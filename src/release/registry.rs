@@ -86,6 +86,25 @@ impl RegistryObserver {
         if !valid_name(name) || !valid_checksum(checksum) || semver::Version::parse(version).is_err() {
             return Err("invalid sealed package identity".into());
         }
+        match self.read_index(name)? {
+            None => Ok(RegistryObservation::Absent),
+            Some(bytes) => observe_records(&bytes, name, version, checksum),
+        }
+    }
+
+    pub(crate) fn has_published_versions(&self, name: &str) -> Result<bool, String> {
+        if !valid_name(name) {
+            return Err("invalid package name".into());
+        }
+        let Some(bytes) = self.read_index(name)? else {
+            return Ok(false);
+        };
+        // Validate every record, including yanked versions, before claiming prior publication.
+        observe_records(&bytes, name, "0.0.0", &"0".repeat(64))?;
+        Ok(true)
+    }
+
+    fn read_index(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
         let lower = name.to_ascii_lowercase();
         let path = match lower.len() {
             1 => format!("1/{lower}"),
@@ -107,7 +126,7 @@ impl RegistryObserver {
             .send()
             .map_err(|_| "registry index request failed or timed out")?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(RegistryObservation::Absent);
+            return Ok(None);
         }
         if response.status() != reqwest::StatusCode::OK {
             return Err(format!("registry index returned HTTP {}", response.status().as_u16()));
@@ -123,7 +142,7 @@ impl RegistryObserver {
         if bytes.len() as u64 > MAX_INDEX_BYTES {
             return Err("registry index exceeds the observation size limit".into());
         }
-        observe_records(&bytes, name, version, checksum)
+        Ok(Some(bytes))
     }
 }
 
@@ -202,6 +221,12 @@ mod tests {
     }
 
     fn observe_response(status: u16, headers: &str, body: &str) -> RegistryObservation {
+        with_response(status, headers, body, |observer| {
+            observer.observe("Example_Crate", "1.2.3", DIGEST)
+        })
+    }
+
+    fn with_response<T>(status: u16, headers: &str, body: &str, operation: impl FnOnce(&RegistryObserver) -> T) -> T {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let response = format!("HTTP/1.1 {status} Result\r\n{headers}Connection: close\r\n\r\n{body}");
@@ -222,11 +247,26 @@ mod tests {
             }
             stream.get_mut().write_all(response.as_bytes()).unwrap();
         });
-        let result = RegistryObserver::new(&format!("sparse+http://{address}/index/"))
-            .unwrap()
-            .observe("Example_Crate", "1.2.3", DIGEST);
+        let observer = RegistryObserver::new(&format!("sparse+http://{address}/index/")).unwrap();
+        let result = operation(&observer);
         worker.join().unwrap();
         result
+    }
+
+    #[test]
+    fn first_release_requires_an_absent_registry_package() {
+        for (status, body, expected) in [
+            (404, String::new(), Ok(false)),
+            (200, record("1.2.3", DIGEST, true), Ok(true)),
+            (200, String::new(), Err("registry returned an empty index".to_string())),
+            (503, String::new(), Err("registry index returned HTTP 503".to_string())),
+        ] {
+            assert_eq!(
+                with_response(status, "", &body, |observer| observer
+                    .has_published_versions("Example_Crate")),
+                expected
+            );
+        }
     }
 
     #[test]

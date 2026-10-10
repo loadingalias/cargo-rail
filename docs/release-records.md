@@ -2,8 +2,13 @@
 
 Cargo-Rail retains the original release intent and execution progress
 so another executor can recover the same release.
-The [record schema](../schemas/release-record-v10.schema.json) owns the portable JSON shape.
+The [record schema](../schemas/release-record-v11.schema.json) owns the portable JSON shape.
 Records contain no credentials or absolute runner paths.
+Release-plan v10 stores sorted `cargo_writes` for primary and declared auxiliary manifests and lockfiles.
+Each write binds its before digest, exact UTF-8 content, and after digest;
+only a new lockfile may omit the before digest.
+Readers validate the contents against the after digest before accepting the record.
+Preparation applies these frozen bytes and recovery retains the original local Cargo inputs.
 
 ## Identity and strict reading
 
@@ -21,7 +26,7 @@ Readers reject duplicate fields, unknown fields, omitted serialized defaults, un
 inconsistent selections, and records larger than 16 MiB.
 The schema alone does not prove identity, checkout binding, or invocation authority.
 The companion Action validates the record version it embeds before exposing record outputs.
-Release-record v10 therefore requires an Action runtime with an independent v10 schema and reader;
+Release-record v11 therefore requires an Action runtime with an independent v11 schema and reader;
 an older Action rejects the record instead of translating it.
 
 A saved intent, package seal, verified workflow attempt, or completed effect cannot be replaced.

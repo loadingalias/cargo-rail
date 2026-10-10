@@ -18,8 +18,6 @@ AGENTS.md
 # Personal
 docs/tasks/
 
-# graft's local graph cache — regenerable, not committed (run `graft build`).
-/graft/
 .ignore
 scripts/tooling/__pycache__/
 scripts/__pycache__/check-cache-host.cpython-314.pyc

@@ -105,3 +105,4 @@ workflow = ".github/workflows/package.yml"
 "cargo-rail-x86_64-unknown-linux-gnu.zip" = { target = "x86_64-unknown-linux-gnu" }
 "LICENSE" = { source = "LICENSE" }
 "SHA256SUMS" = {}
+"cargo-rail-archive-hosts-v1.json" = {}

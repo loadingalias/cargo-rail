@@ -5,7 +5,7 @@ use std::fs;
 use crate::helpers::{NestedWorkspace, TestWorkspace, run_cargo_rail, run_cargo_rail_with_env};
 use anyhow::{Result, anyhow};
 
-const SURFACE_V4_SCHEMA: &str = include_str!("../../schemas/surface-v4.schema.json");
+const SURFACE_V5_SCHEMA: &str = include_str!("../../schemas/surface-v5.schema.json");
 
 #[test]
 fn compiler_observation_process_reports_its_private_protocol() {
@@ -32,9 +32,9 @@ fn surface_schema_is_pre_context_and_matches_the_published_contract() {
             output.status.success(),
             "surface --schema should not load workspace state"
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout), SURFACE_V4_SCHEMA);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), SURFACE_V5_SCHEMA);
         assert!(output.stderr.is_empty(), "schema output must keep stderr empty");
-        let schema: serde_json::Value = serde_json::from_str(SURFACE_V4_SCHEMA)?;
+        let schema: serde_json::Value = serde_json::from_str(SURFACE_V5_SCHEMA)?;
         jsonschema::validator_for(&schema).map_err(|error| anyhow::anyhow!("invalid surface schema: {error}"))?;
         Ok(())
     })();
@@ -232,7 +232,7 @@ reason = "fixture product"
         );
 
         let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-        let schema: serde_json::Value = serde_json::from_str(SURFACE_V4_SCHEMA)?;
+        let schema: serde_json::Value = serde_json::from_str(SURFACE_V5_SCHEMA)?;
         let validator =
             jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid surface schema: {error}"))?;
         let errors = validator
@@ -1310,7 +1310,7 @@ reason = "fixture product"
             String::from_utf8_lossy(&output.stderr)
         );
         let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-        let schema: serde_json::Value = serde_json::from_str(SURFACE_V4_SCHEMA)?;
+        let schema: serde_json::Value = serde_json::from_str(SURFACE_V5_SCHEMA)?;
         let validator =
             jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid surface schema: {error}"))?;
         assert!(validator.is_valid(&report), "surface report failed its schema");
@@ -1324,6 +1324,79 @@ reason = "fixture product"
         let sandboxes = &counters["compiler_acquisition"];
         assert_eq!(sandboxes["sandboxes_created"], 1, "{sandboxes:#}");
         assert_eq!(sandboxes["max_live_cargo_processes"], 1, "{sandboxes:#}");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn surface_cross_target_checks_need_neither_std_nor_a_linker_and_report_host_test_scope() {
+    let result: Result<()> = (|| {
+        // Exercise the bare-metal view when that compiler component is installed.
+        // The configured Linux view always proves that linking is not required.
+        let installed = std::process::Command::new("rustup")
+            .args(["target", "list", "--installed"])
+            .output()?;
+        anyhow::ensure!(installed.status.success(), "{installed:?}");
+        let bare_metal = String::from_utf8(installed.stdout)?
+            .lines()
+            .any(|target| target == "thumbv6m-none-eabi");
+        let workspace = TestWorkspace::new_named("surface-cross-check-only")?;
+        let package = workspace.add_crate("cross-library", "0.1.0", &[])?;
+        fs::write(
+            package.join("src/lib.rs"),
+            "#![no_std]\n/// Return a constant.\n/// ```\n/// assert_eq!(cross_library::value(), 7);\n/// ```\npub fn value() -> u8 { 7 }\n",
+        )?;
+        let targets = if bare_metal {
+            "['x86_64-unknown-linux-gnu', 'thumbv6m-none-eabi']"
+        } else {
+            "['x86_64-unknown-linux-gnu']"
+        };
+        fs::write(
+            workspace.path.join(".config/rail.toml"),
+            format!("targets = {targets}\n[surface]\ntargets = 'workspace'\n"),
+        )?;
+        fs::create_dir_all(workspace.path.join(".cargo"))?;
+        fs::write(
+            workspace.path.join(".cargo/config.toml"),
+            "[target.x86_64-unknown-linux-gnu]\nlinker = 'cargo-rail-linker-must-not-be-called'\n",
+        )?;
+        fs::write(
+            workspace.path.join("rust-toolchain.toml"),
+            include_str!("../../rust-toolchain.toml"),
+        )?;
+        workspace.commit("Check cross-target production code without linkers")?;
+        let output = run_cargo_rail(&workspace.path, &["rail", "surface", "--check", "--format", "json"])?;
+        assert!(matches!(output.status.code(), Some(0 | 1)), "{output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let schema: serde_json::Value = serde_json::from_str(SURFACE_V5_SCHEMA)?;
+        let validator =
+            jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid surface schema: {error}"))?;
+        assert!(validator.is_valid(&report), "{report}");
+        assert_eq!(report["coverage"]["target_coverage_complete"], false);
+        assert_eq!(report["coverage"]["doctest_coverage_complete"], false);
+        assert_eq!(
+            report["coverage"]["nonproduction_target_views"],
+            serde_json::json!(["default"])
+        );
+        assert_eq!(
+            report["coverage"]["doctest_target_views"],
+            serde_json::json!(["default"])
+        );
+        if bare_metal {
+            assert!(
+                report["targets"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("thumbv6m-none-eabi"))
+            );
+        }
+        let original = fs::read(package.join("src/lib.rs"))?;
+        let fix = run_cargo_rail(&workspace.path, &["rail", "surface", "--fix"])?;
+        assert_eq!(fix.status.code(), Some(2), "{fix:?}");
+        assert!(String::from_utf8_lossy(&fix.stderr).contains("complete test and doctest target coverage"));
+        assert_eq!(fs::read(package.join("src/lib.rs"))?, original);
         Ok(())
     })();
     super::helpers::finish_test(result);

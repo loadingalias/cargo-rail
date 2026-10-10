@@ -40,6 +40,8 @@ pub(crate) enum CompilerFactFamily {
 pub(crate) enum AnalysisAcquisition {
     /// Compile every ordinary Cargo target without executing it.
     CheckAllTargets,
+    /// Compile production targets for a cross-target typed analysis.
+    CheckDefaultTargets,
     /// Ask rustdoc to compile documentation tests without executing them.
     CompileDoctests,
 }
@@ -209,7 +211,11 @@ impl AnalysisSchedule {
                 for target in &configured_targets {
                     let view = normalized
                         .entry((
-                            AnalysisAcquisition::CheckAllTargets,
+                            if *target == "default" {
+                                AnalysisAcquisition::CheckAllTargets
+                            } else {
+                                AnalysisAcquisition::CheckDefaultTargets
+                            },
                             PlatformTarget::from(*target),
                             features.clone(),
                             package.clone(),
@@ -218,13 +224,15 @@ impl AnalysisSchedule {
                     view.packages.insert(package.clone());
                     view.domains.extend([
                         CompilerFactDomain::Production,
-                        CompilerFactDomain::NonProduction,
                         CompilerFactDomain::BuildScript,
                         CompilerFactDomain::ProcMacro,
                     ]);
+                    if *target == "default" {
+                        view.domains.insert(CompilerFactDomain::NonProduction);
+                    }
                     view.fact_families.insert(CompilerFactFamily::TypedRustItems);
 
-                    if doctest_packages.contains(package) {
+                    if *target == "default" && doctest_packages.contains(package) {
                         // Cargo's doctest front door accepts one selected package, so equivalent
                         // package views cannot be collapsed into one Cargo invocation.
                         let doctest = normalized
@@ -927,6 +935,7 @@ impl<'plan> CompilerAcquisitionView<'plan> {
     pub(crate) fn command_class(self) -> &'static str {
         match self.spec().acquisition {
             AnalysisAcquisition::CheckAllTargets => "cargo-check-all-targets",
+            AnalysisAcquisition::CheckDefaultTargets => "cargo-check",
             AnalysisAcquisition::CompileDoctests => "cargo-test-doc-no-run",
         }
     }
@@ -970,6 +979,9 @@ impl<'plan> CompilerAcquisitionView<'plan> {
                 "--all-targets".into(),
                 "--message-format=json".into(),
             ],
+            AnalysisAcquisition::CheckDefaultTargets => {
+                vec!["check".into(), "--locked".into(), "--message-format=json".into()]
+            }
             AnalysisAcquisition::CompileDoctests => vec![
                 "test".into(),
                 "--locked".into(),
@@ -1298,6 +1310,7 @@ mod tests {
             source_cfg_features: BTreeSet::from(["backend".to_string(), "common".to_string()]),
             source_cfg_expressions: BTreeSet::from([r#"all(feature = "backend", feature = "common")"#.to_string()]),
             retention_identifiers: BTreeSet::new(),
+            development_only_identifiers: BTreeSet::new(),
             inherits_workspace_msrv: false,
             package_fields: BTreeMap::new(),
             dependencies: HashMap::new(),
@@ -1312,6 +1325,45 @@ mod tests {
             applicable_targets: targets.iter().map(|target| (*target).to_string()).collect(),
             required_features: None,
         }
+    }
+
+    #[test]
+    fn typed_cross_target_views_check_production_without_linking_tests() {
+        let packages = BTreeSet::from(["app".to_string()]);
+        let targets = ["default", "thumbv6m-none-eabi"];
+        let schedule = AnalysisSchedule::for_combined_with_features(
+            &[manifest("app", "app")],
+            &targets,
+            &[],
+            &packages,
+            &packages,
+            None,
+        )
+        .expect("typed schedule");
+        let plan = CompilerAcquisitionPlan::from_schedule(&schedule, &[], &targets).expect("acquisition plan");
+        for view in plan.views() {
+            if view.platform() == "thumbv6m-none-eabi" {
+                assert!(!view.compiles_doctests());
+                assert_eq!(view.command_class(), "cargo-check");
+                assert!(
+                    !view
+                        .cargo_arguments()
+                        .iter()
+                        .any(|argument| argument == "--all-targets")
+                );
+            } else if !view.compiles_doctests() {
+                assert_eq!(view.command_class(), "cargo-check-all-targets");
+                assert!(
+                    view.cargo_arguments()
+                        .iter()
+                        .any(|argument| argument == "--all-targets")
+                );
+            }
+        }
+        assert!(
+            plan.views()
+                .any(|view| view.compiles_doctests() && view.platform() == "default")
+        );
     }
 
     #[test]

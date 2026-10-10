@@ -106,6 +106,10 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "unify.transitive_pinning.host",
         "Enables host-owned pins for fragmented transitive features and selects the owning manifest.",
     ),
+    policy(
+        "unify.cargo_manifests",
+        "Declares independent Cargo workspace inputs for dependency-domain proofs and repairs.",
+    ),
     policy("unify.exclude", "Excludes named dependency cohorts from unification."),
     policy("unify.include", "Force-includes named dependencies in unification."),
     policy(
@@ -639,6 +643,10 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
     policy(
         "crates.<name>.release.publish",
         "Overrides whether a crate participates in registry publication.",
+    ),
+    policy(
+        "crates.<name>.release.tag_format",
+        "Overrides a crate's release tag namespace and previous-tag lookup.",
     ),
     policy("crates.<name>.changelog.path", "Overrides a crate's changelog path."),
     policy(

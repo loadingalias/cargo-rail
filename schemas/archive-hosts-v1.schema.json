@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/loadingalias/cargo-rail/blob/main/schemas/archive-hosts-v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "version", "archives", "unsupported_host_installation"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "archives": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {"pattern": "^[a-zA-Z0-9_-]+$"},
+      "additionalProperties": {"type": "string", "pattern": "^cargo-rail-[a-zA-Z0-9_-]+\\.zip$"}
+    },
+    "unsupported_host_installation": {"const": "source"}
+  }
+}

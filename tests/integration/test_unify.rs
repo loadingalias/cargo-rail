@@ -3836,3 +3836,131 @@ log = { version = "0.4", optional = true }
     })();
     super::helpers::finish_test(result);
 }
+
+#[test]
+fn unify_repairs_independent_workspaces_and_moves_test_only_declarations_losslessly() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_named("unify-independent-domain-repairs")?;
+        workspace.add_crate("app", "0.1.0", &[])?;
+        let root_manifest = workspace.path.join("Cargo.toml");
+        std::fs::write(
+            &root_manifest,
+            std::fs::read_to_string(&root_manifest)?.replace(
+                "members = [\"crates/*\"]",
+                "members = [\"crates/*\"]\nexclude = [\"dependencies/dead\", \"dependencies/test-only\", \"auxiliary\"]",
+            ),
+        )?;
+        for dependency in ["dead", "test-only"] {
+            let directory = workspace.path.join("dependencies").join(dependency);
+            std::fs::create_dir_all(directory.join("src"))?;
+            std::fs::write(
+                directory.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = '{dependency}'\nversion = '0.1.0'\nedition = '2021'\n[workspace]\n[features]\nextra = []\n"
+                ),
+            )?;
+            std::fs::write(directory.join("src/lib.rs"), "pub fn value() -> u8 { 7 }\n")?;
+        }
+        let standalone = workspace.path.join("auxiliary");
+        std::fs::create_dir_all(standalone.join("src"))?;
+        std::fs::write(
+            standalone.join("Cargo.toml"),
+            "[package]\nname = 'app'\nversion = '0.1.0'\nedition = '2021'\n[workspace]\n",
+        )?;
+        std::fs::write(standalone.join("src/lib.rs"), "pub fn unrelated() {}\n")?;
+        let root_member = workspace.path.join("crates/app");
+        let mut original_manifests = Vec::new();
+        for (member, prefix) in [(&root_member, "../../"), (&standalone, "../")] {
+            let manifest_path = member.join("Cargo.toml");
+            let mut manifest = std::fs::read_to_string(&manifest_path)?;
+            if !manifest.contains("[dependencies]") {
+                manifest.push_str("\n[dependencies]\n");
+            }
+            manifest.push_str(&format!("dead = {{ path = '{prefix}dependencies/dead' }}\n\n[target.'cfg(any(unix, windows))'.dependencies]\n# Keep this consumer's dependency policy.\ntest_alias = {{ package = 'test-only', path = '{prefix}dependencies/test-only', default-features = false, features = ['extra'] }} # retained comment\n"));
+            std::fs::write(&manifest_path, &manifest)?;
+            original_manifests.push((manifest_path, manifest));
+            std::fs::create_dir_all(member.join("tests"))?;
+            std::fs::write(
+                member.join("tests/replay.rs"),
+                "#[test]\nfn replay() { assert_eq!(test_alias::value(), 7); }\n",
+            )?;
+        }
+        std::fs::write(
+            workspace.path.join(".config/rail.toml"),
+            "[unify]\ncargo_manifests = ['auxiliary/Cargo.toml']\nmsrv_policy = { mode = 'disabled' }\n",
+        )?;
+        for root in [&workspace.path, &standalone] {
+            let output = crate::helpers::cargo_command(root)
+                .args(["generate-lockfile", "--offline"])
+                .output()?;
+            anyhow::ensure!(output.status.success(), "{output:?}");
+        }
+        workspace.commit("Declare separate graphs and normal dependencies used only by tests")?;
+        let check = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "-f", "json"])?;
+        assert_eq!(check.status.code(), Some(1), "{check:?}");
+        let report: serde_json::Value = serde_json::from_slice(&check.stdout)?;
+        let independent = report["independent_workspaces"]
+            .as_array()
+            .expect("independent workspace proofs");
+        assert_eq!(independent.len(), 1, "{report}");
+        assert_eq!(independent[0]["manifest"], "auxiliary/Cargo.toml");
+        let certificates = report["proof_certificates"].as_array().expect("repair certificates");
+        for manifest in [None, Some("auxiliary/Cargo.toml")] {
+            let matching: Vec<_> = certificates
+                .iter()
+                .filter(|proof| proof["manifest"].as_str() == manifest)
+                .collect();
+            assert!(
+                matching
+                    .iter()
+                    .any(|proof| proof["subject"]["declaration"] == "dead" && proof["decision"] == "remove"),
+                "{report}"
+            );
+            assert!(
+                matching
+                    .iter()
+                    .any(|proof| proof["subject"]["declaration"] == "test_alias"
+                        && proof["decision"] == "move_to_dev_dependencies"
+                        && proof["used_observations"].as_u64().is_some_and(|count| count > 0)
+                        && proof["unused_observations"].as_u64().is_some_and(|count| count > 0)),
+                "{report}"
+            );
+        }
+        for (path, original) in &original_manifests {
+            assert_eq!(&std::fs::read_to_string(path)?, original);
+        }
+        let apply = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
+        assert!(apply.status.success(), "{apply:?}");
+        for (path, _) in original_manifests {
+            let updated = std::fs::read_to_string(&path)?;
+            let manifest: toml_edit::DocumentMut = updated.parse()?;
+            assert!(manifest["dependencies"].get("dead").is_none(), "{updated}");
+            assert!(
+                manifest["target"]["cfg(any(unix, windows))"]["dependencies"]
+                    .get("test_alias")
+                    .is_none(),
+                "{updated}"
+            );
+            assert!(
+                updated.contains("# Keep this consumer's dependency policy."),
+                "{updated}"
+            );
+            assert!(
+                updated.contains("default-features = false, features = ['extra'] } # retained comment"),
+                "{updated}"
+            );
+            assert_eq!(
+                manifest["target"]["cfg(any(unix, windows))"]["dev-dependencies"]["test_alias"]["package"].as_str(),
+                Some("test-only")
+            );
+        }
+        for root in [&workspace.path, &standalone] {
+            let output = crate::helpers::cargo_command(root)
+                .args(["test", "--offline", "--locked"])
+                .output()?;
+            assert!(output.status.success(), "test domain broke after repair: {output:?}");
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}

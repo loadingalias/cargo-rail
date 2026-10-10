@@ -247,6 +247,54 @@ impl ManifestWriter {
         Ok(())
     }
 
+    pub(crate) fn move_normal_dependency_to_dev(
+        &self,
+        manifest: &Path,
+        name: &str,
+        target: Option<&str>,
+    ) -> RailResult<()> {
+        let mut document = manifest_ops::read_toml_file(manifest)?;
+        let table = if let Some(target) = target {
+            document
+                .get_mut("target")
+                .and_then(|targets| targets.get_mut(target))
+                .and_then(toml_edit::Item::as_table_mut)
+                .ok_or_else(|| crate::error::RailError::message("normal dependency target table disappeared"))?
+        } else {
+            document.as_table_mut()
+        };
+        if table
+            .get("dev-dependencies")
+            .and_then(toml_edit::Item::as_table_like)
+            .is_some_and(|dependencies| dependencies.contains_key(name))
+        {
+            return Err(crate::error::RailError::message(format!(
+                "development dependency '{name}' already exists; merge its policy explicitly"
+            )));
+        }
+        let dependencies = table
+            .get_mut("dependencies")
+            .and_then(toml_edit::Item::as_table_like_mut)
+            .ok_or_else(|| crate::error::RailError::message("normal dependency section disappeared"))?;
+        let key = dependencies
+            .key(name)
+            .cloned()
+            .ok_or_else(|| crate::error::RailError::message(format!("normal dependency '{name}' disappeared")))?;
+        let entry = dependencies
+            .remove(name)
+            .ok_or_else(|| crate::error::RailError::message(format!("normal dependency '{name}' disappeared")))?;
+        if !table.contains_key("dev-dependencies") {
+            table.insert("dev-dependencies", toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        table
+            .get_mut("dev-dependencies")
+            .and_then(toml_edit::Item::as_table_like_mut)
+            .ok_or_else(|| crate::error::RailError::message("development dependency section is not a table"))?
+            .entry_format(&key)
+            .or_insert(entry);
+        manifest_ops::write_toml_file(manifest, &document)
+    }
+
     /// Remove a dead feature from a member's Cargo.toml
     ///
     /// No-ops if the manifest has no `[features]` table or the feature is absent.

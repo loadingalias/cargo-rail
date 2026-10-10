@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Collector version used to invalidate stale semantic behavior.
-pub const COLLECTOR_VERSION: u32 = 16;
+pub const COLLECTOR_VERSION: u32 = 17;
 
 /// A rustc platform target or `default` for the workspace's native target.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -184,7 +184,13 @@ impl CompilationUnitId {
             // harness and does not promise to replay its diagnostics. The
             // non-test unit is therefore the authoritative normal-dependency
             // domain; test-mode units belong to the dev-dependency domain.
-            DepKind::Normal => !self.test_mode && self.kind != CargoTargetKind::CustomBuild,
+            DepKind::Normal => {
+                !self.test_mode
+                    && matches!(
+                        self.kind,
+                        CargoTargetKind::Library | CargoTargetKind::Binary | CargoTargetKind::ProcMacro
+                    )
+            }
             DepKind::Dev => {
                 self.test_mode
                     || matches!(

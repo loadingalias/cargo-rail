@@ -159,6 +159,7 @@ fn changed_dependency_names(plan: &crate::cargo::UnificationPlan) -> Vec<String>
         match edit {
             crate::cargo::MemberEdit::UseWorkspace { dep_name, .. }
             | crate::cargo::MemberEdit::RemoveDep { dep_name, .. }
+            | crate::cargo::MemberEdit::MoveToDev { dep_name, .. }
             | crate::cargo::MemberEdit::AddFeatures { dep_name, .. } => {
                 names.insert(dep_name.to_string());
             }
@@ -320,10 +321,31 @@ fn evidence_cache_to_json(plan: &crate::cargo::UnificationPlan) -> Vec<serde_jso
         .collect()
 }
 
-fn proof_certificates_to_json(plan: &crate::cargo::UnificationPlan, msrv_write_needed: bool) -> Vec<serde_json::Value> {
+fn independent_workspaces_to_json(
+    ctx: &WorkspaceContext,
+    plan: &crate::cargo::UnificationPlan,
+) -> RailResult<Vec<serde_json::Value>> {
+    plan.independent_workspaces.iter().map(|workspace| Ok(serde_json::json!({
+        "manifest": crate::utils::path_to_git_format(&crate::utils::path_relative_to(ctx.workspace_root(), &workspace.workspace_root.join("Cargo.toml"))?),
+        "snapshot": workspace.snapshot_id,
+        "coverage": coverage_views_to_json(&workspace.coverage_views)?,
+        "dependency_repairs": workspace.unused_deps.iter().map(|repair| serde_json::json!({
+            "member": repair.member.as_ref(), "dependency": repair.dep_name.as_ref(), "kind": repair.kind.as_str(), "target": repair.target.as_deref(),
+            "decision": if matches!(repair.reason, crate::cargo::UnusedReason::DevelopmentOnly) { "move_to_dev_dependencies" } else { "remove" },
+            "complete_configurations": repair.proof.complete_configurations, "applicable_configurations": repair.proof.applicable_configurations,
+            "used_observations": repair.proof.used_observations, "unused_observations": repair.proof.unused_observations,
+        })).collect::<Vec<_>>(),
+    }))).collect()
+}
+
+fn proof_certificates_to_json(
+    ctx: &WorkspaceContext,
+    plan: &crate::cargo::UnificationPlan,
+    msrv_write_needed: bool,
+) -> RailResult<Vec<serde_json::Value>> {
     let mut certificates =
         Vec::with_capacity(plan.unused_deps.len() + plan.pruned_features.len() + plan.undeclared_features.len());
-    certificates.extend(plan.unused_deps.iter().map(|unused| {
+    let dependency_certificate = |unused: &crate::cargo::UnusedDep| {
         serde_json::json!({
           "schema_version": unused.proof.schema_version,
           "member": &*unused.member,
@@ -335,7 +357,7 @@ fn proof_certificates_to_json(plan: &crate::cargo::UnificationPlan, msrv_write_n
             "dependency_kind": unused.kind.as_str(),
             "target": unused.target.as_deref(),
           },
-          "decision": "remove",
+          "decision": if matches!(unused.reason, crate::cargo::UnusedReason::DevelopmentOnly) { "move_to_dev_dependencies" } else { "remove" },
           "evidence_source": unused.proof.evidence_source,
           "applicable_configurations": unused.proof.applicable_configurations,
           "complete_configurations": unused.proof.complete_configurations,
@@ -344,7 +366,18 @@ fn proof_certificates_to_json(plan: &crate::cargo::UnificationPlan, msrv_write_n
           "incomplete_observations": unused.proof.incomplete_observations,
           "uncertainties": unused.proof.uncertainties.iter().map(|value| &**value).collect::<Vec<_>>(),
         })
-    }));
+    };
+    certificates.extend(plan.unused_deps.iter().map(dependency_certificate));
+    for workspace in &plan.independent_workspaces {
+        for unused in &workspace.unused_deps {
+            let mut certificate = dependency_certificate(unused);
+            certificate["manifest"] = serde_json::json!(crate::utils::path_to_git_format(
+                &crate::utils::path_relative_to(ctx.workspace_root(), &workspace.member_paths[&unused.member])?
+            ));
+            certificate["snapshot"] = serde_json::json!(workspace.snapshot_id);
+            certificates.push(certificate);
+        }
+    }
     certificates.extend(plan.pruned_features.iter().map(|feature| {
         serde_json::json!({
           "schema_version": 1,
@@ -440,7 +473,8 @@ fn proof_certificates_to_json(plan: &crate::cargo::UnificationPlan, msrv_write_n
               "evidence_source": "captured_semantic_manifest_equality",
               "uncertainties": [],
             })),
-            crate::cargo::MemberEdit::RemoveDep { .. }
+            crate::cargo::MemberEdit::MoveToDev { .. }
+            | crate::cargo::MemberEdit::RemoveDep { .. }
             | crate::cargo::MemberEdit::RemoveFeature { .. }
             | crate::cargo::MemberEdit::AddFeatures { .. } => None,
         }));
@@ -481,7 +515,7 @@ fn proof_certificates_to_json(plan: &crate::cargo::UnificationPlan, msrv_write_n
             })
             .then_with(|| left.to_string().cmp(&right.to_string()))
     });
-    certificates
+    Ok(certificates)
 }
 
 fn proof_set_fingerprint(certificates: &[serde_json::Value]) -> String {
@@ -1031,7 +1065,7 @@ pub fn run_unify_analyze(ctx: &WorkspaceContext, options: UnifyAnalyzeOptions<'_
     if json {
         let coverage = coverage_views_to_json(&coverage_views)?;
         let msrv = msrv_to_json(ctx, &plan, msrv_write_needed)?;
-        let proof_certificates = proof_certificates_to_json(&plan, msrv_write_needed);
+        let proof_certificates = proof_certificates_to_json(ctx, &plan, msrv_write_needed)?;
         let proof_fingerprint = proof_set_fingerprint(&proof_certificates);
         let mutation_plan = if ctx.has_git() {
             Some(mutation::build_plan(
@@ -1095,7 +1129,7 @@ pub fn run_unify_analyze(ctx: &WorkspaceContext, options: UnifyAnalyzeOptions<'_
             "dead_features_pruned": plan.pruned_features.len(),
             "optional_features_detected": plan.optional_features.len(),
             "version_mismatches": plan.version_mismatches.len(),
-            "unused_deps": plan.unused_deps.len(),
+            "unused_deps": plan.unused_deps.len() + plan.independent_workspaces.iter().map(|workspace| workspace.unused_deps.len()).sum::<usize>(),
           },
           "has_blocking_issues": plan.has_blocking_issues(),
           "issues": plan.issues.iter().map(|i| serde_json::json!({
@@ -1104,6 +1138,7 @@ pub fn run_unify_analyze(ctx: &WorkspaceContext, options: UnifyAnalyzeOptions<'_
             "severity": format!("{:?}", i.severity),
             "message": &*i.message,
           })).collect::<Vec<_>>(),
+          "independent_workspaces": independent_workspaces_to_json(ctx, &plan)?,
           "dependency_decisions": dependency_decisions_to_json(&plan),
           "feature_reachability": feature_reachability_to_json(&plan),
           "package_inheritance": package_inheritance_to_json(&plan),
@@ -1157,6 +1192,27 @@ pub fn run_unify_analyze(ctx: &WorkspaceContext, options: UnifyAnalyzeOptions<'_
     // Default output stays terse; detailed reasoning belongs behind --explain or JSON.
     write_compact_summary(&mut sink, &plan, msrv_write_needed, has_changes, &actions);
 
+    for workspace in &plan.independent_workspaces {
+        outln!(
+            sink,
+            "Independent workspace: {} (proof {})",
+            workspace.workspace_root.display(),
+            workspace.snapshot_id
+        );
+        for repair in &workspace.unused_deps {
+            outln!(
+                sink,
+                "  {} in {} -> {}",
+                repair.dep_name,
+                repair.member,
+                if matches!(repair.reason, crate::cargo::UnusedReason::DevelopmentOnly) {
+                    "move to dev-dependencies"
+                } else {
+                    "remove unused declaration"
+                }
+            );
+        }
+    }
     // Show explain output if requested
     if explain {
         display_explain(
@@ -1261,6 +1317,15 @@ pub fn run_unify_analyze(ctx: &WorkspaceContext, options: UnifyAnalyzeOptions<'_
                     } => {
                         let section = dependency_section(dep_kind, target.as_deref());
                         outln!(sink, "  {} {} -> REMOVE (unused)", section, dep_name);
+                    }
+                    crate::cargo::MemberEdit::MoveToDev { dep_name, target } => {
+                        outln!(
+                            sink,
+                            "  {} {} -> move to {}",
+                            dependency_section(&crate::cargo::DepKind::Normal, target.as_deref()),
+                            dep_name,
+                            dependency_section(&crate::cargo::DepKind::Dev, target.as_deref())
+                        );
                     }
                     crate::cargo::MemberEdit::RemoveFeature { feature_name } => {
                         outln!(sink, "  [features] {} -> REMOVE (dead/empty)", feature_name);
@@ -1529,6 +1594,15 @@ impl ManifestTransaction {
         if !plan.transitive_pins.is_empty() {
             paths.insert(transitive_pins_host_manifest_path(ctx)?);
         }
+        for workspace in &plan.independent_workspaces {
+            if workspace.member_edits.is_empty() {
+                continue;
+            }
+            paths.insert(workspace.workspace_root.join("Cargo.lock"));
+            for member in workspace.member_edits.keys() {
+                paths.insert(workspace.member_paths[member].clone());
+            }
+        }
         let lockfile_path = ctx.workspace_root().join("Cargo.lock");
         paths.insert(lockfile_path);
         paths.extend(additional_paths.iter().cloned());
@@ -1605,11 +1679,24 @@ fn verify_applied_unify_graph(
     ctx: &WorkspaceContext,
     plan: &crate::cargo::UnificationPlan,
 ) -> RailResult<VerifiedGraphDelta> {
+    verify_workspace_unify_graph(
+        ctx,
+        authorized_graph_names(plan),
+        &plan.unused_deps,
+        &plan.undeclared_features,
+    )
+}
+
+fn verify_workspace_unify_graph(
+    ctx: &WorkspaceContext,
+    authorized_names: BTreeSet<String>,
+    unused_deps: &[crate::cargo::UnusedDep],
+    undeclared_features: &[crate::cargo::UndeclaredFeature],
+) -> RailResult<VerifiedGraphDelta> {
     let snapshot = ctx.snapshot()?;
     let target_metadata = ctx.multi_target_metadata()?;
     let targets = target_metadata.targets();
     let mut verified_feature_edits = std::collections::BTreeSet::new();
-    let authorized_names = authorized_graph_names(plan);
     let mut delta_lines = BTreeSet::new();
     let mut added = 0usize;
     let mut removed = 0usize;
@@ -1689,7 +1776,7 @@ fn verify_applied_unify_graph(
             .as_ref()
             .ok_or_else(|| RailError::message(format!("Cargo returned no resolve graph for target `{target}`")))?;
 
-        for unused in &plan.unused_deps {
+        for unused in unused_deps {
             let Some(package) = metadata
                 .packages
                 .iter()
@@ -1712,6 +1799,17 @@ fn verify_applied_unify_graph(
                     && kind_matches
                     && dependency.target.as_ref().map(ToString::to_string).as_deref() == unused.target.as_deref()
             });
+            if matches!(unused.reason, crate::cargo::UnusedReason::DevelopmentOnly)
+                && !package.dependencies.iter().any(|dependency| {
+                    dependency.rename.as_deref().unwrap_or(dependency.name.as_str()) == unused.dep_name.as_ref()
+                        && dependency.kind == cargo_metadata::DependencyKind::Development
+                        && dependency.target.as_ref().map(ToString::to_string).as_deref() == unused.target.as_deref()
+                })
+            {
+                return Err(RailError::message(
+                    "moved declaration has no development dependency after the planned edit",
+                ));
+            }
             if declaration_remains {
                 return Err(RailError::message(format!(
                     "removed {} dependency `{}` still exists for `{}` in target scope {:?}",
@@ -1723,7 +1821,7 @@ fn verify_applied_unify_graph(
             }
         }
 
-        for undeclared in &plan.undeclared_features {
+        for undeclared in undeclared_features {
             let Some(package) = metadata
                 .packages
                 .iter()
@@ -1757,7 +1855,7 @@ fn verify_applied_unify_graph(
         }
     }
 
-    for undeclared in &plan.undeclared_features {
+    for undeclared in undeclared_features {
         for feature in &undeclared.undeclared_features {
             let key = (
                 undeclared.member.to_string(),
@@ -1901,6 +1999,73 @@ fn display_unify_apply_summary(
     }
 }
 
+fn apply_member_edits(
+    writer: &ManifestWriter,
+    member_paths: &rustc_hash::FxHashMap<std::sync::Arc<str>, PathBuf>,
+    edits_by_member: &rustc_hash::FxHashMap<std::sync::Arc<str>, Vec<crate::cargo::MemberEdit>>,
+) -> RailResult<()> {
+    let mut member_edits = edits_by_member.iter().collect::<Vec<_>>();
+    member_edits.sort_unstable_by_key(|(member, _)| *member);
+    for (member_name, edits) in member_edits {
+        let member_path = member_paths
+            .get(member_name)
+            .ok_or_else(|| crate::error::RailError::message(format!("member path not found: {}", member_name)))?;
+
+        for edit in edits {
+            match edit {
+                crate::cargo::MemberEdit::UseWorkspace {
+                    dep_name,
+                    dep_kind,
+                    target,
+                    local_features,
+                    is_optional,
+                } => {
+                    writer.update_member(
+                        member_path,
+                        dep_name,
+                        *dep_kind,
+                        target.as_deref(),
+                        if local_features.is_empty() {
+                            None
+                        } else {
+                            Some(local_features.as_slice())
+                        },
+                        *is_optional,
+                    )?;
+                }
+                crate::cargo::MemberEdit::RemoveDep {
+                    dep_name,
+                    dep_kind,
+                    target,
+                } => {
+                    writer.remove_dep(member_path, dep_name, *dep_kind, target.as_deref())?;
+                }
+                crate::cargo::MemberEdit::MoveToDev { dep_name, target } => {
+                    writer.move_normal_dependency_to_dev(member_path, dep_name, target.as_deref())?;
+                }
+                crate::cargo::MemberEdit::RemoveFeature { feature_name } => {
+                    writer.remove_feature(member_path, feature_name)?;
+                }
+                crate::cargo::MemberEdit::AddFeatures {
+                    dep_name,
+                    dep_kind,
+                    target,
+                    features_to_add,
+                } => {
+                    writer.add_features(member_path, dep_name, *dep_kind, target.as_deref(), features_to_add)?;
+                }
+                crate::cargo::MemberEdit::EnforceMsrvInheritance => {
+                    writer.enforce_member_msrv_inheritance(member_path)?;
+                }
+                crate::cargo::MemberEdit::InheritPackageField { field } => {
+                    writer.inherit_member_package_field(member_path, field)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Apply a verified dependency-unification plan transactionally.
 pub fn run_unify_apply(
     ctx: &WorkspaceContext,
@@ -1928,7 +2093,7 @@ pub fn run_unify_apply(
     } else {
         false
     };
-    let proof_certificates = proof_certificates_to_json(&plan, msrv_write_needed);
+    let proof_certificates = proof_certificates_to_json(ctx, &plan, msrv_write_needed)?;
     let proof_fingerprint = proof_set_fingerprint(&proof_certificates);
 
     // Check for blockers
@@ -2054,6 +2219,21 @@ pub fn run_unify_apply(
 
         let metadata = BackupMetadata::new("cargo rail unify");
         let max_backups = ctx.config().map(|c| c.unify.max_backups).unwrap_or(3);
+        for workspace in &plan.independent_workspaces {
+            if workspace.member_edits.is_empty() {
+                continue;
+            }
+            files_to_backup.push(crate::utils::path_relative_to(
+                ctx.workspace_root(),
+                &workspace.workspace_root.join("Cargo.lock"),
+            )?);
+            for member in workspace.member_edits.keys() {
+                files_to_backup.push(crate::utils::path_relative_to(
+                    ctx.workspace_root(),
+                    &workspace.member_paths[member],
+                )?);
+            }
+        }
         let backup_id = backup_manager.create_backup(&files_to_backup, metadata, max_backups)?;
         progress!("backup: {}", backup_id);
         created_backup_id = Some(backup_id);
@@ -2074,62 +2254,9 @@ pub fn run_unify_apply(
         }
 
         progress!("updating {} members...", plan.member_edits.len());
-        let mut member_edits = plan.member_edits.iter().collect::<Vec<_>>();
-        member_edits.sort_unstable_by_key(|(member, _)| *member);
-        for (member_name, edits) in member_edits {
-            let member_path = plan
-                .member_paths
-                .get(member_name)
-                .ok_or_else(|| crate::error::RailError::message(format!("member path not found: {}", member_name)))?;
-
-            for edit in edits {
-                match edit {
-                    crate::cargo::MemberEdit::UseWorkspace {
-                        dep_name,
-                        dep_kind,
-                        target,
-                        local_features,
-                        is_optional,
-                    } => {
-                        writer.update_member(
-                            member_path,
-                            dep_name,
-                            *dep_kind,
-                            target.as_deref(),
-                            if local_features.is_empty() {
-                                None
-                            } else {
-                                Some(local_features.as_slice())
-                            },
-                            *is_optional,
-                        )?;
-                    }
-                    crate::cargo::MemberEdit::RemoveDep {
-                        dep_name,
-                        dep_kind,
-                        target,
-                    } => {
-                        writer.remove_dep(member_path, dep_name, *dep_kind, target.as_deref())?;
-                    }
-                    crate::cargo::MemberEdit::RemoveFeature { feature_name } => {
-                        writer.remove_feature(member_path, feature_name)?;
-                    }
-                    crate::cargo::MemberEdit::AddFeatures {
-                        dep_name,
-                        dep_kind,
-                        target,
-                        features_to_add,
-                    } => {
-                        writer.add_features(member_path, dep_name, *dep_kind, target.as_deref(), features_to_add)?;
-                    }
-                    crate::cargo::MemberEdit::EnforceMsrvInheritance => {
-                        writer.enforce_member_msrv_inheritance(member_path)?;
-                    }
-                    crate::cargo::MemberEdit::InheritPackageField { field } => {
-                        writer.inherit_member_package_field(member_path, field)?;
-                    }
-                }
-            }
+        apply_member_edits(&writer, &plan.member_paths, &plan.member_edits)?;
+        for workspace in &plan.independent_workspaces {
+            apply_member_edits(&writer, &workspace.member_paths, &workspace.member_edits)?;
         }
 
         if !plan.transitive_pins.is_empty() {
@@ -2178,6 +2305,28 @@ pub fn run_unify_apply(
             graph_delta.fingerprint
         );
 
+        for workspace in &plan.independent_workspaces {
+            if workspace.member_edits.is_empty() {
+                continue;
+            }
+            let context = analyzer
+                .independent_contexts()
+                .iter()
+                .find(|context| context.workspace_root() == workspace.workspace_root)
+                .ok_or_else(|| RailError::message("independent workspace lost its captured authority"))?;
+            let names = workspace
+                .unused_deps
+                .iter()
+                .flat_map(|dependency| [dependency.member.to_string(), dependency.dep_name.to_string()])
+                .collect();
+            let graph = verify_workspace_unify_graph(context, names, &workspace.unused_deps, &[])?;
+            verify_applied_coverage_views(
+                context,
+                &workspace.coverage_views,
+                graph.post_mutation_metadata.as_ref(),
+                &graph.post_mutation_lock_fingerprint,
+            )?;
+        }
         crate::phase!(
             crate::output::Activity::Cargo,
             "verifying {} captured coverage views...",
@@ -2602,7 +2751,7 @@ fn display_explain(
 
     // Explain unused deps being removed
     if !plan.unused_deps.is_empty() {
-        outln!(sink, "Unused dependencies flagged for removal:");
+        outln!(sink, "Dependency declarations flagged for repair:");
         outln!(sink);
         for unused in &plan.unused_deps {
             outln!(sink, "  {} in {}", unused.dep_name, unused.member);
@@ -2914,6 +3063,10 @@ fn unify_report_output_path(
         ctx.workspace_root().join("Cargo.lock"),
     ]);
     protected.extend(plan.member_paths.values().cloned());
+    for workspace in &plan.independent_workspaces {
+        protected.extend(workspace.member_paths.values().cloned());
+        protected.insert(workspace.workspace_root.join("Cargo.lock"));
+    }
     if !plan.transitive_pins.is_empty() {
         protected.insert(transitive_pins_host_manifest_path(ctx)?);
     }
@@ -2945,7 +3098,7 @@ fn build_unify_mutation_parts(
     let mut actions = Vec::with_capacity(8); // Typically few distinct action types
     let mut risks = Vec::with_capacity(4);
     let mut trace = Vec::with_capacity(8);
-    let proof_certificates = proof_certificates_to_json(plan, msrv_write_needed);
+    let proof_certificates = proof_certificates_to_json(ctx, plan, msrv_write_needed)?;
     let proof_fingerprint = proof_set_fingerprint(&proof_certificates);
 
     actions.push(
@@ -2997,6 +3150,32 @@ fn build_unify_mutation_parts(
         );
     }
 
+    for workspace in &plan.independent_workspaces {
+        if workspace.member_edits.is_empty() {
+            continue;
+        }
+        let mut mutations = workspace
+            .member_edits
+            .keys()
+            .map(|member| unify_expected_mutation(ctx, &workspace.member_paths[member]))
+            .collect::<RailResult<Vec<_>>>()?;
+        mutations.push(unify_expected_mutation(
+            ctx,
+            &workspace.workspace_root.join("Cargo.lock"),
+        )?);
+        mutations.sort_by(|left, right| left.path.cmp(&right.path));
+        actions.push(
+            MutationAction::new(
+                "REPAIR_INDEPENDENT_DEPENDENCIES",
+                crate::utils::path_to_git_format(&crate::utils::path_relative_to(
+                    ctx.workspace_root(),
+                    &workspace.workspace_root.join("Cargo.toml"),
+                )?),
+                Some(workspace.snapshot_id.clone()),
+            )
+            .with_mutations(mutations),
+        );
+    }
     if !plan.transitive_pins.is_empty() {
         let mut mutations = vec![unify_expected_mutation(ctx, &ctx.workspace_root().join("Cargo.toml"))?];
         let host = unify_expected_mutation(ctx, &transitive_pins_host_manifest_path(ctx)?)?;
@@ -3156,6 +3335,7 @@ mod tests {
 
     fn empty_plan() -> UnificationPlan {
         UnificationPlan {
+            independent_workspaces: Vec::new(),
             workspace_deps: Vec::new(),
             member_edits: FxHashMap::default(),
             member_paths: FxHashMap::default(),

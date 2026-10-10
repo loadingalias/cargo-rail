@@ -447,6 +447,7 @@ impl WorkspaceContext {
             mapped_config.as_deref(),
             Some(&materialized_requested_root),
             crate::config::RetiredKeys::Reject,
+            None,
         )
         .map_err(|error| {
             error.context(format!(
@@ -504,6 +505,7 @@ impl WorkspaceContext {
             config_override,
             None,
             crate::config::RetiredKeys::Reject,
+            None,
         )
     }
 
@@ -519,7 +521,51 @@ impl WorkspaceContext {
             config_override,
             None,
             crate::config::RetiredKeys::Strip,
+            None,
         )
+    }
+
+    pub(crate) fn capture_independent_workspace(&self, manifest: &Path) -> RailResult<Self> {
+        self.validate_snapshot_unchanged()?;
+        let manifest = crate::utils::canonicalize_existing(&self.workspace_root().join(manifest))?;
+        if !manifest.starts_with(self.workspace_root()) || manifest.file_name().is_none_or(|name| name != "Cargo.toml")
+        {
+            return Err(RailError::message(
+                "independent Cargo manifest must remain inside the owning workspace",
+            ));
+        }
+        let root = manifest
+            .parent()
+            .ok_or_else(|| RailError::message("independent Cargo manifest has no parent"))?;
+        if !root.join("Cargo.lock").is_file() {
+            return Err(RailError::with_help(
+                format!("independent Cargo workspace '{}' has no Cargo.lock", root.display()),
+                "generate and commit its lockfile before Unify analysis",
+            ));
+        }
+        let members = self
+            .cargo()
+            .workspace_members()
+            .iter()
+            .map(|package| package.name.to_string())
+            .collect::<Vec<_>>();
+        let config_path = self.snapshot()?.rail_config_path();
+        let context = Self::build_inner_at(
+            root,
+            ContextCapture::Snapshot,
+            config_path,
+            Some(root),
+            crate::config::RetiredKeys::Reject,
+            Some((self.workspace_root(), &members)),
+        )?;
+        if context.workspace_root() == self.workspace_root() || context.workspace_root().join("Cargo.toml") != manifest
+        {
+            return Err(RailError::message(
+                "independent Cargo manifest must name a standalone workspace root",
+            ));
+        }
+        self.validate_snapshot_unchanged()?;
+        Ok(context)
     }
 
     fn build_inner_at(
@@ -528,6 +574,7 @@ impl WorkspaceContext {
         config_override: Option<&Path>,
         cargo_current_dir: Option<&Path>,
         retired: crate::config::RetiredKeys,
+        config_workspace: Option<(&Path, &[String])>,
     ) -> RailResult<Self> {
         let process_current_dir = std::env::current_dir().map_err(|error| {
             RailError::message(format!("failed to determine Cargo metadata current directory: {error}"))
@@ -696,7 +743,8 @@ impl WorkspaceContext {
                 .into_iter()
                 .map(|package| package.name.to_string())
                 .collect::<Vec<_>>();
-            cfg.validate_workspace(&workspace_root, Some(&workspace_members))?;
+            let (config_root, config_members) = config_workspace.unwrap_or((&workspace_root, &workspace_members));
+            cfg.validate_workspace(config_root, Some(config_members))?;
         }
 
         // The top-level policy is the only non-host target authority. Surface

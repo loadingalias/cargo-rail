@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-pub(crate) const RELEASE_STATE_SCHEMA_VERSION: u32 = 10;
+pub(crate) const RELEASE_STATE_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Deserialize)]
 struct ReleaseStateSchema {
@@ -134,9 +134,8 @@ fn visit_plan_paths(plan: &mut ReleasePlan, visit: &mut impl FnMut(&mut PathBuf)
     for update in &mut plan.change_files_to_update {
         visit(&mut update.path)?;
     }
-    for auxiliary in &mut plan.auxiliary_lockfiles {
-        visit(&mut auxiliary.manifest_path)?;
-        visit(&mut auxiliary.lockfile_path)?;
+    for auxiliary in &mut plan.cargo_writes {
+        visit(&mut auxiliary.path)?;
     }
     for package in &mut plan.crates {
         visit(&mut package.manifest_path)?;
@@ -339,6 +338,18 @@ impl ReleaseState {
             .chain(plan.change_files_to_update.iter().map(|update| update.path.clone()))
             .map(|path| (path, BackupRestorePolicy::BeforePreparation))
             .collect::<BTreeMap<_, _>>();
+        for write in &plan.cargo_writes {
+            if write.before_digest.is_none() {
+                continue;
+            }
+            let absolute = root.join(&write.path);
+            let relative = crate::utils::path_relative_to(&git.worktree_root, &absolute)?;
+            let entry =
+                git.run_git_at_worktree_root(&["ls-tree", "HEAD", "--", &crate::utils::path_to_git_format(&relative)])?;
+            if entry.stdout.is_empty() {
+                local_input_paths.insert(absolute, BackupRestorePolicy::BeforePreparation);
+            }
+        }
         for (path, restore) in control_paths.iter().filter_map(|path| {
             let absolute = if path.is_absolute() {
                 path.clone()
@@ -434,9 +445,8 @@ impl ReleaseState {
             tag_push: Step::default(),
             abort: Step::default(),
         };
-        for projection in &mut state.intent.plan.auxiliary_lockfiles {
-            projection.manifest_path = root.join(&projection.manifest_path);
-            projection.lockfile_path = root.join(&projection.lockfile_path);
+        for projection in &mut state.intent.plan.cargo_writes {
+            projection.path = root.join(&projection.path);
         }
         state.intent.make_portable(&git.worktree_root)?;
         state.intent.identity = state.intent.identity_for(&state.transaction_id)?;
@@ -800,19 +810,30 @@ impl ReleaseState {
                 ));
             }
         }
-        for projection in &plan.auxiliary_lockfiles {
-            if !projection
-                .before_digest
-                .strip_prefix("sha256:")
-                .is_some_and(super::registry::valid_checksum)
-                || format!(
-                    "sha256:{}",
-                    crate::source::ContentDigest::sha256(projection.content.as_bytes())
-                ) != projection.after_digest
+        if plan.cargo_writes.windows(2).any(|writes| {
+            crate::utils::path_to_git_format(&writes[0].path) >= crate::utils::path_to_git_format(&writes[1].path)
+        }) {
+            return Err(RailError::message("release Cargo writes are not unique and sorted"));
+        }
+        for projection in &plan.cargo_writes {
+            let name = projection.path.file_name().and_then(|name| name.to_str());
+            if !matches!(name, Some("Cargo.toml" | "Cargo.lock"))
+                || (projection.before_digest.is_none() && name != Some("Cargo.lock"))
             {
                 return Err(RailError::message(
-                    "release auxiliary lockfile bytes do not match their digest",
+                    "release Cargo write has an invalid path or creation authority",
                 ));
+            }
+            if projection.before_digest.as_deref().is_some_and(|digest| {
+                !digest
+                    .strip_prefix("sha256:")
+                    .is_some_and(super::registry::valid_checksum)
+            }) || format!(
+                "sha256:{}",
+                crate::source::ContentDigest::sha256(projection.content.as_bytes())
+            ) != projection.after_digest
+            {
+                return Err(RailError::message("release Cargo file bytes do not match their digest"));
             }
         }
         for object in [&self.intent.initial_head, &self.intent.source_tree] {
@@ -1263,7 +1284,7 @@ mod tests {
                     },
                     change_files_to_delete: Vec::new(),
                     change_files_to_update: Vec::new(),
-                    auxiliary_lockfiles: Vec::new(),
+                    cargo_writes: Vec::new(),
                     skipped: Vec::new(),
                 },
                 release_config: ReleaseConfig::default(),
@@ -1325,12 +1346,9 @@ mod tests {
     fn current_state_requires_auxiliary_projection_field() {
         let mut state =
             serde_json::to_value(fixture(RELEASE_STATE_SCHEMA_VERSION, RELEASE_PLAN_CONTRACT_VERSION)).unwrap();
-        state["intent"]["plan"]
-            .as_object_mut()
-            .unwrap()
-            .remove("auxiliary_lockfiles");
+        state["intent"]["plan"].as_object_mut().unwrap().remove("cargo_writes");
         let error = load_value(state).unwrap_err();
-        assert!(error.to_string().contains("auxiliary_lockfiles"), "{error}");
+        assert!(error.to_string().contains("cargo_writes"), "{error}");
     }
 
     #[test]

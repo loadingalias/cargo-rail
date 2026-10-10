@@ -67,6 +67,13 @@ pub enum MemberEdit {
         /// Target platform constraint (if in target-specific section)
         target: Option<Arc<str>>,
     },
+    /// Move a normal declaration, preserving its complete entry, into development dependencies.
+    MoveToDev {
+        /// Cargo dependency key, including a rename.
+        dep_name: Arc<str>,
+        /// Target predicate of the normal declaration.
+        target: Option<Arc<str>>,
+    },
     /// Remove a dead feature (empty no-op)
     RemoveFeature {
         /// Name of the feature to remove
@@ -264,6 +271,8 @@ pub enum UnusedReason {
     /// Present in the resolved graph but reported as unused by rustc
     /// (`unused_crate_dependencies`).
     NotUsedInSource,
+    /// Unused by production units and used by development units.
+    DevelopmentOnly,
     /// Not found in resolved dependency graph for any configured target
     NotInResolvedGraph,
     /// Target-specific dep where the target IS configured but dep still not resolved
@@ -433,9 +442,28 @@ pub struct UnifyDecision {
 
 // UnificationPlan
 
-/// Complete unification plan
+/// Dependency-domain repairs for one separately resolved Cargo workspace.
+#[derive(Debug, Clone)]
+pub struct IndependentDependencyPlan {
+    /// Owning standalone workspace root.
+    pub workspace_root: PathBuf,
+    /// Captured source and resolution authority for its proofs.
+    pub snapshot_id: String,
+    /// Captured feature and target views revalidated after declaration edits.
+    pub coverage_views: Vec<crate::compiler::CoverageView>,
+    /// Package manifests in this workspace, keyed only within this workspace.
+    pub member_paths: FxHashMap<Arc<str>, PathBuf>,
+    /// Proven dependency-domain findings.
+    pub unused_deps: Vec<UnusedDep>,
+    /// Exact declaration edits grouped by package within this workspace.
+    pub member_edits: FxHashMap<Arc<str>, Vec<MemberEdit>>,
+}
+
+/// Planned dependency and manifest repairs in the root and declared independent workspaces.
 #[derive(Debug)]
 pub struct UnificationPlan {
+    /// Dependency repairs in independently declared Cargo workspaces.
+    pub independent_workspaces: Vec<IndependentDependencyPlan>,
     /// Dependencies to add to [workspace.dependencies]
     pub workspace_deps: Vec<UnifiedDep>,
     /// Edits to apply to each member's Cargo.toml
@@ -481,7 +509,13 @@ impl UnificationPlan {
     /// Note: `member_edits` may contain empty vectors in edge cases; this returns the
     /// actual edit count and is the right basis for "would this mutate files?" checks.
     pub fn member_edit_count(&self) -> usize {
-        self.member_edits.values().map(|v| v.len()).sum()
+        self.member_edits.values().map(|v| v.len()).sum::<usize>()
+            + self
+                .independent_workspaces
+                .iter()
+                .flat_map(|workspace| workspace.member_edits.values())
+                .map(Vec::len)
+                .sum::<usize>()
     }
 
     /// Number of equivalent package declarations planned for workspace inheritance.
@@ -539,7 +573,7 @@ impl UnificationPlan {
                         MemberEdit::UseWorkspace { dep_name, .. } => {
                             converted_deps.insert(Arc::clone(dep_name));
                         }
-                        MemberEdit::RemoveDep { dep_name, .. } => {
+                        MemberEdit::RemoveDep { dep_name, .. } | MemberEdit::MoveToDev { dep_name, .. } => {
                             removed_deps.insert(Arc::clone(dep_name));
                         }
                         MemberEdit::RemoveFeature { feature_name } => {
@@ -908,6 +942,7 @@ mod tests {
     #[test]
     fn test_summary_with_add_features_edit() {
         let mut plan = UnificationPlan {
+            independent_workspaces: Vec::new(),
             workspace_deps: vec![],
             member_edits: FxHashMap::default(),
             member_paths: FxHashMap::default(),
@@ -943,6 +978,7 @@ mod tests {
     #[test]
     fn test_summary_with_multiple_add_features_edits() {
         let mut plan = UnificationPlan {
+            independent_workspaces: Vec::new(),
             workspace_deps: vec![],
             member_edits: FxHashMap::default(),
             member_paths: FxHashMap::default(),
@@ -996,6 +1032,7 @@ mod tests {
     #[test]
     fn test_summary_no_undeclared_warning_when_fixes_present() {
         let mut plan = UnificationPlan {
+            independent_workspaces: Vec::new(),
             workspace_deps: vec![],
             member_edits: FxHashMap::default(),
             member_paths: FxHashMap::default(),
@@ -1101,6 +1138,7 @@ mod tests {
         member_edits.insert(arc("crate-a"), vec![]);
 
         let plan = UnificationPlan {
+            independent_workspaces: Vec::new(),
             workspace_deps: vec![],
             member_edits,
             member_paths: FxHashMap::default(),

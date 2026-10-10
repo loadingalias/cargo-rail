@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 pub(crate) const RELEASE_REGISTRY: &str = "crates-io";
-pub(crate) const RELEASE_PLAN_CONTRACT_VERSION: u32 = 9;
+pub(crate) const RELEASE_PLAN_CONTRACT_VERSION: u32 = 10;
 
 /// A plan for releasing one or more crates
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,8 +45,8 @@ pub struct ReleasePlan {
     pub change_files_to_delete: Vec<PathBuf>,
     /// Pending change files rewritten to retain unreleased no-release intent.
     pub change_files_to_update: Vec<PlannedChangeFileUpdate>,
-    /// Exact standalone Cargo lockfile projections produced by this release.
-    pub auxiliary_lockfiles: Vec<PlannedAuxiliaryLockfile>,
+    /// Exact Cargo manifest and lockfile writes validated in isolated captured source.
+    pub cargo_writes: Vec<PlannedCargoWrite>,
     /// Resolved native asset requirements for the selected package closure.
     pub artifacts: Vec<super::ArtifactRequirement>,
     /// Target crates excluded from the plan, with the reason (auto mode only).
@@ -216,21 +216,18 @@ pub struct PlannedChangeFileUpdate {
     pub content: String,
 }
 
-/// One exact committed standalone Cargo lockfile update.
+/// One exact Cargo manifest or lockfile write.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PlannedAuxiliaryLockfile {
-    /// Configured workspace-relative manifest that owns this projection.
+pub struct PlannedCargoWrite {
+    /// Workspace-relative Cargo.toml or Cargo.lock path.
     #[serde(serialize_with = "super::path_serde::serialize")]
-    pub manifest_path: PathBuf,
-    /// Resolved workspace-relative committed lockfile.
-    #[serde(serialize_with = "super::path_serde::serialize")]
-    pub lockfile_path: PathBuf,
-    /// SHA-256 of the committed lockfile bytes used to plan.
-    pub before_digest: String,
+    pub path: PathBuf,
+    /// SHA-256 of captured bytes; absent only when creating Cargo.lock.
+    pub before_digest: Option<String>,
     /// SHA-256 of the exact post-release bytes.
     pub after_digest: String,
-    /// Exact UTF-8 Cargo.lock content to write during apply and recovery.
+    /// Exact UTF-8 content applied without resolving Cargo again.
     pub content: String,
 }
 
@@ -249,9 +246,9 @@ pub struct ReleaseSummary {
 /// How explicit crate selections should handle dependent closure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependentPolicy {
-    /// Reject partial selections that would leave dependents out of sync.
+    /// Reject partial selections that omit published workspace dependents.
     RejectPartialClosure,
-    /// Expand explicit selection to the full dependent closure.
+    /// Expand explicit selection with published workspace dependents.
     IncludeDependents,
 }
 
@@ -325,7 +322,6 @@ impl<'a> ReleasePlanner<'a> {
             )?;
         }
 
-        let planned_crates: HashSet<String> = crate_plans.iter().map(|plan| plan.name.clone()).collect();
         for plan in &mut crate_plans {
             let package_id = self.workspace_package_id(&plan.name)?;
             plan.affected_dependents = self
@@ -333,7 +329,6 @@ impl<'a> ReleasePlanner<'a> {
                 .graph()
                 .direct_dependents_by_id(package_id)?
                 .into_iter()
-                .filter(|dependent| planned_crates.contains(dependent))
                 .collect();
         }
 
@@ -404,7 +399,7 @@ impl<'a> ReleasePlanner<'a> {
                 github.as_ref(),
             )?);
         }
-        let auxiliary_lockfiles = crate::release::auxiliary::plan_lockfiles(
+        let cargo_writes = crate::release::cargo_projection::plan_writes(
             self.ctx,
             &crate_plans,
             &self.release_config.auxiliary_cargo_manifests,
@@ -420,7 +415,7 @@ impl<'a> ReleasePlanner<'a> {
             summary,
             change_files_to_delete: consumption.delete,
             change_files_to_update,
-            auxiliary_lockfiles,
+            cargo_writes,
             skipped,
         })
     }
@@ -866,8 +861,10 @@ impl<'a> ReleasePlanner<'a> {
 
     fn format_tag_value(&self, crate_name: &str, version: &str) -> String {
         const VERSION_PLACEHOLDER: &str = "\u{7b}version\u{7d}";
-        self.release_config
-            .tag_format
+        self.ctx
+            .config()
+            .and_then(|config| config.release_tag_format_override(crate_name))
+            .unwrap_or(&self.release_config.tag_format)
             .replace("{prefix}", &self.release_config.tag_prefix)
             .replace("{crate}", crate_name)
             .replace(VERSION_PLACEHOLDER, version)
@@ -899,7 +896,7 @@ impl<'a> ReleasePlanner<'a> {
         }
 
         let requested_ids = self.workspace_package_ids(&requested)?;
-        let dependents = self.ctx.graph().transitive_dependents_of_ids(&requested_ids)?;
+        let dependents = self.published_dependents(&requested_ids)?;
         if !dependents.is_empty() && dependent_policy == DependentPolicy::RejectPartialClosure {
             let mut missing: Vec<String> = dependents.into_iter().collect();
             missing.sort();
@@ -918,7 +915,7 @@ impl<'a> ReleasePlanner<'a> {
                 let before = selected.len();
                 self.expand_selected_version_groups(&mut selected);
                 let selected_ids = self.workspace_package_ids(&selected)?;
-                let dependents = self.ctx.graph().transitive_dependents_of_ids(&selected_ids)?;
+                let dependents = self.published_dependents(&selected_ids)?;
                 selected.extend(dependents);
                 self.expand_selected_version_groups(&mut selected);
                 if selected.len() == before {
@@ -939,6 +936,21 @@ impl<'a> ReleasePlanner<'a> {
             .graph()
             .workspace_package_by_name(crate_name)
             .map(|package| &package.id)
+    }
+
+    fn published_dependents(&self, selected: &HashSet<PackageId>) -> RailResult<HashSet<String>> {
+        Ok(self
+            .ctx
+            .graph()
+            .transitive_dependents_of_ids(selected)?
+            .into_iter()
+            .filter(|name| {
+                self.ctx
+                    .cargo()
+                    .get_package(name)
+                    .is_some_and(crate::workspace::CargoState::is_package_publishable)
+            })
+            .collect())
     }
 
     fn workspace_package_ids(&self, crate_names: &HashSet<String>) -> RailResult<HashSet<PackageId>> {
@@ -1102,14 +1114,10 @@ impl ReleasePlan {
             output.push('\n');
         }
 
-        if !self.auxiliary_lockfiles.is_empty() {
-            output.push_str("Auxiliary Cargo lockfiles:\n");
-            for projection in &self.auxiliary_lockfiles {
-                output.push_str(&format!(
-                    "  {} — {}\n",
-                    projection.lockfile_path.display(),
-                    projection.manifest_path.display()
-                ));
+        if !self.cargo_writes.is_empty() {
+            output.push_str("Cargo file writes:\n");
+            for write in &self.cargo_writes {
+                output.push_str(&format!("  {}\n", write.path.display()));
             }
             output.push('\n');
         }

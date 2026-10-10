@@ -77,6 +77,11 @@ leak-timeout = { period = "10s", result = "fail" }
 filter = 'binary(cache)'
 test-group = 'cache-subprocess'
 
+# Wall-clock acquisition budgets require a quiet window within this test run.
+[[profile.default.overrides]]
+filter = 'test(=test_instrumentation::unify_compiles_each_shared_dependency_unit_once)'
+threads-required = "num-test-threads"
+
 [[profile.default.overrides]]
 filter = 'binary(integration) & test(/test_(instrumentation|release_cargo|scale_fixture|source_snapshot|surface|unify|unused_detection|undeclared_features)/)'
 test-group = 'integration-subprocess'

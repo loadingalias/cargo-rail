@@ -196,6 +196,32 @@ impl UnifyReport {
             md.push('\n');
         }
 
+        for workspace in &plan.independent_workspaces {
+            md.push_str("## Independent workspace dependency repairs\n\n");
+            md.push_str(&format!(
+                "Manifest: `{}`\n\nSnapshot: `{}`\n\n",
+                workspace.workspace_root.join("Cargo.toml").display(),
+                workspace.snapshot_id
+            ));
+            md.push_str("| Member | Dependency | Decision | Complete configurations |\n|--------|------------|----------|-------------------------|\n");
+            for repair in &workspace.unused_deps {
+                let decision = if matches!(repair.reason, UnusedReason::DevelopmentOnly) {
+                    "move to dev-dependencies"
+                } else {
+                    "remove"
+                };
+                md.push_str(&format!(
+                    "| {} | {} | {} | {}/{} |\n",
+                    repair.member,
+                    repair.dep_name,
+                    decision,
+                    repair.proof.complete_configurations,
+                    repair.proof.applicable_configurations
+                ));
+            }
+            md.push('\n');
+        }
+
         if !plan.version_mismatches.is_empty() {
             md.push_str("## Version Mismatches\n\n");
             md.push_str("| Member | Dependency | Declared | Workspace |\n");
@@ -219,6 +245,9 @@ impl UnifyReport {
                 let kind_str = dep_kind_label(&ud.kind);
                 let reason_str = match &ud.reason {
                     UnusedReason::NotUsedInSource => "unused in source".to_string(),
+                    UnusedReason::DevelopmentOnly => {
+                        "move to dev-dependencies (used only by development units)".to_string()
+                    }
                     UnusedReason::NotInResolvedGraph => "not in resolved graph".to_string(),
                     UnusedReason::TargetConfiguredButNotResolved { target_cfg } => {
                         format!("target `{}` configured but not resolved", target_cfg)

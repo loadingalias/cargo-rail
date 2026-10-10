@@ -287,3 +287,20 @@ Resume verifies the expected branch, parent, owned paths, and files.
 - `2`: invalid arguments or an operational failure.
 
 An executed subprocess may deliberately propagate another status.
+
+## Repair a deleted compiler-cache installation
+
+Run `cargo rail cache setup` from an enrolled workspace.
+Setup restores a missing installation
+when Cargo's configured wrapper path exactly equals Cargo-Rail's managed path,
+even if the receipt was deleted.
+Other configured wrappers still require an explicit owner decision.
+The repair preserves unrelated Cargo configuration and replaces the receipt and missing components.
+Run `cargo rail cache ready` to prove a cold build and verified reuse.
+
+A stale authenticated compiler component reports its path, found and expected digests,
+the adjacent component-manifest version, and the running Cargo-Rail version.
+Install the complete matching native archive from the release URL in the diagnostic, then rerun `cargo rail cache setup`.
+A source installation has no archive driver authority
+and ignores archive-only driver files left beside it;
+Cargo still runs through the source installation's supported fallback.

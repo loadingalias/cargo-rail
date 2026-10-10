@@ -30,6 +30,13 @@ The release workflow packages these native archives:
 | Linux, Arm64         | `aarch64-unknown-linux-gnu` |
 | Windows, x86-64      | `x86_64-pc-windows-msvc` |
 
+Each release also publishes `cargo-rail-archive-hosts-v1.json`.
+Its `archives` map names the supported native archive hosts for that exact `version`;
+`unsupported_host_installation = "source"` selects source installation for other hosts, including Windows ARM64.
+The manifest is included in `SHA256SUMS` and GitHub build-provenance attestation.
+Verify it, require its version to match the selected release, and use its archive name exactly.
+The workspace target-resolution catalog does not declare archive availability.
+
 1. Download `cargo-rail-<target>.zip` and `SHA256SUMS` from the same
    [release](https://github.com/loadingalias/cargo-rail/releases).
 1. Compare the archive's SHA-256 with its entry in `SHA256SUMS`.

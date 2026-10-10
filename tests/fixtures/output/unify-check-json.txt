@@ -93,6 +93,7 @@ exit: Some(1)
   "feature_reachability": [],
   "has_blocking_issues": false,
   "has_changes": true,
+  "independent_workspaces": [],
   "issues": [],
   "mode": "check",
   "msrv": {

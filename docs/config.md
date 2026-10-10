@@ -147,6 +147,30 @@ paths = ["verification/**"]
 `--check` makes the same decision and exits `1` when edits are pending.
 `cargo rail unify apply` revalidates and writes the planned manifest changes.
 
+Declare standalone Cargo workspaces with `unify.cargo_manifests`:
+
+```toml
+[unify]
+cargo_manifests = ["fuzz/Cargo.toml", "tools/check/Cargo.toml"]
+```
+
+Each entry must name a contained workspace root with an existing `Cargo.lock`.
+Unify captures and resolves each workspace independently
+and reports its dependency repairs with its own snapshot and manifest.
+Apply includes those exact manifests and lockfiles in drift checks, backups, and recovery.
+This list is separate from `release.auxiliary_cargo_manifests` because the operations own different policy.
+A normal dependency unused in every normal compilation unit,
+retained by development compiler evidence, and referenced only in integration tests, examples,
+or benchmarks is moved to its matching `dev-dependencies` table.
+Production source and README references retain declarations conservatively.
+The move preserves its rename, features, requirement, target condition, and comments.
+An existing declaration in that destination is retained for manual review.
+
+Cargo's unused-dependency lint is a fast signal for one build.
+Unify checks the configured target and feature views before editing declarations.
+Both retain dependencies that rustc counts as used through another crate's re-export;
+Unify does not infer removal authority from source spelling alone.
+
 Top-level `targets` always remain the dependency-resolution authority.
 `unify.compiler_targets` selects where Unify acquires compiler evidence:
 
@@ -201,8 +225,14 @@ long-running acquisition keeps one bounded progress update on stderr every 30 se
 `--quiet` suppresses those updates.
 JSON written to stdout remains silent on stderr.
 
-Surface report contract v4 separates raw compiler observations from merged physical declarations
-and reports target scope independently from complete product, feature-profile, and doctest coverage.
+Surface report contract v5 separates raw compiler observations from merged physical declarations.
+Every selected target checks production code without linking.
+Tests, examples, benchmarks, and doctests are acquired only on a selected host view.
+The coverage object records their target views and reports incomplete target and doctest coverage
+when cross targets are selected.
+Cross-target inspection and checking remain available without a cross linker or `std`.
+Visibility repair requires host-only targets because missing test views cannot authorize an edit.
+Host doctests still require the host linker.
 Its `retention` section reports both denominators, per-predicate observation and unique-item counts,
 and at most three deterministic representatives per predicate.
 `--explain` additionally runs an omit-one-reason counterfactual before diagnostic policy;
@@ -219,6 +249,21 @@ It performs no mutation or external effect.
 The default `release.tag_format` is `{crate}-{prefix}{version}`.
 With the default `tag_prefix = "v"`, it produces tags such as `my-crate-v1.2.3` for both single-crate and multi-crate repositories.
 Repositories that use unqualified tags such as `v1.2.3` must set `tag_format = "{prefix}{version}"` explicitly.
+Override the format for one package with `[crates.NAME.release].tag_format`.
+The effective format controls both previous-tag lookup and new tags:
+
+```toml
+[release]
+tag_format = "{prefix}{version}"
+
+[crates.provider.release]
+tag_format = "{crate}-{prefix}{version}"
+```
+
+The other package keeps `v<version>` tags; `provider` looks up and creates only `provider-v<version>` tags.
+Without an override, the global format retains its current behavior.
+Text and JSON release output include the same configuration warnings,
+including colliding effective tag formats.
 
 `remote_effects` controls Git and forge effects.
 Registry publication is separate and requires both `registry_publication = "crates-io"` and `--publish` on the exact release invocation.
@@ -254,8 +299,14 @@ Standalone tools or fuzz workspaces
 that depend on released packages by path can declare their exact manifests with `auxiliary_cargo_manifests`.
 Cargo-Rail resolves each manifest's committed `Cargo.lock`,
 computes its post-release bytes in an isolated copy of the captured workspace,
-binds the before/after digests into the release plan,
-and writes only those lockfiles during release apply.
+binds exact manifest and lockfile contents plus their before/after digests into the release plan,
+and applies those frozen writes during release preparation.
+The primary workspace uses the same projection.
+Compatible path requirements of unselected packages and path-only dependencies stay unchanged.
+Released members retain the minimum-version refresh for their released local dependencies;
+shared workspace declarations used by those members refresh with them.
+An incompatible caret, tilde, or exact requirement on a local released package is retargeted to its
+new version; compound and inequality requirements that need editing are rejected before mutation.
 Each manifest and lockfile must be a regular file whose index identity,
 filter-cleaned worktree content, and executable mode exactly match `HEAD`;
 every local Cargo package must resolve inside the captured Git source.

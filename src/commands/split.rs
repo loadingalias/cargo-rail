@@ -509,7 +509,10 @@ pub fn run_split_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, dry_r
                 include: split.include,
                 exclude: split.exclude,
             }),
-            release: Some(CrateReleaseConfig { publish: split.publish }),
+            release: Some(CrateReleaseConfig {
+                publish: split.publish,
+                tag_format: None,
+            }),
             changelog: split.changelog_path.map(|path| ChangelogConfig {
                 path: Some(path),
                 skip: false,

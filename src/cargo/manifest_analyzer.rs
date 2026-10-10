@@ -234,6 +234,8 @@ pub struct ParsedManifest {
     pub(crate) source_cfg_expressions: BTreeSet<String>,
     /// Captured source/README identifiers that conservatively retain dependency declarations.
     pub(crate) retention_identifiers: BTreeSet<String>,
+    /// Captured identifiers confined to integration tests, benches, or examples.
+    pub(crate) development_only_identifiers: BTreeSet<String>,
     /// Whether `[package].rust-version` inherits the captured workspace value.
     pub(crate) inherits_workspace_msrv: bool,
     /// Captured declarations for Cargo-inheritable package fields other than MSRV.
@@ -521,6 +523,7 @@ impl ManifestAnalyzer {
             referenced,
             expressions,
             retention_identifiers,
+            development_only_identifiers,
         } = source_features;
         Ok(ParsedManifest {
             package_id: package_id.clone(),
@@ -532,6 +535,7 @@ impl ManifestAnalyzer {
             source_cfg_features: referenced,
             source_cfg_expressions: expressions,
             retention_identifiers,
+            development_only_identifiers,
             inherits_workspace_msrv,
             package_fields,
             dependencies,

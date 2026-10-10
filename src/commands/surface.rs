@@ -38,9 +38,9 @@ use crate::surface::{
 };
 use crate::workspace::{CargoState, WorkspaceContext, WorkspaceSnapshot};
 
-const SURFACE_CONTRACT_VERSION: u32 = 4;
+const SURFACE_CONTRACT_VERSION: u32 = 5;
 const SURFACE_PREPARATION_CONTRACT_VERSION: u32 = 3;
-const SURFACE_SCHEMA_JSON: &str = include_str!("../../schemas/surface-v4.schema.json");
+const SURFACE_SCHEMA_JSON: &str = include_str!("../../schemas/surface-v5.schema.json");
 
 /// Options for the `surface` domain command.
 #[derive(Debug)]
@@ -137,6 +137,8 @@ struct SurfaceCoverageReport {
     target_scope: &'static str,
     target_views: Vec<String>,
     target_coverage_complete: bool,
+    nonproduction_target_views: Vec<String>,
+    doctest_target_views: Vec<String>,
     product_coverage_complete: bool,
     product_count: usize,
     feature_profile_coverage_complete: bool,
@@ -386,6 +388,12 @@ pub fn run_surface(ctx: &WorkspaceContext, options: SurfaceOptions) -> RailResul
         );
     }
 
+    if initial.targets.iter().any(|target| target != "default") {
+        return Err(RailError::with_help(
+            "surface visibility repair requires complete test and doctest target coverage",
+            "cross-target analysis checks production code and reports host-only test coverage; use surface.targets = [\"host\"] for visibility repair",
+        ));
+    }
     let (plan, updates) = plan_visibility_mutation(ctx, &initial.findings)?;
     if options.dry_run || !initial.configuration_diagnostics.is_empty() {
         let report = build_report(
@@ -470,7 +478,7 @@ fn prepare_surface(ctx: &WorkspaceContext, options: &SurfaceOptions) -> RailResu
     )?;
     let acquisition =
         surface_acquisition_plan_report(ctx.workspace_root(), selected_targets.clone(), products, preview)?;
-    let targets = preflight_surface_targets(snapshot, &selected_targets)?;
+    let targets = preflight_surface_targets(snapshot, &selected_targets, !doctest_packages.is_empty())?;
     let readiness = CompilerFactDriverAuthority::prepare_surface(snapshot)?;
     ctx.validate_snapshot_unchanged()?;
     let report = SurfacePreparationReport {
@@ -554,10 +562,10 @@ fn analyze_surface(
     let cache_identity = CompilerCacheIdentity::capture(snapshot)?;
     let workspace_targets = ctx.config().map(|config| config.targets.as_slice()).unwrap_or_default();
     let targets = selected_target_views(config, workspace_targets);
-    let prerequisites = preflight_surface_targets(snapshot, &targets)?;
     let target_refs = targets.iter().map(String::as_str).collect::<Vec<_>>();
     let typed_packages = surface_typed_packages(&workspace_packages);
     let doctest_packages = surface_doctest_packages(config, &workspace_packages);
+    let prerequisites = preflight_surface_targets(snapshot, &targets, !doctest_packages.is_empty())?;
     let products = acquisition_products(config, &workspace_packages);
     let acquisition = CompilerAcquisitionRequest {
         workspace_identity: snapshot.id().to_string(),
@@ -588,10 +596,15 @@ fn analyze_surface(
     );
     for prerequisite in prerequisites {
         progress!(
-            "  Target prerequisite: {} / rust-std={} / linker={} / linked probe=ready",
+            "  Target prerequisite: {} / rust-std={} / linker={} / linked probe={}",
             prerequisite.target,
             prerequisite.rust_standard_library,
             prerequisite.linker,
+            if prerequisite.linked_probe {
+                "ready"
+            } else {
+                "not required"
+            },
         );
     }
     let evidence = if feature_profiles.is_empty() {
@@ -1347,18 +1360,27 @@ fn is_library_target(kind: &TargetKind) -> bool {
 fn preflight_surface_targets(
     snapshot: &WorkspaceSnapshot,
     selected_targets: &[String],
+    doctests: bool,
 ) -> RailResult<Vec<SurfaceTargetReadinessReport>> {
     use crate::compiler::target_preflight::{TargetPreflight, TargetUse, require_ready};
 
-    // Surface compiles a standard-library driver, so every selected target must link.
     let selected = selected_targets
         .iter()
-        .map(|target| (target.as_str(), TargetUse::Link))
+        .map(|target| {
+            (
+                target.as_str(),
+                if target == "default" && doctests {
+                    TargetUse::Link
+                } else {
+                    TargetUse::Check
+                },
+            )
+        })
         .collect::<Vec<_>>();
     let ready = require_ready(
         TargetPreflight::capture(snapshot).check(&selected),
         "Surface",
-        "install each selected Rust target library and configure its real SDK/linker environment before retrying Surface",
+        "install each selected Rust target library; host doctests also require the host SDK/linker",
     )?;
     Ok(ready
         .into_iter()
@@ -1913,12 +1935,27 @@ fn surface_coverage_report(
     SurfaceCoverageReport {
         target_scope,
         target_views: targets.to_vec(),
-        target_coverage_complete: true,
+        target_coverage_complete: targets.iter().all(|target| target == "default"),
+        nonproduction_target_views: targets
+            .iter()
+            .filter(|target| target.as_str() == "default")
+            .cloned()
+            .collect(),
+        doctest_target_views: if config.doctest_coverage == SurfaceDoctestCoverage::Automatic {
+            targets
+                .iter()
+                .filter(|target| target.as_str() == "default")
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        },
         product_coverage_complete: true,
         product_count: products.len(),
         feature_profile_coverage_complete: true,
         feature_profile_count,
-        doctest_coverage_complete: true,
+        doctest_coverage_complete: config.doctest_coverage != SurfaceDoctestCoverage::Automatic
+            || targets.iter().all(|target| target == "default"),
         doctest_view_count,
     }
 }
@@ -2102,13 +2139,16 @@ fn render_text(report: &SurfaceReport, explain: bool) -> String {
         output.push_str(" configuration diagnostic(s)\n");
     }
     output.push_str(&format!(
-        "Coverage: {} target scope ({} complete target view(s)); {} complete product(s); {} complete feature profile(s); {} complete doctest view(s)\n",
+        "Coverage: {} target scope ({} production target view(s)); {} complete product(s); {} complete feature profile(s); {} complete doctest view(s)\n",
         report.coverage.target_scope,
         report.coverage.target_views.len(),
         report.coverage.product_count,
         report.coverage.feature_profile_count,
         report.coverage.doctest_view_count,
     ));
+    if !report.coverage.target_coverage_complete {
+        output.push_str("Cross-target production code is checked without linking. Tests and doctests are checked on the selected host view only; visibility repair requires host-only targets.\n");
+    }
     if crate::output::is_verbose() {
         output.push_str("Snapshot: ");
         output.push_str(&report.snapshot.identity);

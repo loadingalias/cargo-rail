@@ -122,10 +122,27 @@ pub(crate) fn assess(
             }
         }
     } else {
-        "first release has no prior release tag to compare".into()
+        let observation = if policy == SemverCheckPolicy::Deny {
+            super::registry::RegistryObserver::new(super::packages::SPARSE_INDEX)
+                .map_err(|error| error.to_string())
+                .and_then(|observer| observer.has_published_versions(crate_name))
+        } else {
+            Err("prior registry publication was not queried under warn policy".into())
+        };
+        let (outcome, detail) = missing_baseline(observation);
+        evidence.outcome = outcome;
+        detail
     };
     evidence.require_ready(crate_name)?;
     Ok(evidence)
+}
+
+fn missing_baseline(publication: Result<bool, String>) -> (ApiOutcome, String) {
+    match publication {
+        Ok(false) => (ApiOutcome::NotApplicable, "crates.io reports no published versions; first release has no baseline".into()),
+        Ok(true) => (ApiOutcome::Unavailable, "published library has no matching release tag; set release.tag_format or crates.NAME.release.tag_format to its existing tag line".into()),
+        Err(reason) => (ApiOutcome::Unavailable, format!("no matching release tag and first release is unproven: {reason}; configure the crate's existing tag line")),
+    }
 }
 
 /// Whether a workspace package has a library-like public API target.
@@ -218,6 +235,29 @@ fn first_message(stderr: &str, stdout: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_tag_requires_positive_first_release_evidence() {
+        let (outcome, detail) = missing_baseline(Ok(true));
+        assert_eq!(outcome, ApiOutcome::Unavailable);
+        assert!(detail.contains("published library has no matching release tag"));
+        assert_eq!(missing_baseline(Ok(false)).0, ApiOutcome::NotApplicable);
+        assert_eq!(missing_baseline(Err("offline".into())).0, ApiOutcome::Unavailable);
+        let evidence = ApiEvidence {
+            outcome,
+            baseline: None,
+            target: "host".into(),
+            required: true,
+            detail,
+        };
+        assert!(
+            evidence
+                .require_ready("library")
+                .unwrap_err()
+                .to_string()
+                .contains("blocks release")
+        );
+    }
 
     #[test]
     fn success_is_pass() {

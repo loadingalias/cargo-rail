@@ -28,6 +28,21 @@ Commit all inputs before submitting a hosted request.
 | Protected branch                         | `cargo rail release run --all --pr --publish` |
 
 The selected package set and dependent closure belong to the original intent.
+Published transitive workspace dependents must be selected,
+even if their requirements remain compatible.
+`--include-dependents` selects those published dependents and requires their release intent.
+Members with Cargo `publish = false` are excluded from implicit closure.
+They receive no package bump, changelog, change-file requirement, or tag unless explicitly selected.
+Version groups remain explicit release policy.
+
+Cargo-Rail projects the primary and declared auxiliary workspaces before creating a transaction.
+It preserves compatible requirements of unselected packages and path-only declarations.
+Selected released dependents retain the existing minimum-version refresh,
+including shared workspace requirements.
+It retargets incompatible simple local requirements and rejects ambiguous compound
+or inequality edits before mutation.
+Cargo validates each projected lockfile with `metadata --locked`.
+The plan stores exact manifest and lockfile writes for preparation, drift detection, and recovery.
 Review the check output before requesting publication.
 Omit `--publish` when the release only creates Git and forge objects.
 
@@ -39,7 +54,16 @@ Use an explicit bump when the manifests already contain the intended release ver
 
 The default tag format is `{crate}-{prefix}{version}` for every repository shape.
 With the default `tag_prefix = "v"`, package `my-crate` version `1.2.3` receives `my-crate-v1.2.3`.
-Set `tag_format = "{prefix}{version}"` explicitly when an existing single-crate repository uses `v1.2.3` tags.
+Set `tag_format = "{prefix}{version}"` explicitly when an existing repository uses `v1.2.3` tags.
+A `[crates.NAME.release].tag_format` override gives another package its own previous-tag and new-tag line.
+No alias tags are needed when each package's effective format matches its existing history.
+
+With `semver_check = "deny"`, a published library without a matching previous tag has unavailable compatibility evidence
+and blocks release.
+A first release is established only by a successful crates.io observation showing no published
+versions.
+Registry errors and unavailable observations cannot establish a first release.
+The `warn` policy reports a missing baseline without blocking; `off` skips the check.
 When an existing GitHub changelog uses linked `/compare/` headings,
 generated headings preserve that style and compare the previous tag with the planned tag.
 

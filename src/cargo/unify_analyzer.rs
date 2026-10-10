@@ -56,6 +56,7 @@ pub struct UnifyAnalyzer {
     target_cfg_sets: Arc<std::collections::HashMap<String, TargetCfgSet>>,
     compiler_cache_identity: CompilerCacheIdentity,
     target_preflight: crate::compiler::target_preflight::TargetPreflight,
+    independent_contexts: Vec<WorkspaceContext>,
 }
 
 struct BorrowedFeatureUsage<'a> {
@@ -117,6 +118,18 @@ impl UnifyAnalyzer {
         let compiler_cache_identity = CompilerCacheIdentity::capture(snapshot)?;
         let target_preflight = crate::compiler::target_preflight::TargetPreflight::capture(snapshot);
 
+        let mut independent_contexts = Vec::new();
+        let mut roots = BTreeSet::new();
+        for manifest in &config.cargo_manifests {
+            let context = ctx.capture_independent_workspace(manifest)?;
+            if !roots.insert(context.workspace_root().to_path_buf()) {
+                return Err(crate::error::RailError::message(
+                    "unify.cargo_manifests repeats a standalone Cargo workspace",
+                ));
+            }
+            independent_contexts.push(context);
+        }
+        independent_contexts.sort_by(|left, right| left.workspace_root().cmp(right.workspace_root()));
         Ok(Self {
             metadata,
             manifests,
@@ -131,6 +144,7 @@ impl UnifyAnalyzer {
             target_cfg_sets,
             compiler_cache_identity,
             target_preflight,
+            independent_contexts,
         })
     }
 
@@ -1137,6 +1151,7 @@ impl UnifyAnalyzer {
         });
 
         Ok(UnificationPlan {
+            independent_workspaces: self.independent_dependency_plans()?,
             workspace_deps,
             member_edits,
             member_paths,
@@ -1153,6 +1168,62 @@ impl UnifyAnalyzer {
             package_inheritance,
             dependency_decisions,
         })
+    }
+
+    fn independent_dependency_plans(&self) -> RailResult<Vec<crate::cargo::unify_types::IndependentDependencyPlan>> {
+        let mut plans = Vec::new();
+        for context in &self.independent_contexts {
+            context.validate_snapshot_unchanged()?;
+            let snapshot = context.snapshot()?;
+            let metadata = context.multi_target_metadata()?;
+            let members = context.cargo().workspace_members();
+            let manifests = ManifestAnalyzer::parse_snapshot(snapshot, &members)?;
+            let cfg_sets = context.target_cfg_sets()?;
+            let identity = CompilerCacheIdentity::capture(snapshot)?;
+            let preflight = crate::compiler::target_preflight::TargetPreflight::capture(snapshot);
+            let finder = UnusedDepFinder::new(
+                context.workspace_root(),
+                &metadata,
+                &manifests,
+                &cfg_sets,
+                &[],
+                &self.config,
+                &identity,
+            )
+            .with_target_preflight(&preflight);
+            let unused_deps = finder.find()?;
+            let member_edits = finder
+                .generate_removal_edits(&unused_deps)
+                .into_iter()
+                .map(|(member, edits)| (Arc::from(member), edits))
+                .collect();
+            context.validate_snapshot_unchanged()?;
+            plans.push(crate::cargo::unify_types::IndependentDependencyPlan {
+                workspace_root: context.workspace_root().to_path_buf(),
+                snapshot_id: snapshot.id().to_string(),
+                member_paths: members
+                    .iter()
+                    .map(|package| {
+                        (
+                            Arc::from(package.name.as_str()),
+                            package.manifest_path.clone().into_std_path_buf(),
+                        )
+                    })
+                    .collect(),
+                coverage_views: crate::compiler::scheduler::planned_coverage_views(
+                    &manifests.members,
+                    &self.config.effective_compiler_targets(&metadata.targets()),
+                    &cfg_sets,
+                )?,
+                unused_deps,
+                member_edits,
+            });
+        }
+        Ok(plans)
+    }
+
+    pub(crate) fn independent_contexts(&self) -> &[WorkspaceContext] {
+        &self.independent_contexts
     }
 
     /// Derive executable feature/target inputs from this analyzer's captured graph.

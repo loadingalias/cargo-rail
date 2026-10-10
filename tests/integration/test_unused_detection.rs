@@ -1237,7 +1237,7 @@ tracing_log = { package = "log", version = "0.4" }
         let check = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
         let check_stdout = String::from_utf8_lossy(&check.stdout);
         assert!(
-            check_stdout.contains("Unused dependencies flagged for removal"),
+            check_stdout.contains("Dependency declarations flagged for repair"),
             "{check_stdout}"
         );
         assert!(
@@ -1480,18 +1480,30 @@ required-features = ["example-gate"]
         )?;
         workspace.commit("Use dependency from a required-features example")?;
 
-        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--explain"])?;
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let output = run_cargo_rail(&workspace.path, &["rail", "unify", "--check", "--format", "json"])?;
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let proof = report["proof_certificates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|proof| proof["subject"]["declaration"] == "log")
+            .expect("required-features example dependency repair");
+        assert_eq!(proof["decision"], "move_to_dev_dependencies", "{report}");
         assert!(
-            !String::from_utf8_lossy(&output.stdout).contains("Remove log"),
-            "required-features Cargo targets must contribute usage evidence\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            proof["used_observations"].as_u64().is_some_and(|count| count > 0),
+            "{report}"
         );
         assert!(
-            !stderr.contains("Compiler evidence plan:"),
-            "captured source retention made the compiler result irrelevant, but Unify still scheduled it:\n{stderr}"
+            proof["unused_observations"].as_u64().is_some_and(|count| count > 0),
+            "{report}"
         );
+        let apply = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
+        assert!(apply.status.success(), "{apply:?}");
+        let check = cargo_command(&workspace.path)
+            .args(["check", "--locked", "--example", "gated", "--features", "example-gate"])
+            .output()?;
+        assert!(check.status.success(), "{check:?}");
 
         Ok(())
     })();
@@ -2163,8 +2175,8 @@ edition = "2021"
         let entries = cache["entries"].as_object().expect("cache entries object");
         let entry = entries.values().next().expect("at least one cache entry");
         assert_eq!(
-            entry["collector_version"], 16,
-            "native compiler result reuse requires collector semantics version 16"
+            entry["collector_version"], 17,
+            "native compiler result reuse requires collector semantics version 17"
         );
         assert!(
             entry["key"]["package_id"].as_str().is_some(),

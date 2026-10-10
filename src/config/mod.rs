@@ -234,6 +234,19 @@ impl RailConfig {
                     crate::release::changelog::ChangelogSpec::resolve(&self.release.changelog, Some(config)).map(drop)
                 }),
         );
+        for (name, config) in &self.crates {
+            if config
+                .release
+                .as_ref()
+                .and_then(|config| config.tag_format.as_deref())
+                .is_some_and(|format| format.trim().is_empty())
+            {
+                checks.push(Err(RailError::Config(ConfigError::InvalidField {
+                    field: format!("crates.{name}.release.tag_format"),
+                    reason: "tag_format cannot be empty".into(),
+                })));
+            }
+        }
         checks.into_iter().filter_map(Result::err).collect()
     }
 
@@ -268,6 +281,43 @@ impl RailConfig {
         self.validate_workspace(workspace_root, workspace_members)
     }
 
+    pub(crate) fn release_warnings(&self, members: &[String]) -> RailResult<Vec<String>> {
+        let mut warnings = self.release.validate(members).map_err(RailError::Config)?;
+        let mut namespaces = std::collections::HashSet::new();
+        let collision = members.iter().any(|name| {
+            !namespaces.insert(
+                self.release_tag_format_override(name)
+                    .unwrap_or(&self.release.tag_format)
+                    .replace("{crate}", name)
+                    .replace("{prefix}", &self.release.tag_prefix)
+                    .replace("{version}", "*"),
+            )
+        });
+        if !collision {
+            warnings.retain(|warning| !warning.starts_with("release.tag_format does not contain {crate}"));
+        } else if self.release.tag_format.contains("{crate}") {
+            warnings
+                .push("crate release tag formats share a namespace; choose a distinct tag line for each crate".into());
+        }
+        for (name, config) in &self.crates {
+            if let Some(format) = config.release.as_ref().and_then(|config| config.tag_format.as_ref())
+                && !format.contains("{version}")
+            {
+                warnings.push(format!(
+                    "crates.{name}.release.tag_format does not contain {{version}}; tags may not identify releases"
+                ));
+            }
+        }
+        Ok(warnings)
+    }
+
+    pub(crate) fn release_tag_format_override(&self, name: &str) -> Option<&str> {
+        self.crates
+            .get(name)
+            .and_then(|config| config.release.as_ref())
+            .and_then(|config| config.tag_format.as_deref())
+    }
+
     /// Validate repository-bound rules for policy whose [`Self::validate_policy`] passed.
     pub(crate) fn validate_workspace(
         &self,
@@ -281,7 +331,7 @@ impl RailConfig {
         if !self.targets.is_empty() {
             crate::targets::validate_targets(&self.targets)?;
         }
-        let warnings = self.release.validate(workspace_members).map_err(RailError::Config)?;
+        let warnings = self.release_warnings(workspace_members)?;
         for (crate_name, crate_config) in &self.crates {
             // A split table may name a combined-repository boundary rather
             // than one Cargo package. Per-package release/changelog tables

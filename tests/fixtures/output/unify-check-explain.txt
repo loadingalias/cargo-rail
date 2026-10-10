@@ -16,7 +16,7 @@ Package inheritance:
     planned:
       crates/app/Cargo.toml: [package].license = { workspace = true }
 
-Unused dependencies flagged for removal:
+Dependency declarations flagged for repair:
 
   helper in app
     reason: NotUsedInSource

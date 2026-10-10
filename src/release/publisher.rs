@@ -11,7 +11,6 @@ use crate::release::state::{
     BackupRestorePolicy, Preparation, ReleasePhase, ReleaseState, ReleaseStateCreate, ReleaseStatus, StepStatus,
     normalize_release_path, normalize_release_paths, validate_state_path,
 };
-use crate::release::version::VersionBumper;
 use crate::source::ContentDigest;
 use crate::utils::canonicalize_existing;
 use crate::workspace::WorkspaceContext;
@@ -713,15 +712,10 @@ impl<'a> ReleasePublisher<'a> {
                 crate_plan.current_version,
                 crate_plan.new_version
             );
-            self.bump_crate_version(crate_plan)?;
-            if !crate_plan.affected_dependents.is_empty() {
-                self.update_dependents(crate_plan)?;
-            }
             self.update_changelog(crate_plan)?;
         }
         self.consume_change_files(plan)?;
-        self.update_lockfile(plan)?;
-        self.write_auxiliary_lockfiles(plan)
+        self.write_cargo_writes(plan)
     }
 
     fn reconcile_local_tags(&self, state: &mut ReleaseState, state_path: &Path) -> RailResult<()> {
@@ -1110,106 +1104,49 @@ impl<'a> ReleasePublisher<'a> {
         self.reconcile_forge(state, state_path, assets, true)
     }
 
-    /// Bump version in Cargo.toml
-    fn bump_crate_version(&self, plan: &CrateReleasePlan) -> RailResult<()> {
-        use crate::release::version::BumpType;
-        let bump = BumpType::Exact(plan.new_version.clone());
-        VersionBumper::bump_version(&self.ctx.workspace_root().join(&plan.manifest_path), bump)?;
-        Ok(())
-    }
-
-    /// Update dependent crates to use new version
-    fn update_dependents(&self, plan: &CrateReleasePlan) -> RailResult<()> {
-        // Update [workspace.dependencies] in root Cargo.toml
-        let root_manifest = self.ctx.workspace_root().join("Cargo.toml");
-        VersionBumper::update_workspace_dependency(&root_manifest, &plan.name, &plan.new_version)?;
-
-        // Update dependent crate manifests
-        for dependent_name in &plan.affected_dependents {
-            if let Some(pkg) = self.ctx.cargo().get_package(dependent_name) {
-                let manifest_path = pkg.manifest_path.clone().into_std_path_buf();
-                VersionBumper::update_dependency_version(&manifest_path, &plan.name, &plan.new_version)?;
+    fn write_cargo_writes(&self, plan: &ReleasePlan) -> RailResult<()> {
+        let root = canonicalize_existing(self.ctx.workspace_root())?;
+        for write in &plan.cargo_writes {
+            let path = self.ctx.workspace_root().join(&write.path);
+            let parent = canonicalize_existing(
+                path.parent()
+                    .ok_or_else(|| RailError::message("Cargo file has no parent"))?,
+            )?;
+            if !parent.starts_with(&root) {
+                return Err(RailError::message(format!(
+                    "planned Cargo file '{}' resolves outside the workspace",
+                    write.path.display()
+                )));
             }
-        }
-
-        Ok(())
-    }
-
-    fn update_lockfile(&self, plan: &ReleasePlan) -> RailResult<()> {
-        let mut args = vec!["update"];
-        for package in &plan.crates {
-            args.extend(["--package", package.name.as_str()]);
-        }
-        let output = process::run("cargo", &args, Some(self.ctx.workspace_root()))?;
-        if !output.status.success() {
-            return Err(RailError::message(format!(
-                "Cargo could not update the selected release packages: {}",
-                String::from_utf8_lossy(&output.stderr),
-            )));
-        }
-        Ok(())
-    }
-
-    fn write_auxiliary_lockfiles(&self, plan: &ReleasePlan) -> RailResult<()> {
-        let workspace_root = canonicalize_existing(self.ctx.workspace_root())?;
-        for projection in &plan.auxiliary_lockfiles {
-            let path = self.ctx.workspace_root().join(&projection.lockfile_path);
-            let metadata = fs::symlink_metadata(&path).map_err(|error| {
-                RailError::message(format!(
-                    "failed to inspect planned auxiliary Cargo lockfile '{}': {error}",
-                    projection.lockfile_path.display()
-                ))
-            })?;
-            if !metadata.file_type().is_file() || crate::utils::is_symlink_or_reparse(&metadata) {
-                return Err(RailError::with_help(
-                    format!(
-                        "planned auxiliary Cargo lockfile '{}' is not a regular file",
-                        projection.lockfile_path.display()
-                    ),
-                    "restore the committed lockfile, regenerate the release plan, and retry",
-                ));
-            }
-            let parent = path
-                .parent()
-                .ok_or_else(|| RailError::message("auxiliary Cargo lockfile has no parent directory"))?;
-            let parent = canonicalize_existing(parent)?;
-            if !parent.starts_with(&workspace_root) {
-                return Err(RailError::with_help(
-                    format!(
-                        "auxiliary Cargo lockfile '{}' resolves outside workspace '{}'",
-                        projection.lockfile_path.display(),
-                        workspace_root.display()
-                    ),
-                    "keep release.auxiliary_cargo_manifests and their lockfiles inside the workspace",
-                ));
-            }
-
-            let current = fs::read(&path)?;
-            let current_digest = release_content_digest(&current);
-            if current_digest == projection.after_digest {
+            let current = match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_file() && !crate::utils::is_symlink_or_reparse(&metadata) => {
+                    Some(release_content_digest(&fs::read(&path)?))
+                }
+                Ok(_) => {
+                    return Err(RailError::message(format!(
+                        "planned Cargo file '{}' is not a regular file",
+                        write.path.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            if current.as_deref() == Some(write.after_digest.as_str()) {
                 continue;
             }
-            if current_digest != projection.before_digest {
+            if current != write.before_digest {
                 return Err(RailError::with_help(
-                    format!(
-                        "auxiliary Cargo lockfile '{}' drifted (planned {}, current {})",
-                        projection.lockfile_path.display(),
-                        projection.before_digest,
-                        current_digest
-                    ),
-                    "restore the planned lockfile bytes or regenerate the release plan",
+                    format!("planned Cargo file '{}' drifted", write.path.display()),
+                    "restore the planned bytes or regenerate the release plan",
                 ));
             }
-            if release_content_digest(projection.content.as_bytes()) != projection.after_digest {
-                return Err(RailError::with_help(
-                    format!(
-                        "release plan contains inconsistent post-release bytes for '{}'",
-                        projection.lockfile_path.display()
-                    ),
-                    "discard the release state or plan file and regenerate it with this cargo-rail version",
-                ));
+            if release_content_digest(write.content.as_bytes()) != write.after_digest {
+                return Err(RailError::message(format!(
+                    "release plan contains inconsistent Cargo bytes for '{}'",
+                    write.path.display()
+                )));
             }
-            crate::utils::write_file_atomic(&path, projection.content.as_bytes())?;
+            crate::utils::write_file_atomic(&path, write.content.as_bytes())?;
         }
         Ok(())
     }

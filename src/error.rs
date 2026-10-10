@@ -133,6 +133,14 @@ pub enum RailError {
         source: Box<RailError>,
     },
 
+    /// Warnings already reported before an operation failed.
+    WithWarnings {
+        /// Warning messages retained for machine output.
+        warnings: Vec<String>,
+        /// The original failure, with its class, help, and exit behavior.
+        source: Box<RailError>,
+    },
+
     /// Generic error with an optional recovery hint.
     Message {
         /// Error message
@@ -200,7 +208,7 @@ impl RailError {
     pub fn classified(&self) -> Option<&ClassifiedFailure> {
         match self {
             RailError::Failure(failure) => Some(failure),
-            RailError::Context { source, .. } => source.classified(),
+            RailError::Context { source, .. } | RailError::WithWarnings { source, .. } => source.classified(),
             _ => None,
         }
     }
@@ -216,6 +224,10 @@ impl RailError {
             }
             RailError::Context { context, source } => RailError::Context {
                 context,
+                source: Box::new(source.with_additional_help(additional)),
+            },
+            RailError::WithWarnings { warnings, source } => RailError::WithWarnings {
+                warnings,
                 source: Box::new(source.with_additional_help(additional)),
             },
             RailError::Message { message, help } => RailError::Message {
@@ -241,6 +253,27 @@ impl RailError {
         }
     }
 
+    pub(crate) fn with_warnings(self, warnings: Vec<String>) -> Self {
+        if warnings.is_empty() || matches!(self, Self::CheckHasPendingChanges | Self::ExitWithCode { .. }) {
+            self
+        } else {
+            Self::WithWarnings {
+                warnings,
+                source: Box::new(self),
+            }
+        }
+    }
+
+    fn warnings(&self) -> Vec<&str> {
+        match self {
+            Self::WithWarnings { warnings, source } => {
+                warnings.iter().map(String::as_str).chain(source.warnings()).collect()
+            }
+            Self::Context { source, .. } => source.warnings(),
+            _ => Vec::new(),
+        }
+    }
+
     fn external(message: &'static str, source: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::External {
             message,
@@ -253,7 +286,7 @@ impl RailError {
         match self {
             RailError::CheckHasPendingChanges => ExitCode::CheckFailed,
             RailError::ExitWithCode { code } => ExitCode::Custom(*code),
-            RailError::Context { source, .. } => source.exit_code(),
+            RailError::Context { source, .. } | RailError::WithWarnings { source, .. } => source.exit_code(),
             _ => ExitCode::Error,
         }
     }
@@ -265,7 +298,7 @@ impl RailError {
             RailError::Git(e) => e.help_message(),
             RailError::Message { help, .. } => help.clone(),
             RailError::Failure(failure) => Some(failure.help.clone()),
-            RailError::Context { source, .. } => source.help_message(),
+            RailError::Context { source, .. } | RailError::WithWarnings { source, .. } => source.help_message(),
             _ => None,
         }
     }
@@ -274,7 +307,7 @@ impl RailError {
     pub fn is_broken_pipe(&self) -> bool {
         match self {
             RailError::Io(error) => error.kind() == io::ErrorKind::BrokenPipe,
-            RailError::Context { source, .. } => source.is_broken_pipe(),
+            RailError::Context { source, .. } | RailError::WithWarnings { source, .. } => source.is_broken_pipe(),
             _ => false,
         }
     }
@@ -282,9 +315,15 @@ impl RailError {
     fn machine_parts(&self) -> (String, Option<String>) {
         let mut contexts = Vec::new();
         let mut current = self;
-        while let RailError::Context { context, source } = current {
-            contexts.push(context.as_str());
-            current = source;
+        loop {
+            match current {
+                RailError::Context { context, source } => {
+                    contexts.push(context.as_str());
+                    current = source;
+                }
+                RailError::WithWarnings { source, .. } => current = source,
+                _ => break,
+            }
         }
 
         let message = match current {
@@ -306,6 +345,7 @@ impl fmt::Display for RailError {
             RailError::Io(e) => write!(f, "{}", e),
             RailError::External { message, source } => write!(f, "{}: {}", message, source),
             RailError::Context { context, source } => write!(f, "{}\n{}", source, context),
+            RailError::WithWarnings { source, .. } => write!(f, "{source}"),
             RailError::Message { message, .. } => write!(f, "{}", message),
             RailError::Failure(failure) => write!(f, "{}", failure.message),
             RailError::CheckHasPendingChanges => Ok(()), // Silent - CI signal
@@ -321,7 +361,7 @@ impl std::error::Error for RailError {
             RailError::Git(e) => Some(e),
             RailError::Io(e) => Some(e),
             RailError::External { source, .. } => Some(source.as_ref()),
-            RailError::Context { source, .. } => Some(source.as_ref()),
+            RailError::Context { source, .. } | RailError::WithWarnings { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }
@@ -657,7 +697,7 @@ where
 
 /// Structured JSON error for machine-readable output
 #[derive(serde::Serialize)]
-struct JsonError {
+struct JsonError<'a> {
     error: bool,
     code: i32,
     message: String,
@@ -667,6 +707,8 @@ struct JsonError {
     help: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure_class: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<&'a str>,
 }
 
 /// Print an error to stderr with optional help text
@@ -708,6 +750,7 @@ fn print_error_json(error: &RailError) {
         context,
         help: error.help_message(),
         failure_class: error.classified().map(|failure| failure.class().as_str()),
+        warnings: error.warnings(),
     };
 
     // JSON errors go to stdout for consistent machine parsing
@@ -723,6 +766,30 @@ fn print_error_json(error: &RailError) {
 mod tests {
     use super::*;
     use std::error::Error as _;
+
+    #[test]
+    fn warning_context_preserves_failure_authority_and_silent_exits() {
+        let failure = RailError::failure(FailureClass::Source, "compile failed", "fix source", None)
+            .with_warnings(vec!["tag collision".into()])
+            .context("release check")
+            .with_additional_help("retry");
+        assert_eq!(failure.warnings(), ["tag collision"]);
+        assert_eq!(
+            failure.machine_parts(),
+            ("compile failed".into(), Some("release check".into()))
+        );
+        assert_eq!(failure.classified().unwrap().class(), FailureClass::Source);
+        assert_eq!(failure.help_message().as_deref(), Some("fix source\nretry"));
+        assert_eq!(failure.exit_code().as_i32(), 2);
+        assert!(matches!(
+            RailError::CheckHasPendingChanges.with_warnings(vec!["tag collision".into()]),
+            RailError::CheckHasPendingChanges
+        ));
+        assert!(matches!(
+            RailError::ExitWithCode { code: 2 }.with_warnings(vec!["tag collision".into()]),
+            RailError::ExitWithCode { code: 2 }
+        ));
+    }
 
     fn rail_source(error: &RailError) -> &RailError {
         error

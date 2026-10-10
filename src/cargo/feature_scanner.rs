@@ -34,6 +34,8 @@ pub(crate) struct CapturedSourceFeatures {
     /// These conservatively retain declarations when compiler evidence cannot
     /// distinguish a documented integration from an accidental unused entry.
     pub(crate) retention_identifiers: BTreeSet<String>,
+    /// Identifiers mentioned only by tests, benches, or examples.
+    pub(crate) development_only_identifiers: BTreeSet<String>,
 }
 
 /// Derive source feature evidence from one authoritative workspace capture.
@@ -44,7 +46,8 @@ pub(crate) fn scan_snapshot_source_features(
     let mut selections = BTreeSet::new();
     let mut referenced = BTreeSet::new();
     let mut expressions = BTreeSet::new();
-    let mut retention_identifiers = BTreeSet::new();
+    let mut development_identifiers = BTreeSet::new();
+    let mut nondevelopment_identifiers = BTreeSet::new();
     let entries = snapshot.source().tree().entries();
     let package_start = entries.partition_point(|entry| entry.path.as_path() < package_root);
     for entry in &entries[package_start..] {
@@ -63,7 +66,14 @@ pub(crate) fn scan_snapshot_source_features(
         })?;
         let content = std::str::from_utf8(&bytes)
             .map_err(|_| RailError::message(format!("captured analysis source '{}' is not valid UTF-8", entry.path)))?;
-        extract_identifiers(content, &mut retention_identifiers);
+        if ["tests", "benches", "examples"]
+            .iter()
+            .any(|root| package_path.starts_with(root))
+        {
+            extract_identifiers(content, &mut development_identifiers);
+        } else {
+            extract_identifiers(content, &mut nondevelopment_identifiers);
+        }
         if !rust_source {
             continue;
         }
@@ -82,7 +92,14 @@ pub(crate) fn scan_snapshot_source_features(
             .collect(),
         referenced,
         expressions,
-        retention_identifiers,
+        retention_identifiers: development_identifiers
+            .union(&nondevelopment_identifiers)
+            .cloned()
+            .collect(),
+        development_only_identifiers: development_identifiers
+            .difference(&nondevelopment_identifiers)
+            .cloned()
+            .collect(),
     })
 }
 

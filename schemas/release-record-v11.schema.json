@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/loadingalias/cargo-rail/blob/main/schemas/release-record-v10.schema.json",
-  "title": "Cargo-Rail release execution record v10",
+  "$id": "https://github.com/loadingalias/cargo-rail/blob/main/schemas/release-record-v11.schema.json",
+  "title": "Cargo-Rail release execution record v11",
   "description": "Complete portable release intent and progress. Consumers must also verify canonical intent identity, semantic consistency, checkout and invocation authority. Credentials are never record fields.",
   "type": "object",
   "additionalProperties": false,
@@ -28,7 +28,7 @@
   "properties": {
     "schema_version": {
       "enum": [
-        10
+        11
       ]
     },
     "transaction_id": {
@@ -885,14 +885,14 @@
         "summary",
         "change_files_to_delete",
         "change_files_to_update",
-        "auxiliary_lockfiles",
+        "cargo_writes",
         "skipped",
         "artifacts"
       ],
       "properties": {
         "plan_contract_version": {
           "enum": [
-            9
+            10
           ]
         },
         "snapshot_id": {
@@ -963,37 +963,6 @@
             }
           }
         },
-        "auxiliary_lockfiles": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": [
-              "manifest_path",
-              "lockfile_path",
-              "before_digest",
-              "after_digest",
-              "content"
-            ],
-            "properties": {
-              "manifest_path": {
-                "$ref": "#/$defs/path"
-              },
-              "lockfile_path": {
-                "$ref": "#/$defs/path"
-              },
-              "before_digest": {
-                "$ref": "#/$defs/identity"
-              },
-              "after_digest": {
-                "$ref": "#/$defs/identity"
-              },
-              "content": {
-                "type": "string"
-              }
-            }
-          }
-        },
         "skipped": {
           "type": "array",
           "items": {
@@ -1017,6 +986,40 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/artifact_requirement"
+          }
+        },
+        "cargo_writes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "path",
+              "before_digest",
+              "after_digest",
+              "content"
+            ],
+            "properties": {
+              "before_digest": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/identity"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "after_digest": {
+                "$ref": "#/$defs/identity"
+              },
+              "content": {
+                "type": "string"
+              },
+              "path": {
+                "$ref": "#/$defs/path"
+              }
+            }
           }
         }
       }

@@ -165,6 +165,37 @@ fn authenticated_compiler_components_follow_installation_ownership() {
         );
         fs::write(&source_bundle, &source_bytes)?;
 
+        let driver = bundle.path().join("cargo-rail-fact-driver");
+        let original_driver = fs::read(&driver)?;
+        let component_manifest = bundle.path().join("cargo-rail-components-v1.tsv");
+        let original_manifest = fs::read(&component_manifest).ok();
+        fs::write(&driver, b"stale driver from another release")?;
+        fs::write(&component_manifest, "cargo-rail-components-v1\t0.28.1\n")?;
+        let stale = run(&["rail", "cache", "setup"])?;
+        assert_eq!(stale.status.code(), Some(2), "{stale:?}");
+        let diagnostic = String::from_utf8_lossy(&stale.stderr);
+        for expected in [
+            driver.to_str().context("driver path")?,
+            "found sha256:",
+            "expected sha256:",
+            "adjacent component version 0.28.1",
+            env!("CARGO_PKG_VERSION"),
+            "complete matching native archive",
+            "cargo rail cache setup",
+        ] {
+            assert!(diagnostic.contains(expected), "missing {expected}: {diagnostic}");
+        }
+        anyhow::ensure!(
+            fs::read_dir(cargo_home.path())?.next().is_none(),
+            "stale component setup wrote Cargo state"
+        );
+        fs::write(&driver, &original_driver)?;
+        if let Some(original) = original_manifest {
+            fs::write(&component_manifest, original)?;
+        } else {
+            fs::remove_file(&component_manifest)?;
+        }
+
         let setup = run(&["rail", "cache", "setup"])?;
         anyhow::ensure!(setup.status.success(), "component setup failed: {setup:?}");
         let installation = fs::canonicalize(cargo_home.path())?.join("cargo-rail/compiler-cache-v1");
@@ -2390,6 +2421,40 @@ fn setup_preview_apply_repeat_status_and_exact_remove_are_lossless() {
             cargo_home.path().join("cargo-rail/cache-profiles-v1").is_dir(),
             "uninstall deleted the profile registry"
         );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn setup_repairs_a_deleted_installation_directory_without_adopting_another_wrapper() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_single_crate("deleted-cache-installation", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let config = cargo_home.path().join("config.toml");
+        fs::write(&config, "# retained\n[net]\noffline = true\n")?;
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(setup.status.success(), "{setup:?}");
+        let configured = fs::read_to_string(&config)?;
+        fs::remove_dir_all(cargo_home.path().join("cargo-rail"))?;
+        let preview = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "setup", "--check"],
+        )?;
+        assert_eq!(preview.status.code(), Some(1), "{preview:?}");
+        assert!(
+            !cargo_home
+                .path()
+                .join("cargo-rail/compiler-cache-v1/setup.json")
+                .exists()
+        );
+        let repair = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(repair.status.success(), "{repair:?}");
+        assert!(String::from_utf8_lossy(&repair.stdout).contains("Cache repaired."));
+        assert_eq!(fs::read_to_string(&config)?, configured);
+        let build = cargo_check(&workspace.path, cargo_home.path(), None, None)?;
+        assert!(build.status.success(), "repaired Cargo wrapper did not work: {build:?}");
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -7634,4 +7699,49 @@ pub fn data(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
         Ok(())
     })();
     crate::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn source_installation_ignores_stale_archive_only_compiler_components() {
+    let result: Result<()> = (|| {
+        let source_binary =
+            PathBuf::from(std::env::var_os("CARGO_RAIL_TEST_SOURCE_BINARY").context("source installation binary")?);
+        let directory = tempfile::tempdir()?;
+        fs::copy(source_binary, directory.path().join("cargo-rail"))?;
+        for name in ["cargo-rail-native-rustc-wrapper", "cargo-rail-native-rustc-worker"] {
+            fs::copy(crate::helpers::cargo_binary(name), directory.path().join(name))?;
+        }
+        fs::write(directory.path().join("cargo-rail-fact-driver"), b"stale archive driver")?;
+        fs::write(
+            directory.path().join("cargo-rail-fact-driver-source-v1.json"),
+            b"stale archive source",
+        )?;
+        fs::write(
+            directory.path().join("cargo-rail-components-v1.tsv"),
+            "cargo-rail-components-v1\t0.28.1\n",
+        )?;
+        let workspace = TestWorkspace::new_single_crate("source-stale-components", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let output = Command::new(directory.path().join("cargo-rail"))
+            .current_dir(&workspace.path)
+            .args(["rail", "cache", "setup"])
+            .env("CARGO_HOME", cargo_home.path())
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "source installation treated unowned archive bytes as authority: {output:?}"
+        );
+        let build = cargo_check(&workspace.path, cargo_home.path(), None, None)?;
+        assert!(build.status.success(), "source fallback failed: {build:?}");
+        let receipt: serde_json::Value = serde_json::from_slice(&fs::read(
+            cargo_home.path().join("cargo-rail/compiler-cache-v1/setup.json"),
+        )?)?;
+        assert_eq!(receipt["compiler_components"], serde_json::json!([]));
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
 }

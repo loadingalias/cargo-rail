@@ -108,9 +108,6 @@ impl<'a> UnusedDepFinder<'a> {
                     if required_targets.is_empty() {
                         continue;
                     }
-                    if declaration_has_retention_evidence(declaration.member, &resolved) {
-                        continue;
-                    }
                     let Some(member_evidence) = source_unused.get(&declaration.member.package_id) else {
                         continue;
                     };
@@ -129,13 +126,53 @@ impl<'a> UnusedDepFinder<'a> {
                         continue;
                     }
 
+                    let mut proof = compiler_proof(&dependency, member_evidence, &required_targets, &required_features);
+                    let mut dev_dependency = dependency.clone();
+                    dev_dependency.kind = DepKind::Dev;
+                    let dev_state = member_evidence.dependency_state_for_features(
+                        &dev_dependency,
+                        &required_targets,
+                        &required_features,
+                    );
+                    let reason = if usage.kind == DepKind::Normal
+                        && dev_state == DependencyEvidenceState::Used
+                        && declaration_has_only_development_retention(declaration.member, &resolved)
+                    {
+                        if declaration.usages.iter().any(|other| {
+                            other.kind == DepKind::Dev
+                                && other.target == usage.target
+                                && other.cargo_toml_key == usage.cargo_toml_key
+                        }) {
+                            continue;
+                        }
+                        let dev_summary = member_evidence.dependency_summary_for_features(
+                            &dev_dependency,
+                            &required_targets,
+                            &required_features,
+                        );
+                        // Test harnesses can retain extern crates without diagnosing actual use.
+                        // Require the captured source's declaration retention as well as
+                        // normal-domain unused and development-domain retained evidence.
+                        proof.evidence_source = "compiler_dependency_domains_and_source_retention";
+                        proof.applicable_configurations += dev_summary.applicable;
+                        proof.complete_configurations += dev_summary.complete;
+                        proof.used_observations += dev_summary.used;
+                        proof.unused_observations += dev_summary.unused;
+                        proof.incomplete_observations += dev_summary.incomplete;
+                        UnusedReason::DevelopmentOnly
+                    } else {
+                        if declaration_has_retention_evidence(declaration.member, &resolved) {
+                            continue;
+                        }
+                        UnusedReason::NotUsedInSource
+                    };
                     unused.push(UnusedDep {
                         member: Arc::from(declaration.member.package_name.as_str()),
                         dep_name: Arc::clone(&usage.cargo_toml_key),
                         kind: usage.kind,
                         target: usage.target.as_deref().map(Arc::from),
-                        reason: UnusedReason::NotUsedInSource,
-                        proof: compiler_proof(&dependency, member_evidence, &required_targets, &required_features),
+                        reason,
+                        proof,
                     });
                 }
                 continue;
@@ -415,10 +452,10 @@ impl<'a> UnusedDepFinder<'a> {
     ) -> Vec<CompilerCandidate> {
         let mut candidates = BTreeSet::new();
         for declaration in declarations {
-            if declaration
-                .resolved
-                .as_ref()
-                .is_some_and(|resolved| declaration_has_retention_evidence(declaration.member, resolved))
+            if let Some(resolved) = &declaration.resolved
+                && declaration_has_retention_evidence(declaration.member, resolved)
+                && !(declaration.usages.iter().any(|usage| usage.kind == DepKind::Normal)
+                    && declaration_has_only_development_retention(declaration.member, resolved))
             {
                 // `find` cannot remove this declaration regardless of compiler
                 // output. Do not schedule an exhaustive target/feature matrix
@@ -482,14 +519,20 @@ impl<'a> UnusedDepFinder<'a> {
         let mut edits: HashMap<String, Vec<MemberEdit>> = HashMap::new();
 
         for dep in unused {
-            edits
-                .entry(dep.member.to_string())
-                .or_default()
-                .push(MemberEdit::RemoveDep {
-                    dep_name: Arc::clone(&dep.dep_name),
-                    dep_kind: dep.kind,
-                    target: dep.target.clone(),
-                });
+            edits.entry(dep.member.to_string()).or_default().push(
+                if matches!(dep.reason, UnusedReason::DevelopmentOnly) {
+                    MemberEdit::MoveToDev {
+                        dep_name: Arc::clone(&dep.dep_name),
+                        target: dep.target.clone(),
+                    }
+                } else {
+                    MemberEdit::RemoveDep {
+                        dep_name: Arc::clone(&dep.dep_name),
+                        dep_kind: dep.kind,
+                        target: dep.target.clone(),
+                    }
+                },
+            );
         }
 
         edits
@@ -501,6 +544,14 @@ fn declaration_has_retention_evidence(member: &ParsedManifest, resolved: &Resolv
         .crate_names
         .iter()
         .any(|crate_name| member.retention_identifiers.contains(crate_name))
+}
+
+fn declaration_has_only_development_retention(member: &ParsedManifest, resolved: &ResolvedDependency) -> bool {
+    declaration_has_retention_evidence(member, resolved)
+        && resolved.crate_names.iter().all(|crate_name| {
+            !member.retention_identifiers.contains(crate_name)
+                || member.development_only_identifiers.contains(crate_name)
+        })
 }
 
 fn usage_required_targets<'a>(

@@ -15,7 +15,7 @@ use crate::workspace::WorkspaceContext;
 
 const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
 const INDEX: &str = "https://github.com/rust-lang/crates.io-index";
-const SPARSE_INDEX: &str = "https://index.crates.io/";
+pub(crate) const SPARSE_INDEX: &str = "https://index.crates.io/";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

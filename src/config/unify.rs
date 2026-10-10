@@ -92,6 +92,9 @@ impl ConsumerScope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnifyConfig {
+    /// Standalone Cargo workspace roots whose dependency declarations Unify also repairs.
+    #[serde(default)]
+    pub cargo_manifests: Vec<std::path::PathBuf>,
     /// Top-level target-resolution domains used for compiler evidence.
     ///
     /// `"all"` (the default) selects every top-level target. A list selects only
@@ -192,6 +195,7 @@ pub struct UnifyConfig {
 impl Default for UnifyConfig {
     fn default() -> Self {
         Self {
+            cargo_manifests: Vec::new(),
             compiler_targets: CompilerTargetSelection::All,
             include_paths: default_include_paths(),
             include_renamed: false,
@@ -287,6 +291,22 @@ impl UnifyConfig {
     }
 
     pub(crate) fn validate_policy(&self) -> Result<(), crate::error::ConfigError> {
+        let mut manifests = std::collections::BTreeSet::new();
+        for path in &self.cargo_manifests {
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+                || path.file_name().is_none_or(|name| name != "Cargo.toml")
+                || path == std::path::Path::new("Cargo.toml")
+                || !manifests.insert(path)
+            {
+                return Err(crate::error::ConfigError::InvalidField {
+                    field: "unify.cargo_manifests".into(),
+                    reason: "use unique workspace-relative standalone Cargo.toml paths without traversal".into(),
+                });
+            }
+        }
         validate_glob_patterns("unify.preserve_features", &self.preserve_features)?;
         validate_glob_patterns("unify.skip_undeclared_patterns", &self.skip_undeclared_patterns)?;
 

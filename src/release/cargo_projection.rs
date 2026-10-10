@@ -1,7 +1,7 @@
-//! Exact auxiliary Cargo lockfile projections for release planning and apply.
+//! Cargo resolution of proposed releases in isolated captured source.
 
 use crate::error::{RailError, RailResult};
-use crate::release::planner::{CrateReleasePlan, PlannedAuxiliaryLockfile};
+use crate::release::planner::{CrateReleasePlan, PlannedCargoWrite};
 use crate::release::version::{BumpType, VersionBumper};
 use crate::source::{ContentDigest, SourceEntryKind};
 use crate::workspace::WorkspaceContext;
@@ -11,7 +11,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-struct ResolvedAuxiliaryWorkspace {
+struct ProjectedWorkspace {
     manifest_path: PathBuf,
     lockfile_path: PathBuf,
     isolated_manifest: PathBuf,
@@ -29,55 +29,38 @@ struct CargoMetadataPackage {
     source: Option<String>,
 }
 
-pub(crate) fn plan_lockfiles(
+pub(crate) fn plan_writes(
     ctx: &WorkspaceContext,
     crates: &[CrateReleasePlan],
     manifests: &[PathBuf],
-) -> RailResult<Vec<PlannedAuxiliaryLockfile>> {
-    if crates.is_empty() || manifests.is_empty() {
+) -> RailResult<Vec<PlannedCargoWrite>> {
+    if crates.is_empty() {
         return Ok(Vec::new());
     }
-
     ctx.validate_snapshot_unchanged()?;
     let snapshot = ctx.snapshot()?;
-    let staging = tempfile::Builder::new()
-        .prefix("cargo-rail-release-cargo-")
-        .tempdir()
-        .map_err(|error| RailError::message(format!("failed to create auxiliary Cargo staging root: {error}")))?;
+    let staging = tempfile::Builder::new().prefix("cargo-rail-release-cargo-").tempdir()?;
     let source_root = staging.path().join("source");
-    fs::create_dir(&source_root).map_err(|error| {
-        RailError::message(format!(
-            "failed to create auxiliary Cargo source root '{}': {error}",
-            source_root.display()
-        ))
-    })?;
+    fs::create_dir(&source_root)?;
     materialize_snapshot(ctx, &source_root)?;
-    let workspace_prefix =
-        crate::utils::path_relative_to(snapshot.source_root(), ctx.workspace_root()).map_err(|error| {
-            RailError::message(format!(
-                "workspace '{}' is outside captured source root '{}': {error}",
-                ctx.workspace_root().display(),
-                snapshot.source_root().display()
-            ))
-        })?;
+    let workspace_prefix = crate::utils::path_relative_to(snapshot.source_root(), ctx.workspace_root())?;
     let workspace_root = source_root.join(workspace_prefix);
-
     let mut configured = manifests.to_vec();
     configured.sort_unstable();
     let mut planned_digests = BTreeMap::new();
-    let mut resolved_locks = BTreeSet::new();
-    let mut resolved = Vec::with_capacity(configured.len());
+    let mut resolved_locks = BTreeSet::from([PathBuf::from("Cargo.lock")]);
+    let mut resolved = vec![ProjectedWorkspace {
+        manifest_path: PathBuf::from("Cargo.toml"),
+        lockfile_path: PathBuf::from("Cargo.lock"),
+        isolated_manifest: workspace_root.join("Cargo.toml"),
+        isolated_lockfile: workspace_root.join("Cargo.lock"),
+    }];
+    let mut local_manifests = BTreeSet::new();
     for manifest in configured {
         require_head_file(ctx, &manifest, "auxiliary Cargo manifest")?;
         let isolated_manifest = workspace_root.join(&manifest);
         let isolated_lock = resolve_lockfile(ctx, &workspace_root, &isolated_manifest)?;
-        let lockfile = crate::utils::path_relative_to(&workspace_root, &isolated_lock).map_err(|error| {
-            RailError::message(format!(
-                "auxiliary Cargo manifest '{}' resolved lockfile '{}' outside the isolated workspace: {error}",
-                manifest.display(),
-                isolated_lock.display()
-            ))
-        })?;
+        let lockfile = crate::utils::path_relative_to(&workspace_root, &isolated_lock)?;
         if lockfile == Path::new("Cargo.lock") {
             return Err(RailError::with_help(
                 format!(
@@ -97,60 +80,92 @@ pub(crate) fn plan_lockfiles(
             ));
         }
         require_head_file(ctx, &lockfile, "auxiliary Cargo lockfile")?;
-        validate_local_package_manifests(
-            ctx,
-            snapshot,
-            &source_root,
-            &workspace_root,
-            &isolated_manifest,
-            &manifest,
-        )?;
-        resolved.push(ResolvedAuxiliaryWorkspace {
+        resolved.push(ProjectedWorkspace {
             manifest_path: manifest,
             lockfile_path: lockfile,
             isolated_manifest,
             isolated_lockfile: isolated_lock,
         });
     }
-
-    // Cargo resolution is read-only. Reject a wrapper or Cargo invocation that
-    // changed any captured path before binding the intentional release edits.
+    for workspace in &resolved {
+        local_manifests.extend(validate_local_package_manifests(
+            ctx,
+            snapshot,
+            &source_root,
+            &workspace_root,
+            &workspace.isolated_manifest,
+            &workspace.manifest_path,
+        )?);
+        // A virtual workspace manifest need not appear in Cargo's package list.
+        local_manifests.insert(workspace.isolated_manifest.clone());
+    }
     audit_isolated_tree(snapshot, &source_root, &planned_digests)?;
-    apply_planned_manifests(ctx, &source_root, &workspace_root, crates, &mut planned_digests)?;
-
-    let mut projections = Vec::new();
+    for plan in crates {
+        let manifest = isolated_path(ctx, &workspace_root, &plan.manifest_path)?;
+        VersionBumper::bump_version(&manifest, BumpType::Exact(plan.new_version.clone()))?;
+        bind_planned_digest(&source_root, &manifest, &mut planned_digests)?;
+    }
+    for manifest in local_manifests {
+        if update_local_requirements(ctx, &workspace_root, &manifest, crates)? {
+            bind_planned_digest(&source_root, &manifest, &mut planned_digests)?;
+        }
+    }
     for workspace in resolved {
         let before = read_isolated_lockfile(&workspace.isolated_lockfile, &workspace.lockfile_path)?;
-        let package_specs = local_release_package_specs(&before, crates, &workspace.lockfile_path)?;
-        if !package_specs.is_empty() {
-            run_cargo_update(ctx, &workspace_root, &workspace.isolated_manifest, &package_specs)?;
+        let specs = local_release_package_specs(&before, crates, &workspace.lockfile_path)?;
+        if !specs.is_empty() {
+            run_cargo_update(ctx, &workspace_root, &workspace.isolated_manifest, &specs)?;
         }
+        validate_local_package_manifests(
+            ctx,
+            snapshot,
+            &source_root,
+            &workspace_root,
+            &workspace.isolated_manifest,
+            &workspace.manifest_path,
+        )?;
         let after = read_isolated_lockfile(&workspace.isolated_lockfile, &workspace.lockfile_path)?;
-        if after == before {
+        if after != before {
+            bind_planned_digest(&source_root, &workspace.isolated_lockfile, &mut planned_digests)?;
+        }
+    }
+    audit_isolated_tree(snapshot, &source_root, &planned_digests)?;
+    let mut writes = Vec::new();
+    let mut inputs = projection_inputs(snapshot)?;
+    for relative in planned_digests.keys() {
+        let entry = snapshot
+            .source()
+            .tree()
+            .entries()
+            .iter()
+            .find(|entry| entry.path.as_path() == relative);
+        let before = if let Some(bytes) = inputs.remove(relative) {
+            Some(bytes)
+        } else {
+            entry
+                .map(|entry| snapshot.read_source_file(&entry.path))
+                .transpose()?
+                .flatten()
+        };
+        let after = fs::read(source_root.join(relative))?;
+        if before.as_deref() == Some(after.as_slice()) {
             continue;
         }
-        let content = String::from_utf8(after.clone()).map_err(|error| {
-            RailError::message(format!(
-                "Cargo produced non-UTF-8 lockfile bytes for '{}': {error}",
-                workspace.lockfile_path.display()
-            ))
-        })?;
-        planned_digests.insert(
-            relative_isolated(&source_root, &workspace.isolated_lockfile)?,
-            ContentDigest::sha256(&after),
-        );
-        projections.push(PlannedAuxiliaryLockfile {
-            manifest_path: portable_contract_path(&workspace.manifest_path),
-            lockfile_path: portable_contract_path(&workspace.lockfile_path),
-            before_digest: digest(&before),
+        writes.push(PlannedCargoWrite {
+            path: portable_contract_path(&crate::utils::path_relative_to(
+                &workspace_root,
+                &source_root.join(relative),
+            )?),
+            before_digest: before.as_deref().map(digest),
             after_digest: digest(&after),
-            content,
+            content: String::from_utf8(after).map_err(|error| {
+                RailError::message(format!("Cargo file '{}' is not UTF-8: {error}", relative.display()))
+            })?,
         });
     }
-
-    audit_isolated_tree(snapshot, &source_root, &planned_digests)?;
+    writes.sort_by_cached_key(|write| crate::utils::path_to_git_format(&write.path));
     ctx.validate_snapshot_unchanged()?;
-    Ok(projections)
+    Ok(writes)
 }
 
 fn materialize_snapshot(ctx: &WorkspaceContext, destination: &Path) -> RailResult<()> {
@@ -188,7 +203,35 @@ fn materialize_snapshot(ctx: &WorkspaceContext, destination: &Path) -> RailResul
             }
         }
     }
+    for (relative, bytes) in projection_inputs(snapshot)? {
+        let path = destination.join(relative);
+        fs::create_dir_all(
+            path.parent()
+                .ok_or_else(|| RailError::message("captured Cargo input has no parent"))?,
+        )?;
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+        file.write_all(&bytes)?;
+    }
     Ok(())
+}
+
+fn projection_inputs(snapshot: &crate::workspace::WorkspaceSnapshot) -> RailResult<BTreeMap<PathBuf, Vec<u8>>> {
+    let mut inputs = BTreeMap::new();
+    if let Some(lockfile) = snapshot.lockfile() {
+        inputs.insert(
+            lockfile.file().path().as_path().to_path_buf(),
+            lockfile.file().bytes().to_vec(),
+        );
+    }
+    for config in snapshot.cargo_config().provenance() {
+        if let Ok(relative) = config.path().strip_prefix(snapshot.source_root()) {
+            inputs.insert(
+                relative.to_path_buf(),
+                toml_edit::ser::to_string(config.settings())?.into_bytes(),
+            );
+        }
+    }
+    Ok(inputs)
 }
 
 fn materialize_contained_symlink(root: &Path, path: &Path, target: &str) -> RailResult<()> {
@@ -237,35 +280,152 @@ fn materialize_contained_symlink(root: &Path, path: &Path, target: &str) -> Rail
     Ok(())
 }
 
-fn apply_planned_manifests(
+fn update_local_requirements(
     ctx: &WorkspaceContext,
-    source_root: &Path,
-    workspace_root: &Path,
+    root: &Path,
+    manifest: &Path,
     crates: &[CrateReleasePlan],
-    planned_digests: &mut BTreeMap<PathBuf, ContentDigest>,
+) -> RailResult<bool> {
+    let primary_manifest = crate::utils::canonicalize_existing(manifest)?
+        == crate::utils::canonicalize_existing(&root.join("Cargo.toml"))?;
+    let selected_names = crates.iter().map(|plan| plan.name.as_str()).collect::<BTreeSet<_>>();
+    let versions = crates
+        .iter()
+        .map(|plan| {
+            Ok((
+                crate::utils::canonicalize_existing(&isolated_path(ctx, root, &plan.manifest_path)?)?,
+                (
+                    &plan.new_version,
+                    primary_manifest
+                        && plan
+                            .affected_dependents
+                            .iter()
+                            .any(|name| selected_names.contains(name.as_str())),
+                ),
+            ))
+        })
+        .collect::<RailResult<BTreeMap<_, _>>>()?;
+    let mut editor = crate::toml::editor::TomlEditor::open(manifest)?;
+    let mut changed = false;
+    let selected_member = versions.contains_key(&crate::utils::canonicalize_existing(manifest)?);
+    update_dependency_tables(
+        manifest,
+        editor.doc_mut().as_table_mut(),
+        &versions,
+        selected_member,
+        false,
+        &mut changed,
+    )?;
+    if changed {
+        editor.write()?;
+    }
+    Ok(changed)
+}
+
+fn update_dependency_tables(
+    manifest: &Path,
+    table: &mut toml_edit::Table,
+    versions: &BTreeMap<PathBuf, (&semver::Version, bool)>,
+    refresh_member: bool,
+    refresh_shared: bool,
+    changed: &mut bool,
 ) -> RailResult<()> {
-    for plan in crates {
-        let manifest = isolated_path(ctx, workspace_root, &plan.manifest_path)?;
-        VersionBumper::bump_version(&manifest, BumpType::Exact(plan.new_version.clone()))?;
-        bind_planned_digest(source_root, &manifest, planned_digests)?;
-        if plan.affected_dependents.is_empty() {
-            continue;
+    for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if let Some(dependencies) = table.get_mut(section).and_then(toml_edit::Item::as_table_like_mut) {
+            for (key, dependency) in dependencies.iter_mut() {
+                let Some(dependency) = dependency.as_table_like_mut() else {
+                    continue;
+                };
+                let Some(path) = dependency.get("path").and_then(toml_edit::Item::as_str) else {
+                    continue;
+                };
+                let target = crate::utils::canonicalize_existing(
+                    &manifest
+                        .parent()
+                        .expect("manifest parent")
+                        .join(path)
+                        .join("Cargo.toml"),
+                )?;
+                let Some((version, selected_dependent)) = versions.get(&target) else {
+                    continue;
+                };
+                let Some(requirement) = dependency.get("version").and_then(toml_edit::Item::as_str) else {
+                    continue;
+                };
+                let replacement = retarget_requirement(
+                    requirement,
+                    version,
+                    refresh_member || refresh_shared && *selected_dependent,
+                )
+                .map_err(|error| {
+                    RailError::with_help(
+                        format!(
+                            "cannot update local dependency '{key}' in '{}': {error}",
+                            manifest.display()
+                        ),
+                        "set a requirement compatible with the planned version, then regenerate the release plan",
+                    )
+                })?;
+                if let Some(replacement) = replacement {
+                    let value = dependency
+                        .get_mut("version")
+                        .and_then(toml_edit::Item::as_value_mut)
+                        .ok_or_else(|| RailError::message("dependency version is not a TOML value"))?;
+                    let decor = value.decor().clone();
+                    *value = replacement.into();
+                    *value.decor_mut() = decor;
+                    *changed = true;
+                }
+            }
         }
-        let workspace_manifest = workspace_root.join("Cargo.toml");
-        if VersionBumper::update_workspace_dependency(&workspace_manifest, &plan.name, &plan.new_version)? {
-            bind_planned_digest(source_root, &workspace_manifest, planned_digests)?;
-        }
-        for dependent in &plan.affected_dependents {
-            let package = ctx.cargo().get_package(dependent).ok_or_else(|| {
-                RailError::message(format!("release plan references unknown dependent crate '{dependent}'"))
-            })?;
-            let path = isolated_path(ctx, workspace_root, package.manifest_path.as_std_path())?;
-            if VersionBumper::update_dependency_version(&path, &plan.name, &plan.new_version)? {
-                bind_planned_digest(source_root, &path, planned_digests)?;
+    }
+    if let Some(workspace) = table.get_mut("workspace").and_then(toml_edit::Item::as_table_mut) {
+        // A shared table may serve a released dependent. Refresh that minimum
+        // while leaving compatible requirements of unselected packages unchanged.
+        update_dependency_tables(manifest, workspace, versions, refresh_member, true, changed)?;
+    }
+    if let Some(targets) = table.get_mut("target").and_then(toml_edit::Item::as_table_mut) {
+        for (_, target) in targets.iter_mut() {
+            if let Some(target) = target.as_table_mut() {
+                update_dependency_tables(manifest, target, versions, refresh_member, refresh_shared, changed)?;
             }
         }
     }
     Ok(())
+}
+
+fn retarget_requirement(requirement: &str, version: &semver::Version, refresh: bool) -> RailResult<Option<String>> {
+    let parsed = semver::VersionReq::parse(requirement).map_err(|error| RailError::message(error.to_string()))?;
+    if parsed.matches(version) && !refresh {
+        return Ok(None);
+    }
+    let [comparator] = parsed.comparators.as_slice() else {
+        return Err(RailError::message(format!(
+            "requirement '{requirement}' is a compound range"
+        )));
+    };
+    if !matches!(comparator.op, semver::Op::Caret | semver::Op::Tilde | semver::Op::Exact) {
+        return Err(RailError::message(format!(
+            "requirement '{requirement}' cannot be retargeted without changing its constraint policy"
+        )));
+    }
+    let original = requirement.trim();
+    let prefix_len = original
+        .find(|character: char| character.is_ascii_digit())
+        .ok_or_else(|| RailError::message("requirement has no version"))?;
+    let prefix = original
+        .get(..prefix_len)
+        .ok_or_else(|| RailError::message("invalid requirement prefix"))?;
+    let replacement = format!("{prefix}{version}");
+    if replacement == original {
+        return Ok(None);
+    }
+    if !semver::VersionReq::parse(&replacement).is_ok_and(|requirement| requirement.matches(version)) {
+        return Err(RailError::message(
+            "retargeted requirement does not accept the planned version",
+        ));
+    }
+    Ok(Some(replacement))
 }
 
 fn isolated_path(ctx: &WorkspaceContext, root: &Path, original: &Path) -> RailResult<PathBuf> {
@@ -345,7 +505,7 @@ fn validate_local_package_manifests(
     workspace_root: &Path,
     manifest: &Path,
     manifest_path: &Path,
-) -> RailResult<()> {
+) -> RailResult<Vec<PathBuf>> {
     let output = cargo_command(ctx, workspace_root)?
         .args(["metadata", "--format-version", "1", "--locked", "--manifest-path"])
         .arg(manifest)
@@ -358,6 +518,7 @@ fn validate_local_package_manifests(
             manifest_path.display()
         ))
     })?;
+    let mut manifests = Vec::new();
     for package in metadata.packages.into_iter().filter(|package| package.source.is_none()) {
         let resolved = crate::utils::canonicalize_existing(&package.manifest_path).map_err(|error| {
             RailError::message(format!(
@@ -411,8 +572,9 @@ fn validate_local_package_manifests(
                 "commit a regular package manifest inside the captured Git worktree",
             ));
         }
+        manifests.push(isolated);
     }
-    Ok(())
+    Ok(manifests)
 }
 
 fn require_head_file(ctx: &WorkspaceContext, workspace_path: &Path, description: &str) -> RailResult<()> {
@@ -637,13 +799,22 @@ fn audit_isolated_tree(
     root: &Path,
     planned_digests: &BTreeMap<PathBuf, ContentDigest>,
 ) -> RailResult<()> {
-    let expected = snapshot
+    let mut expected = snapshot
         .source()
         .tree()
         .entries()
         .iter()
-        .map(|entry| (entry.path.as_path().to_path_buf(), &entry.kind))
+        .map(|entry| (entry.path.as_path().to_path_buf(), entry.kind.clone()))
         .collect::<BTreeMap<_, _>>();
+    for (path, bytes) in projection_inputs(snapshot)? {
+        expected.insert(
+            path,
+            SourceEntryKind::RegularFile {
+                digest: ContentDigest::sha256(&bytes),
+                executable: false,
+            },
+        );
+    }
     let mut actual = BTreeSet::new();
     collect_tree_paths(root, root, &mut actual)?;
     let unexpected = actual
@@ -678,7 +849,7 @@ fn audit_isolated_tree(
         if let Some(planned_digest) = planned_digests.get(&path) {
             let absolute = root.join(&path);
             let metadata = fs::symlink_metadata(&absolute)?;
-            let exact_candidate = match kind {
+            let exact_candidate = match &kind {
                 SourceEntryKind::RegularFile { executable, .. } => {
                     regular_metadata_matches(&metadata, *executable)
                         && ContentDigest::sha256(&fs::read(&absolute)?) == *planned_digest
@@ -697,7 +868,7 @@ fn audit_isolated_tree(
             continue;
         }
         let absolute = root.join(&path);
-        let unchanged = match kind {
+        let unchanged = match &kind {
             SourceEntryKind::RegularFile {
                 digest: expected,
                 executable,

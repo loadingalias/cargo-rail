@@ -68,99 +68,107 @@ pub fn run_release_plan(
     let skip_publish = true;
 
     // Validate release config (tag format, changelog shape, release policies)
-    let warnings = release_config.validate(workspace_members).map_err(RailError::Config)?;
+    let warnings = ctx
+        .config()
+        .expect("release configuration")
+        .release_warnings(workspace_members)?;
 
     for warning in &warnings {
         crate::warn!("{}", warning);
     }
 
-    let policy = dependent_policy(include_dependents);
-    let planner = ReleasePlanner::new(ctx, release_config);
-    let plan = planner.plan(target_crates, &bump_request, policy)?;
-    let target_crates = plan.canonical_crate_order.clone();
-    let mutation_plan = build_release_mutation_plan(ctx, &plan, skip_publish, skip_tag, false, release_config)?;
-    let has_pending_changes = !mutation_plan.actions.is_empty();
-    let readiness = release_check_readiness(has_pending_changes, skip_publish, skip_tag, release_config);
+    let result = (|| -> RailResult<()> {
+        let policy = dependent_policy(include_dependents);
+        let planner = ReleasePlanner::new(ctx, release_config);
+        let plan = planner.plan(target_crates, &bump_request, policy)?;
+        let target_crates = plan.canonical_crate_order.clone();
+        let mutation_plan = build_release_mutation_plan(ctx, &plan, skip_publish, skip_tag, false, release_config)?;
+        let has_pending_changes = !mutation_plan.actions.is_empty();
+        let readiness = release_check_readiness(has_pending_changes, skip_publish, skip_tag, release_config);
 
-    if !has_pending_changes {
+        if !has_pending_changes {
+            if json {
+                let payload = serde_json::json!({
+                  "release_plan": plan,
+                  "mutation_plan": mutation_plan,
+                  "check": true,
+                  "readiness": readiness,
+                  "warnings": warnings,
+                });
+                let output = crate::output::machine_json_envelope("release", "check", "no_changes", 0, payload);
+                let json_output = serde_json::to_string_pretty(&output)
+                    .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?;
+                println!("{}", json_output);
+            } else {
+                println!("{}", plan.format_summary_with_flags(skip_publish, skip_tag));
+                println!("\nNo release-worthy changes detected.");
+            }
+
+            return Ok(());
+        }
+
+        validator.validate(&target_crates, false)?;
+
+        // Validate changelog paths (catches path traversal issues early)
+        validator.validate_changelog_paths(&target_crates, release_config)?;
+        validator.validate_apply_preconditions(&plan, true, skip_tag, false)?;
+
+        if !json {
+            println!("{}", plan.format_summary_with_flags(skip_publish, skip_tag));
+
+            // Show additional config info
+            if release_config.remote_effects.creates_forge_release() && !skip_tag {
+                println!(
+                    "Forge releases: enabled ({})",
+                    release_forge_detail(release_config.remote_effects)
+                );
+            }
+            if release_config.sign_tags && !skip_tag {
+                println!("Tag signing: enabled");
+            }
+        }
+
+        let (extended_results, has_extended_failures) = if extended {
+            run_extended_checks(&validator, &plan, json)?
+        } else {
+            (Vec::new(), false)
+        };
+
         if json {
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
               "release_plan": plan,
               "mutation_plan": mutation_plan,
               "check": true,
               "readiness": readiness,
+              "warnings": warnings,
             });
-            let output = crate::output::machine_json_envelope("release", "check", "no_changes", 0, payload);
+            if extended {
+                payload["extended"] = serde_json::json!(extended_results);
+            }
+            let (result, exit_code) = if has_extended_failures {
+                ("failed", 2)
+            } else {
+                ("pending_changes", 1)
+            };
+            let output = crate::output::machine_json_envelope("release", "check", result, exit_code, payload);
             let json_output = serde_json::to_string_pretty(&output)
                 .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?;
             println!("{}", json_output);
-        } else {
-            println!("{}", plan.format_summary_with_flags(skip_publish, skip_tag));
-            println!("\nNo release-worthy changes detected.");
+        } else if !has_extended_failures {
+            println!("\nChanges detected. Run without --check to apply.");
         }
 
-        return Ok(());
-    }
-
-    validator.validate(&target_crates, false)?;
-
-    // Validate changelog paths (catches path traversal issues early)
-    validator.validate_changelog_paths(&target_crates, release_config)?;
-    validator.validate_apply_preconditions(&plan, true, skip_tag, false)?;
-
-    if !json {
-        println!("{}", plan.format_summary_with_flags(skip_publish, skip_tag));
-
-        // Show additional config info
-        if release_config.remote_effects.creates_forge_release() && !skip_tag {
-            println!(
-                "Forge releases: enabled ({})",
-                release_forge_detail(release_config.remote_effects)
-            );
+        if has_extended_failures {
+            if json {
+                return Err(RailError::ExitWithCode { code: 2 });
+            }
+            return Err(RailError::message("extended validation failed"));
         }
-        if release_config.sign_tags && !skip_tag {
-            println!("Tag signing: enabled");
-        }
-    }
 
-    let (extended_results, has_extended_failures) = if extended {
-        run_extended_checks(&validator, &plan, json)?
-    } else {
-        (Vec::new(), false)
-    };
-
-    if json {
-        let mut payload = serde_json::json!({
-          "release_plan": plan,
-          "mutation_plan": mutation_plan,
-          "check": true,
-          "readiness": readiness,
-        });
-        if extended {
-            payload["extended"] = serde_json::json!(extended_results);
-        }
-        let (result, exit_code) = if has_extended_failures {
-            ("failed", 2)
-        } else {
-            ("pending_changes", 1)
-        };
-        let output = crate::output::machine_json_envelope("release", "check", result, exit_code, payload);
-        let json_output = serde_json::to_string_pretty(&output)
-            .map_err(|e| RailError::message(format!("JSON serialization failed: {}", e)))?;
-        println!("{}", json_output);
-    } else if !has_extended_failures {
-        println!("\nChanges detected. Run without --check to apply.");
-    }
-
-    if has_extended_failures {
-        if json {
-            return Err(RailError::ExitWithCode { code: 2 });
-        }
-        return Err(RailError::message("extended validation failed"));
-    }
-
-    // Exit code 1 in --check mode indicates changes are pending (consistent across text/json)
-    Err(RailError::CheckHasPendingChanges)
+        // Exit code 1 in --check mode indicates changes are pending (consistent across text/json)
+        Err(RailError::CheckHasPendingChanges)
+    })();
+    result.map_err(|error| error.with_warnings(warnings))
 }
 
 /// Arguments for release execution.
@@ -248,247 +256,250 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
     let skip_publish = registry_publication_skipped(args.publish, release_config)?;
 
     let workspace_members = ctx.graph().workspace_members();
-    let mut warnings = release_config.validate(workspace_members).map_err(RailError::Config)?;
+    let mut warnings = ctx
+        .config()
+        .expect("release configuration")
+        .release_warnings(workspace_members)?;
     if !json {
         for warning in &warnings {
             crate::warn!("{}", warning);
         }
     }
 
-    let validator = ReleaseValidator::new(ctx);
-    let effective_skip_publish = skip_publish;
-    let effective_skip_tag = args.skip_tag;
-    let (mut plan, mut expected_mutation_plan) = plan_release_operation(
-        ctx,
-        release_config,
-        ReleaseOperationOptions {
-            crate_names: args.crate_names.clone(),
-            all: args.all,
-            bump: args.bump.clone(),
-            skip_publish: effective_skip_publish,
-            skip_tag: effective_skip_tag,
-            pr: args.pr,
-            include_dependents: args.include_dependents,
-        },
-    )?;
-    if plan.crates.is_empty() {
+    let result = (|| -> RailResult<()> {
+        let validator = ReleaseValidator::new(ctx);
+        let effective_skip_publish = skip_publish;
+        let effective_skip_tag = args.skip_tag;
+        let (mut plan, mut expected_mutation_plan) = plan_release_operation(
+            ctx,
+            release_config,
+            ReleaseOperationOptions {
+                crate_names: args.crate_names.clone(),
+                all: args.all,
+                bump: args.bump.clone(),
+                skip_publish: effective_skip_publish,
+                skip_tag: effective_skip_tag,
+                pr: args.pr,
+                include_dependents: args.include_dependents,
+            },
+        )?;
+        if plan.crates.is_empty() {
+            if json {
+                let payload = serde_json::json!({
+                  "release_plan": plan,
+                  "warnings": warnings,
+                });
+                let output = crate::output::machine_json_envelope("release", "apply", "no_changes", 0, payload);
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                println!("{}", plan.format_summary_with_flags(skip_publish, args.skip_tag));
+                println!("\nNo release-worthy changes detected.");
+            }
+            return Ok(());
+        }
+
+        let target_crates = plan.canonical_crate_order.clone();
+        validator.validate(&target_crates, false)?;
+
+        if let Some(warning) = validator.validate_branch(args.allow_non_default_branch)? {
+            if json {
+                warnings.push(warning);
+            } else {
+                crate::warn!("{}", warning);
+            }
+        }
+
+        // Validate changelog paths
+        validator.validate_changelog_paths(&target_crates, release_config)?;
+
+        let mutation_plan = if let Some(path) = args.plan_path.as_ref() {
+            let from_file = mutation::read_plan_file(path)?;
+            if !from_file.operation_id.starts_with("release-") {
+                return Err(RailError::with_help(
+                    format!("plan '{}' is not a release plan", path.display()),
+                    "generate a release plan using 'cargo rail release check --json'".to_string(),
+                ));
+            }
+            mutation::validate_pre_apply_with_allowed_paths(ctx, &from_file, std::slice::from_ref(path))?;
+            // The saved date is presentation input, not a fresh clock reading. Rebuild
+            // every other value from the current selected intent before comparison.
+            let github = crate::release::changelog::detect_github_repo(ctx.workspace_root());
+            for planned in &mut plan.crates {
+                let date = from_file
+                    .actions
+                    .iter()
+                    .filter(|action| action.code == "UPDATE_CHANGELOG")
+                    .find(|action| {
+                        action.payload.get("crate").and_then(serde_json::Value::as_str) == Some(planned.name.as_str())
+                    })
+                    .and_then(|action| action.payload.get("presentation"))
+                    .and_then(|value| value.get("date"))
+                    .and_then(serde_json::Value::as_str);
+                if let Some(date) = date {
+                    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                        .map_err(|error| RailError::message(format!("invalid saved release date: {error}")))?;
+                    planned.presentation = Some(crate::release::presentation::capture(
+                        ctx.workspace_root(),
+                        release_config,
+                        planned,
+                        date,
+                        github.as_ref(),
+                    )?);
+                }
+            }
+            expected_mutation_plan = build_release_mutation_plan(
+                ctx,
+                &plan,
+                effective_skip_publish,
+                effective_skip_tag,
+                args.pr,
+                release_config,
+            )?;
+            mutation::validate_requested_operation(&from_file, &expected_mutation_plan)?;
+            from_file
+        } else {
+            mutation::validate_pre_apply(ctx, &expected_mutation_plan)?;
+            expected_mutation_plan
+        };
+
+        let plan_control_paths = args.plan_path.iter().cloned().collect::<Vec<_>>();
+        let allowed_unstaged_paths = plan_control_paths
+            .iter()
+            .cloned()
+            .chain(mutation::declared_input_paths(&mutation_plan))
+            .collect::<Vec<_>>();
+        mutation::validate_changed_paths_with_allowed_paths(ctx, &mutation_plan, &allowed_unstaged_paths)?;
+
+        if !json {
+            println!(
+                "{}",
+                plan.format_summary_with_flags(effective_skip_publish, effective_skip_tag)
+            );
+        }
+
+        enforce_safety_gate(
+            if args.pr { "release PR" } else { "release apply" },
+            args.yes,
+            args.plan_path.as_deref(),
+            io::stdin().is_terminal() && !json,
+        )?;
+
+        // Skip confirmation if --yes flag is set
+        if !args.yes && io::stdin().is_terminal() && !json {
+            println!("\nthis will:");
+            println!("  - modify Cargo.toml (version bumps)");
+            println!("  - update changelogs");
+            if !plan.cargo_writes.is_empty() {
+                println!("  - update {} declared Cargo file(s)", plan.cargo_writes.len());
+            }
+            if args.pr {
+                println!("  - create and push a release PR branch");
+            } else {
+                println!("  - create git commits");
+            }
+            if !effective_skip_tag {
+                println!("  - create {} tag(s)", plan.crates.len());
+            }
+            if !effective_skip_publish {
+                println!("  - publish to crates.io (irreversible)");
+            }
+
+            if !crate::utils::prompt_for_confirmation()? {
+                println!("cancelled");
+                return Ok(());
+            }
+        }
+
+        validator.validate_apply_preconditions(&plan, effective_skip_publish, effective_skip_tag, false)?;
+        mutation::validate_pre_apply_with_allowed_paths(ctx, &mutation_plan, &plan_control_paths)?;
+        mutation::validate_changed_paths_with_allowed_paths(ctx, &mutation_plan, &allowed_unstaged_paths)?;
+        let plan_receipt = mutation::write_receipt(
+            ctx.workspace_root(),
+            "release",
+            "plan",
+            "planned",
+            mutation_plan.clone(),
+            vec![MutationTrace::new(
+                "RELEASE_PLAN_CREATED",
+                format!("planned release for {} crate(s)", plan.summary.total_crates),
+            )],
+        )?;
+        crate::progress!("receipt: {}", plan_receipt.display());
+
+        let publisher = ReleasePublisher::new(ctx, release_config);
+        let planned_paths = mutation::expected_paths(&mutation_plan);
+        let transaction_id = mutation_plan.operation_id.clone();
+        publisher.execute(
+            &transaction_id,
+            &plan,
+            skip_publish,
+            args.skip_tag,
+            args.local,
+            args.executor,
+            args.prepare,
+            args.retain_remote,
+            args.pr,
+            &planned_paths,
+            &allowed_unstaged_paths,
+        )?;
+
+        if args.prepare || args.pr || !args.local && release_config.hosted_workflow.is_some() && !args.executor {
+            let state = ReleaseState::load(&state_dir(ctx.workspace_root()).join(format!("{transaction_id}.json")))?;
+            if json {
+                let payload = serde_json::json!({
+                    "transaction_id": state.transaction_id,
+                    "intent": state.intent.identity,
+                    "source": state.release_commit(),
+                    "phase": state.phase,
+                    "review": state.review,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string(&crate::output::machine_json_envelope(
+                        "release", "prepare", "success", 0, payload
+                    ))?
+                );
+            }
+            return Ok(());
+        }
+
+        let resulting_objects = collect_release_objects(ctx, &mutation_plan, &plan, effective_skip_tag)?;
+
+        let apply_receipt = mutation::write_receipt_with_objects(
+            ctx.workspace_root(),
+            "release",
+            "apply",
+            "applied",
+            mutation_plan,
+            vec![
+                MutationTrace::new("RELEASE_APPLY_STARTED", "started release apply"),
+                MutationTrace::new("RELEASE_APPLY_COMPLETED", "completed release apply"),
+            ],
+            resulting_objects,
+        )?;
+        crate::progress!("receipt: {}", apply_receipt.display());
+
         if json {
             let payload = serde_json::json!({
               "release_plan": plan,
               "warnings": warnings,
+              "plan_receipt": plan_receipt,
+              "apply_receipt": apply_receipt,
+              "release_pr": args.pr,
             });
-            let output = crate::output::machine_json_envelope("release", "apply", "no_changes", 0, payload);
+            let output = crate::output::machine_json_envelope(
+                "release",
+                if args.pr { "release_pr" } else { "apply" },
+                "success",
+                0,
+                payload,
+            );
             println!("{}", serde_json::to_string_pretty(&output)?);
-        } else {
-            println!("{}", plan.format_summary_with_flags(skip_publish, args.skip_tag));
-            println!("\nNo release-worthy changes detected.");
-        }
-        return Ok(());
-    }
-
-    let target_crates = plan.canonical_crate_order.clone();
-    validator.validate(&target_crates, false)?;
-
-    if let Some(warning) = validator.validate_branch(args.allow_non_default_branch)? {
-        if json {
-            warnings.push(warning);
-        } else {
-            crate::warn!("{}", warning);
-        }
-    }
-
-    // Validate changelog paths
-    validator.validate_changelog_paths(&target_crates, release_config)?;
-
-    let mutation_plan = if let Some(path) = args.plan_path.as_ref() {
-        let from_file = mutation::read_plan_file(path)?;
-        if !from_file.operation_id.starts_with("release-") {
-            return Err(RailError::with_help(
-                format!("plan '{}' is not a release plan", path.display()),
-                "generate a release plan using 'cargo rail release check --json'".to_string(),
-            ));
-        }
-        mutation::validate_pre_apply_with_allowed_paths(ctx, &from_file, std::slice::from_ref(path))?;
-        // The saved date is presentation input, not a fresh clock reading. Rebuild
-        // every other value from the current selected intent before comparison.
-        let github = crate::release::changelog::detect_github_repo(ctx.workspace_root());
-        for planned in &mut plan.crates {
-            let date = from_file
-                .actions
-                .iter()
-                .filter(|action| action.code == "UPDATE_CHANGELOG")
-                .find(|action| {
-                    action.payload.get("crate").and_then(serde_json::Value::as_str) == Some(planned.name.as_str())
-                })
-                .and_then(|action| action.payload.get("presentation"))
-                .and_then(|value| value.get("date"))
-                .and_then(serde_json::Value::as_str);
-            if let Some(date) = date {
-                chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-                    .map_err(|error| RailError::message(format!("invalid saved release date: {error}")))?;
-                planned.presentation = Some(crate::release::presentation::capture(
-                    ctx.workspace_root(),
-                    release_config,
-                    planned,
-                    date,
-                    github.as_ref(),
-                )?);
-            }
-        }
-        expected_mutation_plan = build_release_mutation_plan(
-            ctx,
-            &plan,
-            effective_skip_publish,
-            effective_skip_tag,
-            args.pr,
-            release_config,
-        )?;
-        mutation::validate_requested_operation(&from_file, &expected_mutation_plan)?;
-        from_file
-    } else {
-        mutation::validate_pre_apply(ctx, &expected_mutation_plan)?;
-        expected_mutation_plan
-    };
-
-    let plan_control_paths = args.plan_path.iter().cloned().collect::<Vec<_>>();
-    let allowed_unstaged_paths = plan_control_paths
-        .iter()
-        .cloned()
-        .chain(mutation::declared_input_paths(&mutation_plan))
-        .collect::<Vec<_>>();
-    mutation::validate_changed_paths_with_allowed_paths(ctx, &mutation_plan, &allowed_unstaged_paths)?;
-
-    if !json {
-        println!(
-            "{}",
-            plan.format_summary_with_flags(effective_skip_publish, effective_skip_tag)
-        );
-    }
-
-    enforce_safety_gate(
-        if args.pr { "release PR" } else { "release apply" },
-        args.yes,
-        args.plan_path.as_deref(),
-        io::stdin().is_terminal() && !json,
-    )?;
-
-    // Skip confirmation if --yes flag is set
-    if !args.yes && io::stdin().is_terminal() && !json {
-        println!("\nthis will:");
-        println!("  - modify Cargo.toml (version bumps)");
-        println!("  - update changelogs");
-        if !plan.auxiliary_lockfiles.is_empty() {
-            println!(
-                "  - update {} declared auxiliary Cargo lockfile(s)",
-                plan.auxiliary_lockfiles.len()
-            );
-        }
-        if args.pr {
-            println!("  - create and push a release PR branch");
-        } else {
-            println!("  - create git commits");
-        }
-        if !effective_skip_tag {
-            println!("  - create {} tag(s)", plan.crates.len());
-        }
-        if !effective_skip_publish {
-            println!("  - publish to crates.io (irreversible)");
         }
 
-        if !crate::utils::prompt_for_confirmation()? {
-            println!("cancelled");
-            return Ok(());
-        }
-    }
-
-    validator.validate_apply_preconditions(&plan, effective_skip_publish, effective_skip_tag, false)?;
-    mutation::validate_pre_apply_with_allowed_paths(ctx, &mutation_plan, &plan_control_paths)?;
-    mutation::validate_changed_paths_with_allowed_paths(ctx, &mutation_plan, &allowed_unstaged_paths)?;
-    let plan_receipt = mutation::write_receipt(
-        ctx.workspace_root(),
-        "release",
-        "plan",
-        "planned",
-        mutation_plan.clone(),
-        vec![MutationTrace::new(
-            "RELEASE_PLAN_CREATED",
-            format!("planned release for {} crate(s)", plan.summary.total_crates),
-        )],
-    )?;
-    crate::progress!("receipt: {}", plan_receipt.display());
-
-    let publisher = ReleasePublisher::new(ctx, release_config);
-    let planned_paths = mutation::expected_paths(&mutation_plan);
-    let transaction_id = mutation_plan.operation_id.clone();
-    publisher.execute(
-        &transaction_id,
-        &plan,
-        skip_publish,
-        args.skip_tag,
-        args.local,
-        args.executor,
-        args.prepare,
-        args.retain_remote,
-        args.pr,
-        &planned_paths,
-        &allowed_unstaged_paths,
-    )?;
-
-    if args.prepare || args.pr || !args.local && release_config.hosted_workflow.is_some() && !args.executor {
-        let state = ReleaseState::load(&state_dir(ctx.workspace_root()).join(format!("{transaction_id}.json")))?;
-        if json {
-            let payload = serde_json::json!({
-                "transaction_id": state.transaction_id,
-                "intent": state.intent.identity,
-                "source": state.release_commit(),
-                "phase": state.phase,
-                "review": state.review,
-            });
-            println!(
-                "{}",
-                serde_json::to_string(&crate::output::machine_json_envelope(
-                    "release", "prepare", "success", 0, payload
-                ))?
-            );
-        }
-        return Ok(());
-    }
-
-    let resulting_objects = collect_release_objects(ctx, &mutation_plan, &plan, effective_skip_tag)?;
-
-    let apply_receipt = mutation::write_receipt_with_objects(
-        ctx.workspace_root(),
-        "release",
-        "apply",
-        "applied",
-        mutation_plan,
-        vec![
-            MutationTrace::new("RELEASE_APPLY_STARTED", "started release apply"),
-            MutationTrace::new("RELEASE_APPLY_COMPLETED", "completed release apply"),
-        ],
-        resulting_objects,
-    )?;
-    crate::progress!("receipt: {}", apply_receipt.display());
-
-    if json {
-        let payload = serde_json::json!({
-          "release_plan": plan,
-          "warnings": warnings,
-          "plan_receipt": plan_receipt,
-          "apply_receipt": apply_receipt,
-          "release_pr": args.pr,
-        });
-        let output = crate::output::machine_json_envelope(
-            "release",
-            if args.pr { "release_pr" } else { "apply" },
-            "success",
-            0,
-            payload,
-        );
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    }
-
-    Ok(())
+        Ok(())
+    })();
+    result.map_err(|error| error.with_warnings(warnings))
 }
 
 /// Validate registry publication readiness.
@@ -548,164 +559,171 @@ pub(super) fn run_release_publication_check_with_plan_inputs(
     debug_assert!(!skip_publish);
 
     let workspace_members = ctx.graph().workspace_members();
-    let warnings = release_config.validate(workspace_members).map_err(RailError::Config)?;
+    let warnings = ctx
+        .config()
+        .expect("release configuration")
+        .release_warnings(workspace_members)?;
     if !json {
         for warning in &warnings {
             crate::warn!("{}", warning);
         }
     }
 
-    let (plan, mutation_plan) = plan_release_operation(
-        ctx,
-        release_config,
-        ReleaseOperationOptions {
-            crate_names,
-            all,
-            bump,
-            skip_publish: false,
-            skip_tag,
-            pr: false,
-            include_dependents,
-        },
-    )?;
-    let has_pending_changes = !mutation_plan.actions.is_empty();
-    let target_crates = plan.canonical_crate_order.clone();
-    let validator = ReleaseValidator::new(ctx);
-    validator.validate(&target_crates, false)?;
-    validator.validate_changelog_paths(&target_crates, release_config)?;
-    // Match run's local/tag/release-note checks without performing registry
-    // lookups. Live publication checks remain opt-in under --extended.
-    validator.validate_apply_preconditions(&plan, true, skip_tag, false)?;
+    let result = (|| -> RailResult<()> {
+        let (plan, mutation_plan) = plan_release_operation(
+            ctx,
+            release_config,
+            ReleaseOperationOptions {
+                crate_names,
+                all,
+                bump,
+                skip_publish: false,
+                skip_tag,
+                pr: false,
+                include_dependents,
+            },
+        )?;
+        let has_pending_changes = !mutation_plan.actions.is_empty();
+        let target_crates = plan.canonical_crate_order.clone();
+        let validator = ReleaseValidator::new(ctx);
+        validator.validate(&target_crates, false)?;
+        validator.validate_changelog_paths(&target_crates, release_config)?;
+        // Match run's local/tag/release-note checks without performing registry
+        // lookups. Live publication checks remain opt-in under --extended.
+        validator.validate_apply_preconditions(&plan, true, skip_tag, false)?;
 
-    let insights = ReleasePlanner::new(ctx, release_config).release_check_insights(&target_crates)?;
-    let commit_diagnostics = insights.commit_diagnostics;
-    let commit_failed =
-        release_config.unconventional_commits == crate::config::CommitPolicy::Deny && !commit_diagnostics.is_empty();
-    let missing_change_files = insights.missing_change_files;
-    let shallow_repository = insights.shallow_repository;
-    let has_change_file_failures = !missing_change_files.is_empty();
-    let has_shallow_failures = shallow_repository;
+        let insights = ReleasePlanner::new(ctx, release_config).release_check_insights(&target_crates)?;
+        let commit_diagnostics = insights.commit_diagnostics;
+        let commit_failed = release_config.unconventional_commits == crate::config::CommitPolicy::Deny
+            && !commit_diagnostics.is_empty();
+        let missing_change_files = insights.missing_change_files;
+        let shallow_repository = insights.shallow_repository;
+        let has_change_file_failures = !missing_change_files.is_empty();
+        let has_shallow_failures = shallow_repository;
 
-    let publishable_crates = plan
-        .crates
-        .iter()
-        .filter(|crate_plan| crate_plan.publish)
-        .map(|crate_plan| crate_plan.name.clone())
-        .collect::<Vec<_>>();
-    let skipped_crates = plan
-        .crates
-        .iter()
-        .filter(|crate_plan| !crate_plan.publish)
-        .map(|crate_plan| {
-            let reason = validator
-                .unpublishable_reason(&crate_plan.name)
-                .unwrap_or_else(|| "release plan disables publication".to_string());
-            (crate_plan.name.clone(), reason)
-        })
-        .collect::<Vec<_>>();
-    for crate_name in &publishable_crates {
-        validator.validate_publishable(crate_name)?;
-    }
-
-    if !json {
-        println!("{}", plan.format_summary_with_flags(false, skip_tag));
+        let publishable_crates = plan
+            .crates
+            .iter()
+            .filter(|crate_plan| crate_plan.publish)
+            .map(|crate_plan| crate_plan.name.clone())
+            .collect::<Vec<_>>();
+        let skipped_crates = plan
+            .crates
+            .iter()
+            .filter(|crate_plan| !crate_plan.publish)
+            .map(|crate_plan| {
+                let reason = validator
+                    .unpublishable_reason(&crate_plan.name)
+                    .unwrap_or_else(|| "release plan disables publication".to_string());
+                (crate_plan.name.clone(), reason)
+            })
+            .collect::<Vec<_>>();
         for crate_name in &publishable_crates {
-            println!("{}: ready for crates-io publication", crate_name);
+            validator.validate_publishable(crate_name)?;
         }
-        for (crate_name, reason) in &skipped_crates {
-            println!("{}: not publishable ({})", crate_name, reason);
-        }
-        if shallow_repository {
-            println!("\nrelease history:");
-            println!("  shallow clone: fetch tags: git fetch --unshallow --tags, or set fetch-depth: 0");
-        }
-        for (name, diagnostics) in &commit_diagnostics {
-            for diagnostic in diagnostics {
-                println!("{name}: {}", diagnostic.describe());
-            }
-        }
-        if !missing_change_files.is_empty() {
-            println!("\nmissing change files:");
-            for crate_name in &missing_change_files {
-                println!(
-                    "  {}: code changes require {} coverage",
-                    crate_name, release_config.change_dir
-                );
-            }
-        }
-    }
 
-    let (extended_results, has_extended_failures) = if extended {
-        run_extended_checks(&validator, &plan, json)?
-    } else {
-        (Vec::new(), false)
-    };
-
-    let validation_failed = has_extended_failures || has_change_file_failures || has_shallow_failures || commit_failed;
-    if json {
-        let (result, exit_code, status) = if validation_failed {
-            ("failed", 2, "failed")
-        } else if has_pending_changes {
-            ("pending_changes", 1, "pending")
-        } else {
-            ("no_changes", 0, "passed")
-        };
-        let mut payload = serde_json::json!({
-          "action": "check",
-          "check": true,
-          "release_plan": plan,
-          "mutation_plan": mutation_plan,
-          "readiness": publication_check_readiness(&mutation_plan),
-          "status": status,
-          "crates": publishable_crates,
-          "count": publishable_crates.len(),
-          "skipped": skipped_crates
-              .iter()
-              .map(|(name, reason)| serde_json::json!({"crate": name, "reason": reason}))
-              .collect::<Vec<_>>(),
-          "warnings": warnings,
-        });
-        if !commit_diagnostics.is_empty() {
-            payload["commit_diagnostics"] = serde_json::json!(commit_diagnostics);
-        }
-        if extended {
-            payload["extended"] = serde_json::json!(extended_results);
-        }
-        if !missing_change_files.is_empty() {
-            payload["missing_change_files"] = serde_json::json!(missing_change_files);
-        }
-        if shallow_repository {
-            payload["release_history"] = serde_json::json!({
-              "shallow_repository": true,
-              "help": "fetch tags: git fetch --unshallow --tags, or set fetch-depth: 0"
-            });
-        }
-        let output = crate::output::machine_json_envelope("release", "check", result, exit_code, payload);
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    }
-
-    if validation_failed {
-        if json {
-            return Err(RailError::ExitWithCode { code: 2 });
-        }
-        return Err(RailError::message(if has_shallow_failures {
-            "release history check failed"
-        } else if has_change_file_failures {
-            "change file coverage failed"
-        } else {
-            "extended validation failed"
-        }));
-    }
-    if has_pending_changes {
         if !json {
-            println!("\nPublication-ready changes detected. Run the matching release command to apply.");
+            println!("{}", plan.format_summary_with_flags(false, skip_tag));
+            for crate_name in &publishable_crates {
+                println!("{}: ready for crates-io publication", crate_name);
+            }
+            for (crate_name, reason) in &skipped_crates {
+                println!("{}: not publishable ({})", crate_name, reason);
+            }
+            if shallow_repository {
+                println!("\nrelease history:");
+                println!("  shallow clone: fetch tags: git fetch --unshallow --tags, or set fetch-depth: 0");
+            }
+            for (name, diagnostics) in &commit_diagnostics {
+                for diagnostic in diagnostics {
+                    println!("{name}: {}", diagnostic.describe());
+                }
+            }
+            if !missing_change_files.is_empty() {
+                println!("\nmissing change files:");
+                for crate_name in &missing_change_files {
+                    println!(
+                        "  {}: code changes require {} coverage",
+                        crate_name, release_config.change_dir
+                    );
+                }
+            }
         }
-        return Err(RailError::CheckHasPendingChanges);
-    }
-    if !json {
-        println!("\nNo release-worthy changes detected.");
-    }
-    Ok(())
+
+        let (extended_results, has_extended_failures) = if extended {
+            run_extended_checks(&validator, &plan, json)?
+        } else {
+            (Vec::new(), false)
+        };
+
+        let validation_failed =
+            has_extended_failures || has_change_file_failures || has_shallow_failures || commit_failed;
+        if json {
+            let (result, exit_code, status) = if validation_failed {
+                ("failed", 2, "failed")
+            } else if has_pending_changes {
+                ("pending_changes", 1, "pending")
+            } else {
+                ("no_changes", 0, "passed")
+            };
+            let mut payload = serde_json::json!({
+              "action": "check",
+              "check": true,
+              "release_plan": plan,
+              "mutation_plan": mutation_plan,
+              "readiness": publication_check_readiness(&mutation_plan),
+              "status": status,
+              "crates": publishable_crates,
+              "count": publishable_crates.len(),
+              "skipped": skipped_crates
+                  .iter()
+                  .map(|(name, reason)| serde_json::json!({"crate": name, "reason": reason}))
+                  .collect::<Vec<_>>(),
+              "warnings": warnings,
+            });
+            if !commit_diagnostics.is_empty() {
+                payload["commit_diagnostics"] = serde_json::json!(commit_diagnostics);
+            }
+            if extended {
+                payload["extended"] = serde_json::json!(extended_results);
+            }
+            if !missing_change_files.is_empty() {
+                payload["missing_change_files"] = serde_json::json!(missing_change_files);
+            }
+            if shallow_repository {
+                payload["release_history"] = serde_json::json!({
+                  "shallow_repository": true,
+                  "help": "fetch tags: git fetch --unshallow --tags, or set fetch-depth: 0"
+                });
+            }
+            let output = crate::output::machine_json_envelope("release", "check", result, exit_code, payload);
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+
+        if validation_failed {
+            if json {
+                return Err(RailError::ExitWithCode { code: 2 });
+            }
+            return Err(RailError::message(if has_shallow_failures {
+                "release history check failed"
+            } else if has_change_file_failures {
+                "change file coverage failed"
+            } else {
+                "extended validation failed"
+            }));
+        }
+        if has_pending_changes {
+            if !json {
+                println!("\nPublication-ready changes detected. Run the matching release command to apply.");
+            }
+            return Err(RailError::CheckHasPendingChanges);
+        }
+        if !json {
+            println!("\nNo release-worthy changes detected.");
+        }
+        Ok(())
+    })();
+    result.map_err(|error| error.with_warnings(warnings))
 }
 
 fn run_extended_checks(
@@ -1321,7 +1339,7 @@ fn build_release_mutation_plan(
         plan.crates.len() * 7
             + plan.change_files_to_delete.len()
             + plan.change_files_to_update.len()
-            + plan.auxiliary_lockfiles.len()
+            + plan.cargo_writes.len()
             + 3,
     );
 
@@ -1336,46 +1354,8 @@ fn build_release_mutation_plan(
               "crate": crate_plan.name,
               "from": crate_plan.current_version,
               "to": crate_plan.new_version,
-            }))
-            .with_mutations(vec![release_mutation(
-                ctx,
-                &crate_plan.manifest_path,
-                MutationEffect::Write,
-            )?]),
+            })),
         );
-        if !crate_plan.affected_dependents.is_empty() {
-            let mut mutations = vec![release_mutation(
-                ctx,
-                &ctx.workspace_root().join("Cargo.toml"),
-                MutationEffect::Write,
-            )?];
-            for dependent in &crate_plan.affected_dependents {
-                let package = ctx.cargo().get_package(dependent).ok_or_else(|| {
-                    RailError::message(format!(
-                        "release plan references unknown dependent crate '{}'",
-                        dependent
-                    ))
-                })?;
-                mutations.push(release_mutation(
-                    ctx,
-                    &package.manifest_path.clone().into_std_path_buf(),
-                    MutationEffect::Write,
-                )?);
-            }
-            actions.push(
-                MutationAction::new(
-                    "UPDATE_DEPENDENTS",
-                    crate_plan.name.clone(),
-                    Some(crate_plan.affected_dependents.join(",")),
-                )
-                .with_payload(serde_json::json!({
-                  "dependency": crate_plan.name,
-                  "version": crate_plan.new_version,
-                  "dependents": crate_plan.affected_dependents,
-                }))
-                .with_mutations(mutations),
-            );
-        }
         if crate_plan.generate_changelog && !crate_plan.changelog_body.trim().is_empty() {
             actions.push(
                 MutationAction::new(
@@ -1412,31 +1392,25 @@ fn build_release_mutation_plan(
                     .with_mutations(vec![release_mutation(ctx, &update.path, MutationEffect::Write)?]),
             );
         }
-        actions.push(
-            MutationAction::new("UPDATE_LOCKFILE", "Cargo.lock", None)
-                .with_payload(serde_json::json!({ "packages": plan.canonical_crate_order }))
-                .with_mutations(vec![release_mutation(
-                    ctx,
-                    &ctx.workspace_root().join("Cargo.lock"),
-                    MutationEffect::Write,
-                )?]),
-        );
-        for auxiliary in &plan.auxiliary_lockfiles {
+        for write in &plan.cargo_writes {
             actions.push(
                 MutationAction::new(
-                    "UPDATE_AUXILIARY_LOCKFILE",
-                    auxiliary.lockfile_path.display().to_string(),
-                    Some(format!("manifest={}", auxiliary.manifest_path.display())),
+                    if write.path == Path::new("Cargo.lock") {
+                        "UPDATE_LOCKFILE"
+                    } else if write.path.file_name().is_some_and(|name| name == "Cargo.lock") {
+                        "UPDATE_AUXILIARY_LOCKFILE"
+                    } else {
+                        "WRITE_CARGO_FILE"
+                    },
+                    write.path.display().to_string(),
+                    None,
                 )
-                .with_payload(serde_json::json!({
-                  "manifest": auxiliary.manifest_path,
-                  "lockfile": auxiliary.lockfile_path,
-                  "before_digest": auxiliary.before_digest,
-                  "after_digest": auxiliary.after_digest,
-                }))
+                .with_payload(
+                    serde_json::json!({"before_digest": write.before_digest, "after_digest": write.after_digest}),
+                )
                 .with_mutations(vec![release_mutation(
                     ctx,
-                    &ctx.workspace_root().join(&auxiliary.lockfile_path),
+                    &ctx.workspace_root().join(&write.path),
                     MutationEffect::Write,
                 )?]),
             );
@@ -1752,6 +1726,7 @@ pub fn run_release_init(ctx: &WorkspaceContext, crates: Option<Vec<String>>, dry
 
         crate_config.release = Some(CrateReleaseConfig {
             publish: crate::workspace::CargoState::is_package_publishable(pkg),
+            tag_format: None,
         });
 
         if let Some(path) = changelog_path {
@@ -1820,7 +1795,7 @@ mod tests {
         test_git(root.path(), &["init", "-q", "-b", "main"]);
         test_git(root.path(), &["config", "user.name", "Cargo-Rail Test"]);
         test_git(root.path(), &["config", "user.email", "cargo-rail@example.invalid"]);
-        let message = "prepare\n\nRail-Release: release-fixture\nRail-Release-Contract: 10\nRail-Release-Intent: first\nRail-Release-Intent: second";
+        let message = "prepare\n\nRail-Release: release-fixture\nRail-Release-Contract: 11\nRail-Release-Intent: first\nRail-Release-Intent: second";
         test_git(root.path(), &["commit", "--allow-empty", "-qm", message]);
         let transaction = git_release_transactions(root.path()).unwrap().remove(0);
         let status = history_status_report(root.path(), transaction);

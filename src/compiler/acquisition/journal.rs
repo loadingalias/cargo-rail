@@ -863,6 +863,7 @@ mod tests {
                 source_cfg_features: Default::default(),
                 source_cfg_expressions: Default::default(),
                 retention_identifiers: Default::default(),
+                development_only_identifiers: Default::default(),
                 inherits_workspace_msrv: false,
                 package_fields: Default::default(),
                 dependencies: Default::default(),

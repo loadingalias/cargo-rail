@@ -320,6 +320,19 @@ fn only_release_state(workspace: &Path) -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("missing release state"))
 }
 
+fn auxiliary_cargo_writes(plan: &serde_json::Value) -> Vec<&serde_json::Value> {
+    plan["cargo_writes"]
+        .as_array()
+        .expect("Cargo writes")
+        .iter()
+        .filter(|write| {
+            write["path"]
+                .as_str()
+                .is_some_and(|path| path.contains("aux") && path.ends_with("/Cargo.lock"))
+        })
+        .collect()
+}
+
 fn add_auxiliary_cargo_workspace(ws: &TestWorkspace, name: &str, dependency: &str) -> Result<PathBuf> {
     add_auxiliary_cargo_workspace_with_dependencies(ws, name, &[(dependency, "..")])
 }
@@ -1761,14 +1774,11 @@ auxiliary_cargo_manifests = ["aux-one/Cargo.toml", "aux-two/Cargo.toml"]
             String::from_utf8_lossy(&check.stderr)
         );
         let check: serde_json::Value = serde_json::from_slice(&check.stdout)?;
-        assert_eq!(check["release_plan"]["plan_contract_version"], 9);
-        let projections = check["release_plan"]["auxiliary_lockfiles"]
-            .as_array()
-            .expect("auxiliary lockfile projections");
+        assert_eq!(check["release_plan"]["plan_contract_version"], 10);
+        let projections = auxiliary_cargo_writes(&check["release_plan"]);
         assert_eq!(projections.len(), 2);
         for (index, name) in ["aux-one", "aux-two"].into_iter().enumerate() {
-            assert_eq!(projections[index]["manifest_path"], format!("{name}/Cargo.toml"));
-            assert_eq!(projections[index]["lockfile_path"], format!("{name}/Cargo.lock"));
+            assert_eq!(projections[index]["path"], format!("{name}/Cargo.lock"));
             assert!(
                 projections[index]["before_digest"]
                     .as_str()
@@ -1862,7 +1872,7 @@ auxiliary_cargo_manifests = ["aux-dual/Cargo.toml"]
         std::fs::write(
             &wrapper,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = update ]; then\n  if [ -e \"{}\" ]; then exit 97; fi\n  printf 'one\\n' > \"{}\"\nfi\nexec \"{}\" \"$@\"\n",
+                "#!/bin/sh\nif [ \"$1\" = update ]; then\ncase \"$3\" in */aux-dual/Cargo.toml)\n  if [ -e \"{}\" ]; then exit 97; fi\n  printf 'one\\n' > \"{}\"\n;; esac\nfi\nexec \"{}\" \"$@\"\n",
                 marker.display(),
                 marker.display(),
                 PathBuf::from(cargo).display()
@@ -1893,7 +1903,7 @@ auxiliary_cargo_manifests = ["aux-dual/Cargo.toml"]
         );
         assert_eq!(std::fs::read_to_string(&marker)?, "one\n");
         let check: serde_json::Value = serde_json::from_slice(&check.stdout)?;
-        let candidate = check["release_plan"]["auxiliary_lockfiles"][0]["content"]
+        let candidate = auxiliary_cargo_writes(&check["release_plan"])[0]["content"]
             .as_str()
             .expect("planned Cargo.lock content");
         assert!(candidate.contains("name = \"dual-release-one\"\nversion = \"0.1.1\""));
@@ -1963,10 +1973,7 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
             String::from_utf8_lossy(&check.stderr)
         );
         let check: serde_json::Value = serde_json::from_slice(&check.stdout)?;
-        assert_eq!(
-            check["release_plan"]["auxiliary_lockfiles"].as_array().unwrap().len(),
-            1
-        );
+        assert_eq!(auxiliary_cargo_writes(&check["release_plan"]).len(), 1);
         let status = git(&ws.path, &["status", "--porcelain", "--untracked-files=no"])?;
         assert!(status.stdout.is_empty(), "planning changed the CRLF checkout");
 
@@ -2059,10 +2066,7 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
             String::from_utf8_lossy(&check.stderr)
         );
         let check: serde_json::Value = serde_json::from_slice(&check.stdout)?;
-        assert_eq!(
-            check["release_plan"]["auxiliary_lockfiles"].as_array().unwrap().len(),
-            1
-        );
+        assert_eq!(auxiliary_cargo_writes(&check["release_plan"]).len(), 1);
         let status = git(&ws.git_root, &["status", "--porcelain", "--untracked-files=no"])?;
         assert!(status.stdout.is_empty(), "planning changed the nested CRLF checkout");
 
@@ -2248,11 +2252,7 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
         );
         let check: serde_json::Value = serde_json::from_slice(&check.stdout)?;
         assert_eq!(
-            check["release_plan"]["auxiliary_lockfiles"][0]["manifest_path"],
-            "auxiliary/Cargo.toml"
-        );
-        assert_eq!(
-            check["release_plan"]["auxiliary_lockfiles"][0]["lockfile_path"],
+            auxiliary_cargo_writes(&check["release_plan"])[0]["path"],
             "auxiliary/Cargo.lock"
         );
 
@@ -2528,12 +2528,9 @@ auxiliary_cargo_manifests = ["auxiliary/Cargo.toml"]
 
         let state_path = only_release_state(&ws.path)?;
         let state: serde_json::Value = serde_json::from_slice(&std::fs::read(&state_path)?)?;
-        assert_eq!(state["schema_version"], 10);
-        assert_eq!(state["intent"]["plan"]["plan_contract_version"], 9);
-        assert_eq!(
-            state["intent"]["plan"]["auxiliary_lockfiles"].as_array().unwrap().len(),
-            1
-        );
+        assert_eq!(state["schema_version"], 11);
+        assert_eq!(state["intent"]["plan"]["plan_contract_version"], 10);
+        assert_eq!(auxiliary_cargo_writes(&state["intent"]["plan"]).len(), 1);
         let resumed = run_cargo_rail(
             &ws.path,
             &[
@@ -2713,7 +2710,7 @@ core = ["lib-a", "lib-b", "lib-c"]
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let json: serde_json::Value = serde_json::from_str(&stdout)?;
-        assert_eq!(json["release_plan"]["plan_contract_version"], 9);
+        assert_eq!(json["release_plan"]["plan_contract_version"], 10);
         assert!(
             json["release_plan"]["snapshot_id"]
                 .as_str()
@@ -6164,7 +6161,7 @@ fn release_record_handoff_preserves_intent_and_resumes_in_a_fresh_clone() {
         let portable = std::fs::read_to_string(bundle.join("record.json"))?;
         assert!(!portable.contains(ws.path.to_str().unwrap()));
         let schema: serde_json::Value =
-            serde_json::from_str(include_str!("../../schemas/release-record-v10.schema.json"))?;
+            serde_json::from_str(include_str!("../../schemas/release-record-v11.schema.json"))?;
         let validator = jsonschema::validator_for(&schema)?;
         let record: serde_json::Value = serde_json::from_str(&portable)?;
         let errors = validator
@@ -8491,7 +8488,7 @@ else:raise RuntimeError(args)
         assert_eq!(sealed["artifacts"][0]["artifact_id"], 91);
         assert_eq!(sealed["artifacts"][0]["files"].as_array().unwrap().len(), 2);
         let schema: serde_json::Value =
-            serde_json::from_str(include_str!("../../schemas/release-record-v10.schema.json"))?;
+            serde_json::from_str(include_str!("../../schemas/release-record-v11.schema.json"))?;
         jsonschema::validator_for(&schema)?
             .validate(&sealed)
             .map_err(|error| anyhow::anyhow!("{error}"))?;

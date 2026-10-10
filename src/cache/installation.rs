@@ -3074,6 +3074,7 @@ fn install_wrapper_value(original: &str, wrapper: &Path, owned_wrapper: Option<&
     };
     let selected = wrapper_value_from_document(&document)?;
     if let Some(selected) = selected
+        && Path::new(selected) != wrapper
         && owned_wrapper.is_none_or(|owned| Path::new(selected) != owned)
     {
         return Err(RailError::with_help(
@@ -3832,6 +3833,31 @@ mod tests {
         let error = install_wrapper_value("[build]\nrustc-wrapper = 'sccache'\n", Path::new("/tools/rail"), None)
             .expect_err("existing wrapper must conflict");
         assert!(error.to_string().contains("already selects rustc wrapper"));
+    }
+
+    #[test]
+    fn setup_repairs_its_managed_wrapper_without_a_receipt() {
+        let wrapper = Path::new("/cargo-home/cargo-rail/compiler-cache-v1/cargo-rail-native-rustc-wrapper");
+        let original = format!(
+            "# keep\n[build]\nrustc-wrapper = '{}'\ntarget-dir = 'out'\n",
+            wrapper.display()
+        );
+        let (edited, created) = install_wrapper_value(&original, wrapper, None).unwrap();
+        assert!(!created);
+        assert_eq!(
+            edited,
+            format!(
+                "# keep\n[build]\nrustc-wrapper = \"{}\"\ntarget-dir = 'out'\n",
+                wrapper.display()
+            )
+        );
+        let other = Path::new("/other/cargo-rail/compiler-cache-v1/cargo-rail-native-rustc-wrapper");
+        assert!(
+            install_wrapper_value(&original, other, None)
+                .unwrap_err()
+                .to_string()
+                .contains("already selects rustc wrapper")
+        );
     }
 
     #[test]

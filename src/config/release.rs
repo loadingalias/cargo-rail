@@ -665,6 +665,8 @@ pub struct CrateReleaseConfig {
     /// Enable or disable publishing for this crate within Cargo's manifest authority.
     #[serde(default = "default_true")]
     pub publish: bool,
+    /// Override the global tag format for this crate's release history.
+    pub tag_format: Option<String>,
 }
 
 /// Per-crate changelog configuration (`[crates.NAME.changelog]`)

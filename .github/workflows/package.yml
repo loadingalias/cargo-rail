@@ -121,11 +121,14 @@ jobs:
           cp "$RUNNER_TEMP"/packages/*/*.zip "$RUNNER_TEMP/assets/"
           cat "$RUNNER_TEMP"/packages/*/SHA256SUMS | sort > "$RUNNER_TEMP/assets/SHA256SUMS"
           cp LICENSE "$RUNNER_TEMP/assets/LICENSE"
+          python3 scripts/package-archive-hosts.py "$RUNNER_TEMP/assets"
           (cd "$RUNNER_TEMP/assets"; sha256sum --check --strict SHA256SUMS)
       - name: Attest component archives
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: ${{ runner.temp }}/assets/cargo-rail-*.zip
+          subject-path: |
+            ${{ runner.temp }}/assets/cargo-rail-*.zip
+            ${{ runner.temp }}/assets/cargo-rail-archive-hosts-v1.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-cargo-rail-${{ github.run_id }}-${{ github.run_attempt }}

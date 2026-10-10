@@ -1148,10 +1148,7 @@ fn read_authenticated_component(path: &Path, expected_digest: &str, maximum_byte
     let bytes = read_bounded_regular_file(path, maximum_bytes)?;
     let actual = format!("sha256:{}", ContentDigest::sha256(&bytes));
     if actual != expected_digest {
-        return Err(RailError::message(format!(
-            "authenticated component '{}' does not match embedded release authority",
-            path.display()
-        )));
+        return Err(component_digest_mismatch(path, expected_digest, &actual));
     }
     Ok(bytes)
 }
@@ -2679,11 +2676,37 @@ fn transfer_authenticated_component(
     crate::instrumentation::record_hashed_file_bytes_read(usize::try_from(bytes).unwrap_or(usize::MAX));
     let actual = format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize()));
     if actual != expected_digest {
-        return Err(RailError::message(
-            "compiler fact driver bytes do not match embedded release authority",
-        ));
+        return Err(component_digest_mismatch(path, expected_digest, &actual));
     }
     Ok(bytes)
+}
+
+fn component_digest_mismatch(path: &Path, expected: &str, actual: &str) -> RailError {
+    let adjacent = path.parent().map(|parent| parent.join("cargo-rail-components-v1.tsv"));
+    let version = adjacent
+        .as_deref()
+        .and_then(|manifest| read_bounded_regular_file(manifest, 64 * 1024).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| {
+            let mut header = text.lines().next()?.split('\t');
+            if header.next()? != "cargo-rail-components-v1" {
+                return None;
+            }
+            let version = header.next()?;
+            semver::Version::parse(version).ok().map(|version| version.to_string())
+        })
+        .unwrap_or_else(|| "absent or invalid".into());
+    RailError::with_help(
+        format!(
+            "compiler component '{}' does not match embedded release authority: found {actual}, expected {expected}; adjacent component version {version}, running cargo-rail {}",
+            path.display(),
+            env!("CARGO_PKG_VERSION")
+        ),
+        format!(
+            "install the complete matching native archive from https://github.com/loadingalias/cargo-rail/releases/tag/v{} and rerun cargo rail cache setup",
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -3065,6 +3088,31 @@ mod tests {
 
             file.set_permissions(fs::Permissions::from_mode(0o700))
                 .expect("make component executable");
+        }
+    }
+
+    #[test]
+    fn stale_component_diagnosis_binds_path_digests_and_versions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("driver-source.json");
+        fs::write(&path, b"stale").unwrap();
+        fs::write(
+            directory.path().join("cargo-rail-components-v1.tsv"),
+            "cargo-rail-components-v1\t0.28.1\thost\n",
+        )
+        .unwrap();
+        let expected = format!("sha256:{}", "0".repeat(64));
+        let error = read_authenticated_component(&path, &expected, 1024)
+            .unwrap_err()
+            .to_string();
+        for context in [
+            path.display().to_string(),
+            expected,
+            format!("sha256:{}", ContentDigest::sha256(b"stale")),
+            "adjacent component version 0.28.1".into(),
+            format!("running cargo-rail {}", env!("CARGO_PKG_VERSION")),
+        ] {
+            assert!(error.contains(&context), "{error}");
         }
     }
 

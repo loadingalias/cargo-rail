@@ -3,7 +3,7 @@
 mod aliases;
 pub(crate) mod artifacts;
 pub(crate) mod attribution;
-pub(crate) mod auxiliary;
+pub(crate) mod cargo_projection;
 pub mod change_files;
 pub(crate) mod changelog;
 mod contract;
