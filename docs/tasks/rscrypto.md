@@ -315,7 +315,12 @@ Native qualification remains required before publication:
   so RISC-V qualification can identify the capture error.
 - Native CI also found rustc's current nightly entry-point rename.
   The driver selects the old or new name through its existing exact-compiler API table.
-  Baseline and dated-nightly driver checks pass locally; native CI qualification remains pending.
+  Baseline and dated-nightly driver checks pass locally; native stable, beta, and nightly checks pass.
+- The Surface cross-target fixture now selects a foreign architecture on every test host,
+  preserving the host linker needed by doctests while proving that foreign checks do not link.
+  The complete local lane passes: 1,784 tests, six doctests, the compiler-driver checks,
+  and Clippy on all six configured cross-compilation targets.
+  IBM Z's native suite passes; complete native CI qualification remains pending.
 
 After a release, rscrypto Track 1 must bump its tooling pin,
 use the configuration at the top of this file, and verify that release-check exits 0 or 1,

@@ -1334,7 +1334,12 @@ reason = "fixture product"
 fn surface_cross_target_checks_need_neither_std_nor_a_linker_and_report_host_test_scope() {
     let result: Result<()> = (|| {
         // Exercise the bare-metal view when that compiler component is installed.
-        // The configured Linux view always proves that linking is not required.
+        // Keep the configured Linux view foreign to the test host, whose doctests need linking.
+        let cross_target = if cfg!(target_arch = "x86_64") {
+            "aarch64-unknown-linux-gnu"
+        } else {
+            "x86_64-unknown-linux-gnu"
+        };
         let installed = std::process::Command::new("rustup")
             .args(["target", "list", "--installed"])
             .output()?;
@@ -1349,9 +1354,9 @@ fn surface_cross_target_checks_need_neither_std_nor_a_linker_and_report_host_tes
             "#![no_std]\n/// Return a constant.\n/// ```\n/// assert_eq!(cross_library::value(), 7);\n/// ```\npub fn value() -> u8 { 7 }\n",
         )?;
         let targets = if bare_metal {
-            "['x86_64-unknown-linux-gnu', 'thumbv6m-none-eabi']"
+            format!("['{cross_target}', 'thumbv6m-none-eabi']")
         } else {
-            "['x86_64-unknown-linux-gnu']"
+            format!("['{cross_target}']")
         };
         fs::write(
             workspace.path.join(".config/rail.toml"),
@@ -1360,7 +1365,7 @@ fn surface_cross_target_checks_need_neither_std_nor_a_linker_and_report_host_tes
         fs::create_dir_all(workspace.path.join(".cargo"))?;
         fs::write(
             workspace.path.join(".cargo/config.toml"),
-            "[target.x86_64-unknown-linux-gnu]\nlinker = 'cargo-rail-linker-must-not-be-called'\n",
+            format!("[target.{cross_target}]\nlinker = 'cargo-rail-linker-must-not-be-called'\n"),
         )?;
         fs::write(
             workspace.path.join("rust-toolchain.toml"),
@@ -1374,6 +1379,12 @@ fn surface_cross_target_checks_need_neither_std_nor_a_linker_and_report_host_tes
         let validator =
             jsonschema::validator_for(&schema).map_err(|error| anyhow!("invalid surface schema: {error}"))?;
         assert!(validator.is_valid(&report), "{report}");
+        assert!(
+            report["targets"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(cross_target))
+        );
         assert_eq!(report["coverage"]["target_coverage_complete"], false);
         assert_eq!(report["coverage"]["doctest_coverage_complete"], false);
         assert_eq!(
