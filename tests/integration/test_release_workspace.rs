@@ -435,13 +435,23 @@ fn release_rejects_undeclared_path_dependent_lockfiles_before_mutation() {
         ] {
             let output = run_cargo_rail(&ws.path, &args)?;
             assert_eq!(output.status.code(), Some(2), "{output:?}");
-            let diagnostic = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            let diagnostic = if args.contains(&"json") {
+                let error: Value = serde_json::from_slice(&output.stdout)?;
+                format!(
+                    "{}\n{}",
+                    error["message"].as_str().expect("JSON error message"),
+                    error["help"].as_str().expect("JSON error help")
+                )
+            } else {
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            };
             assert!(diagnostic.contains("auxiliary/Cargo.lock"), "{diagnostic}");
-            assert!(diagnostic.contains("auxiliary/Cargo.toml"), "{diagnostic}");
+            let manifest = std::path::Path::new("auxiliary").join("Cargo.toml");
+            assert!(diagnostic.contains(&manifest.display().to_string()), "{diagnostic}");
             assert!(diagnostic.contains("release.auxiliary_cargo_manifests"), "{diagnostic}");
             assert_eq!(git(&ws.path, &["rev-parse", "HEAD"])?.stdout, before);
             assert!(git(&ws.path, &["status", "--porcelain"])?.stdout.is_empty());
