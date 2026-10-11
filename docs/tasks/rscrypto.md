@@ -1,8 +1,69 @@
 # Cargo-Rail consumer issues
 
+## Release status and undeclared independent lockfiles
+
+Status: fixed and validated locally on 2026-10-11; pre-release CI, release,
+and consumer adoption remain gated.
+Cargo-Rail 0.31.0 reproduces both defects despite the earlier consumer task's administrative
+closure.
+
+- Release status derives required effects from the retained intent.
+  Text and JSON identify skipped effects without counting them as completed publication
+  or next work.
+  Interrupted preparation keeps its ambiguity and recovery command.
+  The stored release-plan v10 and release-record v11 contracts remain unchanged.
+- Release planning inspects captured tracked independent lockfiles.
+  Cargo metadata confirms the selected package's actual manifest path;
+  an unrelated package with the same name and version does not block the release.
+  Omitted workspaces must be declared in `release.auxiliary_cargo_manifests` before preparation.
+  Capture follows inactive optional and transitive path dependencies.
+  Unattributed local lockfile identities also require an explicit declaration.
+  Discovery authorizes no additional writes.
+
+The two defect regressions fail on the original source.
+The source-built retained probe now rejects the omission in ordinary check, extended check,
+and execution; the unchanged fixture still passes locked metadata.
+The declared control updates its lockfile and passes locked metadata after preparation.
+Preparation-only status, registry evidence, forge publication,
+and existing recovery regressions pass locally.
+The unpublished-dependent, per-crate tag, warning,
+and declared-Cargo-write regressions remain covered.
+Complete local validation passed: `just check` ran 1,789 tests, six doctests,
+the dedicated compiler-driver checks, and all six cross-target lint lanes.
+All 17 focused release regressions pass.
+The final native archive passed checksum/component verification and all 15 installation checks.
+The unchanged Action source passed its complete check
+and all seven ignored CLI contract tests against the final candidate,
+including independent release-record validation.
+The new source-bound evidence is retained in rscrypto's `benchmark_results/cargo-rail-release-repair-20261011T175442Z/REPORT.md` and its verified sibling archive.
+
+The patch release intent is `.changes/release-status-lockfile-discovery.md`.
+The owner authorized source commits and pushes on 2026-10-11.
+Wait for CI and a new owner instruction before starting either release.
+Remaining gates:
+
+1. Verify CI for the pushed source,
+   then obtain the owner's instruction to release Cargo-Rail 0.31.1.
+1. Refresh the companion Action's exact CLI/tooling lock and planner/cache/release defaults after
+   that release exists, qualify its published archive, and release the matching Action 11.0.1 patch.
+   Its independent reader consumes the unchanged contracts;
+   this refresh preserves the documented supported version pair.
+1. rscrypto Track 1 authenticates the released CLI, updates its existing version,
+   platform asset pins, and immutable Action pins, then reruns both defect probes,
+   the unpublished-dependent/tag-format regression, and clean `just release-check`.
+   The check must exit 0 or 1, plan only rscrypto, and select `v0.10.0` → `v0.11.0`.
+
+The fixes remain unpublished.
+The companion Action has no pending production change because the stored contracts are unchanged.
+Keep its existing released CLI lock and defaults until Cargo-Rail 0.31.1 exists.
+The installed CLI, consumer tracked source, earlier sealed bundle,
+and Track 2 ownership remain unchanged.
+No current Action defect is reproduced.
+Shared-cache producer/reader reuse remains unproved and is a separate qualification gate.
+
 ## Release one crate while an unpublished member depends on it
 
-Status: released in Cargo-Rail 0.31.0; rscrypto adoption remains pending.
+Status: released in Cargo-Rail 0.31.0; rscrypto adoption verified at `614d1b56`.
 The owner prioritized this fix on 2026-10-10.
 
 The root workspace will contain `rscrypto` and `rscrypto-rustls`.
@@ -51,14 +112,14 @@ tag_format = "{crate}-{prefix}{version}"
 ```
 
 No alias tags or change to rscrypto's current release workflow are required.
-Do not edit rscrypto in this task.
-Source validation does not close the consumer acceptance gate until a released Cargo-Rail is pinned
-and rscrypto's release check plans only rscrypto, with previous tag `v0.10.0` and tag `v0.11.0`.
+The retained consumer evidence verifies that the pinned release plans only rscrypto,
+with previous tag `v0.10.0` and tag `v0.11.0`.
+Repeat this acceptance after adopting the release-status and lockfile-discovery patch.
 
 ## Cargo-Rail omits the Windows ARM64 native archive (0.29.0 and 0.30.0)
 
 Status: released in Cargo-Rail 0.31.0 using the owner-selected archive-host manifest.
-Consumer adoption remains pending.
+The consumer pins are adopted; native platform qualification remains separate.
 Historical evidence from 2026-09-30: the v0.30.0 release still publishes no `cargo-rail-aarch64-pc-windows-msvc.zip`,
 while its `.config/rail.toml` still lists `aarch64-pc-windows-msvc`.
 
@@ -98,7 +159,7 @@ and native installation evidence exist.
 
 ## Cargo-Rail Unify misses unused dependencies outside the root workspace and misplaced test-only ones
 
-Status: scope and misplacement released in Cargo-Rail 0.31.0; consumer adoption remains pending.
+Status: scope and misplacement released in Cargo-Rail 0.31.0; the consumer pins are adopted.
 Recorded 2026-09-26.
 The rscrypto findings are fixed in `ecc7d47e` (Cargo's lint now reports nothing).
 The historical task file `cargo-rail/docs/tasks/unify-unused-dependencies.md` no longer exists.
@@ -160,7 +221,7 @@ Documentation distinguishes Cargo's single-build lint from Unify's configured-vi
 
 ## Release planning silently skips the semver gate when no tag matches `tag_format`
 
-Status: released in Cargo-Rail 0.31.0; consumer adoption remains pending.
+Status: released in Cargo-Rail 0.31.0; the consumer pins are adopted.
 Found 2026-10-01 with cargo-rail 0.30.1. rscrypto works around it by declaring its tag format.
 
 Command: `just release-check` (`cargo rail release check rscrypto --bump auto --skip-tag`) on `main` at `b41e5e5c`, with `release.semver_check = "deny"` and no `release.tag_format`.
@@ -302,9 +363,8 @@ rustc's nightly entry-point rename, and the Surface fixture's foreign-target sel
 Stable, beta, and nightly compiler-driver checks pass.
 The RISC-V diagnostic fixture remains in place; its final native suite passes.
 
-rscrypto Track 1 must bump its tooling pin to Cargo-Rail 0.31.0,
-use the configuration at the top of this file, and verify that release-check exits 0 or 1,
-plans only rscrypto, and selects `v0.10.0` -> `v0.11.0`.
-Its CI cache Action pins must also adopt Cargo-Rail-Action v11,
-whose lock and default inputs select the matching Cargo-Rail 0.31.0 producer.
-It needs no alias tags or release-workflow change.
+rscrypto Track 1 adopted Cargo-Rail 0.31.0 and immutable Cargo-Rail-Action 11.0.0 pins.
+The retained acceptance at `614d1b56` plans only rscrypto and selects `v0.10.0` -> `v0.11.0`.
+The separate release-status and undeclared-lockfile defects above require another Cargo-Rail
+release.
+The existing tag configuration needs no alias tags or release-workflow change.

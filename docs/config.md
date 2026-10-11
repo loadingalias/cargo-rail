@@ -296,7 +296,17 @@ after verifying the immutable forge release.
 Aliases require tags and forge publication.
 
 Standalone tools or fuzz workspaces
-that depend on released packages by path can declare their exact manifests with `auxiliary_cargo_manifests`.
+that depend on released packages by path must declare their exact manifests with `auxiliary_cargo_manifests`
+when their independent lockfiles are tracked in Git.
+Normal and extended release checks inspect captured tracked lockfiles
+and use Cargo metadata to identify workspaces
+that resolve a selected release package by its manifest path.
+Discovery follows Cargo-declared path dependencies, including inactive optional dependencies.
+An omitted workspace blocks planning before release mutation.
+A matching local lockfile identity that Cargo cannot attribute also blocks planning
+until the workspace is declared.
+Packages with the same name and version
+that Cargo attributes to another manifest remain independent.
 Cargo-Rail resolves each manifest's committed `Cargo.lock`,
 computes its post-release bytes in an isolated copy of the captured workspace,
 binds exact manifest and lockfile contents plus their before/after digests into the release plan,

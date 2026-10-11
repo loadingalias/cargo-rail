@@ -6354,6 +6354,103 @@ fn unsupported_release_journal_blocks_resume_and_new_transactions() {
 }
 
 #[test]
+fn release_status_distinguishes_skipped_effects_from_preparation() {
+    super::helpers::finish_test((|| -> Result<()> {
+        for interrupted in [true, false] {
+            let ws = TestWorkspace::new_single_crate("preparation-status", "0.1.0")?;
+            ws.write_release_config(
+                "remote_effects = 'none'\nregistry_publication = 'none'\nsemver_check = 'off'\nsign_tags = false\n",
+            )?;
+            write_test_change(&ws.path, &["preparation-status"])?;
+            let args = [
+                "rail",
+                "release",
+                "run",
+                "--all",
+                "--bump",
+                "patch",
+                "--skip-tag",
+                "--yes",
+            ];
+            let release = if interrupted {
+                run_with_rejected_commit(&ws.path, &args)?
+            } else {
+                run_cargo_rail(&ws.path, &args)?
+            };
+            assert_eq!(
+                release.status.code(),
+                Some(if interrupted { 2 } else { 0 }),
+                "{release:?}"
+            );
+            let status = run_cargo_rail(
+                &ws.path,
+                &["rail", "release", "status", "--history", "--format", "json"],
+            )?;
+            assert!(status.status.success(), "{status:?}");
+            let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+            let report = &status["transactions"][0];
+            let completed = if interrupted { "none" } else { "workspace preparation" };
+            let next = if interrupted { "workspace preparation" } else { "none" };
+            if interrupted {
+                assert!(report["completed_effect"].is_null(), "{report}");
+                assert_eq!(report["next_effect"], next);
+                assert!(report["exact_sha"].is_null());
+                assert_eq!(report["state"], "planned:active");
+                assert_eq!(report["recoverability"], "reconcile");
+                assert!(
+                    report["safe_operator_command"]
+                        .as_str()
+                        .unwrap()
+                        .contains("release resume")
+                );
+            } else {
+                assert_eq!(report["completed_effect"], completed);
+                assert!(report["next_effect"].is_null());
+                assert_eq!(
+                    report["exact_sha"],
+                    String::from_utf8(git(&ws.path, &["rev-parse", "HEAD"])?.stdout)?.trim()
+                );
+                assert_eq!(report["state"], "released:complete");
+                assert_eq!(report["recoverability"], "terminal");
+            }
+            assert_eq!(report["ambiguity"], interrupted);
+            for effect in [
+                "remote Git commit push",
+                "remote exact-SHA readiness validation",
+                "local Git tag for preparation-status",
+                "irreversible registry publication for preparation-status",
+                "remote Git tag push",
+                "remote forge draft for preparation-status",
+                "remote forge publication for preparation-status",
+            ] {
+                assert!(
+                    report["observations"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&serde_json::json!(format!("{effect}:skipped"))),
+                    "{report}"
+                );
+            }
+            let text = run_cargo_rail(&ws.path, &["rail", "release", "status", "--history"])?;
+            assert!(text.status.success(), "{text:?}");
+            let text = String::from_utf8(text.stdout)?;
+            assert!(text.contains(&format!("Last completed effect: {completed}")), "{text}");
+            assert!(text.contains(&format!("Next effect: {next}")), "{text}");
+            assert!(text.contains("Skipped effects:"), "{text}");
+            assert!(
+                text.contains("irreversible registry publication for preparation-status"),
+                "{text}"
+            );
+            assert!(
+                text.contains("remote forge publication for preparation-status"),
+                "{text}"
+            );
+        }
+        Ok(())
+    })());
+}
+
+#[test]
 fn release_recovery_survives_invalid_metadata_and_clean_refuses_active_state() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_single_crate("release-status-active", "0.1.0")?;
@@ -8033,6 +8130,58 @@ fn remote_release_record_rejects_a_second_upload_attempt_identity() {
         let retained = git(remote.path(), &["show", "refs/notes/cargo-rail/active:record.json"])?;
         let retained: serde_json::Value = serde_json::from_slice(&retained.stdout)?;
         assert_eq!(retained["crates"][0]["publication_attempt"], "1".repeat(64));
+
+        let status = run_cargo_rail(&ws.path, &["rail", "release", "status", "--format", "json"])?;
+        assert!(status.status.success(), "{status:?}");
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+        let report = &status["transactions"][0];
+        assert_eq!(report["ambiguity"], true);
+        assert_eq!(report["completed_effect"], "remote exact-SHA readiness validation");
+        assert_eq!(
+            report["next_effect"],
+            "irreversible registry publication for upload-lease"
+        );
+        assert_eq!(report["recoverability"], "reconcile");
+
+        record["crates"][0]["publication_attempt"] = serde_json::json!("1".repeat(64));
+        record["crates"][0]["publication"]["status"] = serde_json::json!("complete");
+        record["tag_push"] = serde_json::json!({"status":"complete","object":source});
+        record["phase"] = serde_json::json!("released");
+        record["status"] = serde_json::json!("complete");
+        std::fs::write(&first_path, serde_json::to_vec(&record)?)?;
+        let status = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "status",
+                first_path.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        )?;
+        assert!(status.status.success(), "{status:?}");
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+        let report = &status["transactions"][0];
+        assert_eq!(
+            report["completed_effect"],
+            "irreversible registry publication for upload-lease"
+        );
+        assert!(report["next_effect"].is_null());
+        assert_eq!(report["ambiguity"], false);
+        assert!(
+            report["observations"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(format!(
+                    "irreversible registry publication for upload-lease:complete={checksum}"
+                )))
+        );
+        let text = run_cargo_rail(&ws.path, &["rail", "release", "status", first_path.to_str().unwrap()])?;
+        assert!(
+            String::from_utf8(text.stdout)?
+                .contains("Last completed effect: irreversible registry publication for upload-lease")
+        );
         Ok(())
     })();
     super::helpers::finish_test(result);
@@ -8525,6 +8674,24 @@ else:raise RuntimeError(args)
         assert_eq!(completed["status"], "complete");
         assert_eq!(completed["crates"][0]["forge_draft"]["object"], "81");
         assert_eq!(completed["crates"][0]["forge_publication"]["object"], "81");
+        let status = invoke(&["rail", "release", "status", "--history", "--format", "json"])?;
+        assert!(status.status.success(), "{status:?}");
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+        let report = &status["transactions"][0];
+        assert_eq!(
+            report["completed_effect"],
+            "remote forge publication for registry-shadow"
+        );
+        assert!(report["next_effect"].is_null());
+        assert_eq!(report["ambiguity"], false);
+        assert!(report["observations"].as_array().unwrap().contains(&serde_json::json!(
+            "remote forge publication for registry-shadow:complete=81"
+        )));
+        let text = invoke(&["rail", "release", "status", "--history"])?;
+        assert!(
+            String::from_utf8(text.stdout)?
+                .contains("Last completed effect: remote forge publication for registry-shadow")
+        );
         Ok(())
     })();
     super::helpers::finish_test(result);

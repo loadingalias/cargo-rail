@@ -966,6 +966,14 @@ pub fn run_release_status_standalone(
             println!("  Packages: {}", report.packages.join(", "));
         }
         println!("  Exact SHA: {}", report.exact_sha.as_deref().unwrap_or("not prepared"));
+        let skipped = report
+            .observations
+            .iter()
+            .filter_map(|observation| observation.strip_suffix(":skipped"))
+            .collect::<Vec<_>>();
+        if !skipped.is_empty() {
+            println!("  Skipped effects: {}", skipped.join(", "));
+        }
         for observation in &report.observations {
             if observation.starts_with("executor:")
                 || observation.starts_with("validation:")
@@ -1021,7 +1029,11 @@ fn release_status_report(state: ReleaseState, path: PathBuf) -> ReleaseStatusRep
     let mut next = None;
     let mut observations = Vec::new();
     let mut ambiguity = false;
-    let mut record = |name: String, status: StepStatus, object: Option<&str>| {
+    let mut record = |name: String, status: StepStatus, object: Option<&str>, required: bool| {
+        if !required {
+            observations.push(format!("{name}:skipped"));
+            return;
+        }
         if status == StepStatus::InProgress {
             ambiguity = true;
         }
@@ -1045,12 +1057,13 @@ fn release_status_report(state: ReleaseState, path: PathBuf) -> ReleaseStatusRep
         Preparation::Committing { tree } => (StepStatus::InProgress, Some(tree.as_str())),
         Preparation::Complete { commit } => (StepStatus::Complete, Some(commit.as_str())),
     };
-    record("workspace preparation".to_string(), status, object);
+    record("workspace preparation".to_string(), status, object, true);
     if let Some(review) = &state.review {
         record(
             "review branch push".into(),
             review.pushed.status,
             review.pushed.object.as_deref(),
+            true,
         );
         record(
             "reviewed merge".into(),
@@ -1060,54 +1073,68 @@ fn release_status_report(state: ReleaseState, path: PathBuf) -> ReleaseStatusRep
                 StepStatus::Pending
             },
             review.merge.as_ref().map(|merge| merge.commit.as_str()),
+            true,
         );
     }
+    let pushes = state.intent.release_config.remote_effects.pushes();
+    let tags = !state.intent.skip_tag;
+    let forge = state.intent.release_config.remote_effects.creates_forge_release() && tags;
     record(
         "remote Git commit push".to_string(),
         state.commit_push.status,
         state.commit_push.object.as_deref(),
+        pushes,
     );
     record(
         "remote exact-SHA readiness validation".to_string(),
         state.readiness.status,
         state.readiness.object.as_deref(),
+        pushes && (tags || !state.intent.skip_publish),
     );
     for crate_state in &state.crates {
         record(
             format!("local Git tag for {}", crate_state.name),
             crate_state.tag.status,
             crate_state.tag.object.as_deref(),
+            tags,
         );
     }
-    for crate_state in &state.crates {
+    for (crate_state, package) in state.crates.iter().zip(&state.intent.plan.crates) {
         record(
             format!("irreversible registry publication for {}", crate_state.name),
             crate_state.publication.status,
             crate_state.publication.object.as_deref(),
+            !state.intent.skip_publish && package.publish,
         );
     }
     record(
         "remote Git tag push".to_string(),
         state.tag_push.status,
         state.tag_push.object.as_deref(),
+        pushes && tags,
     );
     for crate_state in &state.crates {
         record(
             format!("remote forge draft for {}", crate_state.name),
             crate_state.forge_draft.status,
             crate_state.forge_draft.object.as_deref(),
+            forge,
         );
         record(
             format!("remote forge publication for {}", crate_state.name),
             crate_state.forge_publication.status,
             crate_state.forge_publication.object.as_deref(),
+            forge,
         );
     }
-    record(
-        "local release restoration".to_string(),
-        state.abort.status,
-        state.abort.object.as_deref(),
-    );
+    if state.abort.status != StepStatus::Pending {
+        record(
+            "local release restoration".to_string(),
+            state.abort.status,
+            state.abort.object.as_deref(),
+            true,
+        );
+    }
 
     for package in &state.crates {
         if state.intent.alias_previous.contains_key(&package.name) {
@@ -1115,6 +1142,7 @@ fn release_status_report(state: ReleaseState, path: PathBuf) -> ReleaseStatusRep
                 format!("release alias for {}", package.name),
                 package.alias.status,
                 package.alias.object.as_deref(),
+                true,
             );
         }
     }

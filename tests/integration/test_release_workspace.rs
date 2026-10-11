@@ -381,6 +381,285 @@ fn release_projection_updates_renamed_inherited_and_target_path_requirements() {
 }
 
 #[test]
+fn release_rejects_undeclared_path_dependent_lockfiles_before_mutation() {
+    finish_test((|| -> Result<()> {
+        let ws = workspace(Some("0.2.0"), false)?;
+        let auxiliary = ws.path.join("auxiliary");
+        std::fs::create_dir_all(auxiliary.join("src"))?;
+        std::fs::write(
+            auxiliary.join("Cargo.toml"),
+            "[workspace]\n[package]\nname = 'auxiliary'\nversion = '0.1.0'\npublish = false\nedition = '2021'\n[dependencies]\ncore = { path = '../crates/core', version = '0.2.0' }\n",
+        )?;
+        std::fs::write(auxiliary.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n")?;
+        let lock = cargo_command(&auxiliary)
+            .args(["generate-lockfile", "--offline"])
+            .output()?;
+        ensure!(lock.status.success(), "{lock:?}");
+        ws.commit("Track an undeclared independent workspace")?;
+        let before = git(&ws.path, &["rev-parse", "HEAD"])?.stdout;
+        let lock_before = std::fs::read(auxiliary.join("Cargo.lock"))?;
+        for args in [
+            vec![
+                "rail",
+                "release",
+                "check",
+                "core",
+                "--bump",
+                "patch",
+                "--skip-tag",
+                "--format",
+                "json",
+            ],
+            vec![
+                "rail",
+                "release",
+                "check",
+                "core",
+                "--bump",
+                "patch",
+                "--skip-tag",
+                "--format",
+                "json",
+                "--extended",
+            ],
+            vec![
+                "rail",
+                "release",
+                "run",
+                "core",
+                "--bump",
+                "patch",
+                "--skip-tag",
+                "--yes",
+            ],
+        ] {
+            let output = run_cargo_rail(&ws.path, &args)?;
+            assert_eq!(output.status.code(), Some(2), "{output:?}");
+            let diagnostic = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(diagnostic.contains("auxiliary/Cargo.lock"), "{diagnostic}");
+            assert!(diagnostic.contains("auxiliary/Cargo.toml"), "{diagnostic}");
+            assert!(diagnostic.contains("release.auxiliary_cargo_manifests"), "{diagnostic}");
+            assert_eq!(git(&ws.path, &["rev-parse", "HEAD"])?.stdout, before);
+            assert!(git(&ws.path, &["status", "--porcelain"])?.stdout.is_empty());
+            assert_eq!(std::fs::read(auxiliary.join("Cargo.lock"))?, lock_before);
+            assert!(!ws.path.join("target/cargo-rail/releases").exists());
+        }
+        let metadata = cargo_command(&auxiliary)
+            .args(["metadata", "--locked", "--offline", "--format-version", "1"])
+            .output()?;
+        assert!(metadata.status.success(), "{metadata:?}");
+        Ok(())
+    })());
+}
+
+#[test]
+fn release_covers_inactive_transitive_path_dependencies_in_independent_lockfiles() {
+    finish_test((|| -> Result<()> {
+        let ws = workspace(None, false)?;
+        for (name, dependency) in [
+            (
+                "auxiliary",
+                "bridge = { path = '../bridge', optional = true, features = ['leaf'] }",
+            ),
+            (
+                "bridge",
+                "leaf = { path = '../leaf', optional = true, features = ['core'] }",
+            ),
+            (
+                "leaf",
+                "core = { path = '../crates/core', version = '^0.2.0', optional = true }",
+            ),
+        ] {
+            let root = ws.path.join(name);
+            std::fs::create_dir_all(root.join("src"))?;
+            std::fs::write(
+                root.join("Cargo.toml"),
+                format!(
+                    "[workspace]\n[package]\nname = '{name}'\nversion = '0.1.0'\npublish = false\nedition = '2021'\n[dependencies]\n{dependency}\n"
+                ),
+            )?;
+            std::fs::write(root.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n")?;
+        }
+        let auxiliary = ws.path.join("auxiliary");
+        let lock = cargo_command(&auxiliary)
+            .args(["generate-lockfile", "--offline"])
+            .output()?;
+        ensure!(lock.status.success(), "{lock:?}");
+        ws.commit("Track an inactive transitive path dependency")?;
+        let lock_before = std::fs::read(auxiliary.join("Cargo.lock"))?;
+        assert!(String::from_utf8_lossy(&lock_before).contains("name = \"core\""));
+        for extended in [false, true] {
+            let mut args = vec![
+                "rail",
+                "release",
+                "check",
+                "core",
+                "--bump",
+                "minor",
+                "--skip-tag",
+                "--format",
+                "json",
+            ];
+            if extended {
+                args.push("--extended");
+            }
+            let check = run_cargo_rail(&ws.path, &args)?;
+            assert_eq!(check.status.code(), Some(2), "{check:?}");
+            assert!(
+                String::from_utf8_lossy(&check.stdout).contains("auxiliary/Cargo.lock"),
+                "{check:?}"
+            );
+            assert_eq!(std::fs::read(auxiliary.join("Cargo.lock"))?, lock_before);
+        }
+        ws.write_release_config("tag_format = '{prefix}{version}'\nsemver_check = 'off'\nsign_tags = false\nremote_effects = 'none'\nauxiliary_cargo_manifests = ['auxiliary/Cargo.toml']\n")?;
+        ws.commit("Declare the independent workspace")?;
+        let release = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "run",
+                "core",
+                "--bump",
+                "minor",
+                "--skip-tag",
+                "--yes",
+            ],
+        )?;
+        assert!(release.status.success(), "{release:?}");
+        let leaf: toml_edit::DocumentMut = std::fs::read_to_string(ws.path.join("leaf/Cargo.toml"))?.parse()?;
+        assert_eq!(leaf["package"]["version"].as_str(), Some("0.1.0"));
+        assert_eq!(leaf["dependencies"]["core"]["version"].as_str(), Some("^0.3.0"));
+        let metadata = cargo_command(&auxiliary)
+            .args(["metadata", "--locked", "--offline", "--format-version", "1"])
+            .output()?;
+        assert!(metadata.status.success(), "{metadata:?}");
+        let lock: toml_edit::DocumentMut = std::fs::read_to_string(auxiliary.join("Cargo.lock"))?.parse()?;
+        assert!(lock["package"].as_array_of_tables().unwrap().iter().any(|package| package["name"].as_str() == Some("core") && package["version"].as_str() == Some("0.3.0")));
+        Ok(())
+    })());
+}
+
+#[test]
+fn release_rejects_unattributed_local_lockfile_identities_until_the_workspace_is_declared() {
+    finish_test((|| -> Result<()> {
+        let ws = workspace(None, false)?;
+        let auxiliary = ws.path.join("auxiliary");
+        std::fs::create_dir_all(auxiliary.join("src"))?;
+        std::fs::write(
+            auxiliary.join("Cargo.toml"),
+            "[workspace]\n[package]\nname = 'auxiliary'\nversion = '0.1.0'\npublish = false\nedition = '2021'\n[dependencies]\ncore = { version = '0.2.0', optional = true }\n[patch.crates-io]\ncore = { path = '../crates/core' }\n",
+        )?;
+        std::fs::write(auxiliary.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n")?;
+        let lock = cargo_command(&auxiliary)
+            .args(["generate-lockfile", "--offline"])
+            .output()?;
+        ensure!(lock.status.success(), "{lock:?}");
+        ws.commit("Track an inactive path patch absent from resolved metadata")?;
+        assert!(std::fs::read_to_string(auxiliary.join("Cargo.lock"))?.contains("name = \"core\""));
+        let check = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "check",
+                "core",
+                "--bump",
+                "patch",
+                "--skip-tag",
+                "--format",
+                "json",
+            ],
+        )?;
+        assert_eq!(check.status.code(), Some(2), "{check:?}");
+        let diagnostic = String::from_utf8(check.stdout)?;
+        assert!(diagnostic.contains("could not attribute"), "{diagnostic}");
+        assert!(diagnostic.contains("auxiliary/Cargo.lock"), "{diagnostic}");
+        assert!(diagnostic.contains("release.auxiliary_cargo_manifests"), "{diagnostic}");
+        ws.write_release_config("tag_format = '{prefix}{version}'\nsemver_check = 'off'\nsign_tags = false\nremote_effects = 'none'\nauxiliary_cargo_manifests = ['auxiliary/Cargo.toml']\n")?;
+        ws.commit("Declare the independent path-patched workspace")?;
+        let release = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "run",
+                "core",
+                "--bump",
+                "patch",
+                "--skip-tag",
+                "--yes",
+            ],
+        )?;
+        assert!(release.status.success(), "{release:?}");
+        let metadata = cargo_command(&auxiliary)
+            .args([
+                "metadata",
+                "--all-features",
+                "--locked",
+                "--offline",
+                "--format-version",
+                "1",
+            ])
+            .output()?;
+        assert!(metadata.status.success(), "{metadata:?}");
+        let metadata: Value = serde_json::from_slice(&metadata.stdout)?;
+        assert!(
+            metadata["packages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|package| package["name"] == "core" && package["version"] == "0.2.1")
+        );
+        Ok(())
+    })());
+}
+
+#[test]
+fn unrelated_independent_lockfile_with_the_same_package_identity_does_not_block_release() {
+    finish_test((|| -> Result<()> {
+        let ws = workspace(None, false)?;
+        let auxiliary = ws.path.join("auxiliary");
+        std::fs::create_dir_all(auxiliary.join("src"))?;
+        std::fs::write(
+            auxiliary.join("Cargo.toml"),
+            "[workspace]\n[package]\nname = 'core'\nversion = '0.2.0'\npublish = false\nedition = '2021'\n",
+        )?;
+        std::fs::write(auxiliary.join("src/lib.rs"), "pub fn independent() {}\n")?;
+        let lock = cargo_command(&auxiliary)
+            .args(["generate-lockfile", "--offline"])
+            .output()?;
+        ensure!(lock.status.success(), "{lock:?}");
+        ws.commit("Track an unrelated package with the same name and version")?;
+        let lock_before = std::fs::read(auxiliary.join("Cargo.lock"))?;
+        let release = run_cargo_rail(
+            &ws.path,
+            &[
+                "rail",
+                "release",
+                "run",
+                "core",
+                "--bump",
+                "patch",
+                "--skip-tag",
+                "--yes",
+            ],
+        )?;
+        assert!(release.status.success(), "{release:?}");
+        assert_eq!(std::fs::read(auxiliary.join("Cargo.lock"))?, lock_before);
+        let metadata = cargo_command(&auxiliary)
+            .args(["metadata", "--locked", "--offline", "--format-version", "1"])
+            .output()?;
+        assert!(metadata.status.success(), "{metadata:?}");
+        Ok(())
+    })());
+}
+
+#[test]
 fn release_cargo_writes_use_portable_path_order_across_independent_workspaces() {
     finish_test((|| -> Result<()> {
         let ws = workspace(None, false)?;

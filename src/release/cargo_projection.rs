@@ -25,8 +25,21 @@ struct CargoMetadataPaths {
 
 #[derive(serde::Deserialize)]
 struct CargoMetadataPackage {
+    name: String,
+    version: semver::Version,
     manifest_path: PathBuf,
     source: Option<String>,
+    dependencies: Vec<CargoMetadataDependency>,
+}
+
+#[derive(serde::Deserialize)]
+struct CargoMetadataDependency {
+    path: Option<PathBuf>,
+}
+
+enum CargoMetadataScope {
+    Resolved,
+    Declarations,
 }
 
 pub(crate) fn plan_writes(
@@ -42,6 +55,7 @@ pub(crate) fn plan_writes(
     let staging = tempfile::Builder::new().prefix("cargo-rail-release-cargo-").tempdir()?;
     let source_root = staging.path().join("source");
     fs::create_dir(&source_root)?;
+    let source_root = crate::utils::canonicalize_existing(&source_root)?;
     materialize_snapshot(ctx, &source_root)?;
     let workspace_prefix = crate::utils::path_relative_to(snapshot.source_root(), ctx.workspace_root())?;
     let workspace_root = source_root.join(workspace_prefix);
@@ -88,17 +102,21 @@ pub(crate) fn plan_writes(
         });
     }
     for workspace in &resolved {
-        local_manifests.extend(validate_local_package_manifests(
-            ctx,
-            snapshot,
-            &source_root,
-            &workspace_root,
-            &workspace.isolated_manifest,
-            &workspace.manifest_path,
-        )?);
+        local_manifests.extend(
+            validate_local_package_manifests(
+                ctx,
+                snapshot,
+                &source_root,
+                &workspace_root,
+                &workspace.isolated_manifest,
+                &workspace.manifest_path,
+            )?
+            .into_keys(),
+        );
         // A virtual workspace manifest need not appear in Cargo's package list.
         local_manifests.insert(workspace.isolated_manifest.clone());
     }
+    validate_auxiliary_workspace_coverage(ctx, &source_root, &workspace_root, crates, &resolved)?;
     audit_isolated_tree(snapshot, &source_root, &planned_digests)?;
     for plan in crates {
         let manifest = isolated_path(ctx, &workspace_root, &plan.manifest_path)?;
@@ -166,6 +184,97 @@ pub(crate) fn plan_writes(
     writes.sort_by_cached_key(|write| crate::utils::path_to_git_format(&write.path));
     ctx.validate_snapshot_unchanged()?;
     Ok(writes)
+}
+
+fn validate_auxiliary_workspace_coverage(
+    ctx: &WorkspaceContext,
+    source_root: &Path,
+    workspace_root: &Path,
+    crates: &[CrateReleasePlan],
+    declared: &[ProjectedWorkspace],
+) -> RailResult<()> {
+    let snapshot = ctx.snapshot()?;
+    let capture = ctx
+        .source_capture()
+        .ok_or_else(|| RailError::message("release lockfile discovery requires captured Git source"))?;
+    let released_manifests = crates
+        .iter()
+        .map(|package| {
+            isolated_path(ctx, workspace_root, &package.manifest_path)
+                .and_then(|path| crate::utils::canonicalize_existing(&path).map_err(Into::into))
+        })
+        .collect::<RailResult<BTreeSet<_>>>()?;
+    for entry in snapshot.source().tree().entries() {
+        if entry.path.as_path().file_name().is_none_or(|name| name != "Cargo.lock")
+            || !matches!(entry.kind, SourceEntryKind::RegularFile { .. })
+            || capture.is_untracked(&entry.path)
+        {
+            continue;
+        }
+        let lockfile = source_root.join(entry.path.as_path());
+        if declared.iter().any(|workspace| workspace.isolated_lockfile == lockfile) {
+            continue;
+        }
+        let manifest_path = entry.path.as_path().with_file_name("Cargo.toml");
+        let Some(manifest_entry) = snapshot
+            .source()
+            .tree()
+            .entries()
+            .iter()
+            .find(|entry| entry.path.as_path() == manifest_path)
+        else {
+            continue;
+        };
+        if capture.is_untracked(&manifest_entry.path) {
+            continue;
+        }
+        let bytes = snapshot
+            .read_source_file(&entry.path)?
+            .ok_or_else(|| RailError::message(format!("captured Cargo lockfile '{}' disappeared", entry.path)))?;
+        let specs = local_release_package_specs(&bytes, crates, entry.path.as_path())?;
+        if specs.is_empty() {
+            continue;
+        }
+        let manifest = source_root.join(&manifest_path);
+        if resolve_lockfile(ctx, workspace_root, &manifest)? != lockfile {
+            // Cargo ignores a member's stale lockfile in favor of its workspace root.
+            continue;
+        }
+        let local =
+            validate_local_package_manifests(ctx, snapshot, source_root, workspace_root, &manifest, &manifest_path)?;
+        let resolves_release = local.keys().any(|manifest| released_manifests.contains(manifest));
+        let unattributed = crates.iter().any(|package| {
+            specs.contains(&format!("{}@{}", package.name, package.current_version))
+                && !local
+                    .values()
+                    .any(|local| (&local.name, &local.version) == (&package.name, &package.current_version))
+        });
+        if resolves_release || unattributed {
+            let help = match manifest.strip_prefix(workspace_root) {
+                Ok(relative) => format!(
+                    "add '{}' to release.auxiliary_cargo_manifests before planning the release",
+                    relative.display()
+                ),
+                Err(_) => format!(
+                    "move independent Cargo workspace '{}' inside the primary workspace root and declare it in release.auxiliary_cargo_manifests",
+                    manifest_path.display()
+                ),
+            };
+            let message = if resolves_release {
+                format!(
+                    "tracked independent Cargo lockfile '{}' resolves a released path package but is not declared for release",
+                    entry.path
+                )
+            } else {
+                format!(
+                    "tracked independent Cargo lockfile '{}' contains a local release-package identity that Cargo metadata could not attribute",
+                    entry.path
+                )
+            };
+            return Err(RailError::with_help(message, help));
+        }
+    }
+    Ok(())
 }
 
 fn materialize_snapshot(ctx: &WorkspaceContext, destination: &Path) -> RailResult<()> {
@@ -505,76 +614,134 @@ fn validate_local_package_manifests(
     workspace_root: &Path,
     manifest: &Path,
     manifest_path: &Path,
-) -> RailResult<Vec<PathBuf>> {
-    let output = cargo_command(ctx, workspace_root)?
+) -> RailResult<BTreeMap<PathBuf, CargoMetadataPackage>> {
+    let metadata = read_cargo_metadata(ctx, workspace_root, manifest, CargoMetadataScope::Resolved)?;
+    let mut pending = BTreeMap::new();
+    for package in metadata.packages.into_iter().filter(|package| package.source.is_none()) {
+        let isolated = validate_local_manifest(snapshot, source_root, &package.manifest_path, manifest_path)?;
+        pending.insert(isolated, package);
+    }
+    let mut packages = BTreeMap::new();
+    while let Some((isolated, package)) = pending.pop_first() {
+        for dependency in package
+            .dependencies
+            .iter()
+            .filter_map(|dependency| dependency.path.as_ref())
+        {
+            let dependency =
+                validate_local_manifest(snapshot, source_root, &dependency.join("Cargo.toml"), manifest_path)?;
+            if dependency == isolated || packages.contains_key(&dependency) || pending.contains_key(&dependency) {
+                continue;
+            }
+            // Cargo's declarations include inactive optional and target-specific paths.
+            // --no-deps reads that package without resolving or creating its own lockfile.
+            let metadata = read_cargo_metadata(ctx, workspace_root, &dependency, CargoMetadataScope::Declarations)?;
+            let package = metadata
+                .packages
+                .into_iter()
+                .filter(|package| package.source.is_none())
+                .find(|package| {
+                    crate::utils::canonicalize_existing(&package.manifest_path).is_ok_and(|path| path == dependency)
+                })
+                .ok_or_else(|| {
+                    RailError::message(format!(
+                        "Cargo metadata omitted local path package '{}'",
+                        dependency.display()
+                    ))
+                })?;
+            pending.insert(dependency, package);
+        }
+        packages.insert(isolated, package);
+    }
+    Ok(packages)
+}
+
+fn read_cargo_metadata(
+    ctx: &WorkspaceContext,
+    root: &Path,
+    manifest: &Path,
+    scope: CargoMetadataScope,
+) -> RailResult<CargoMetadataPaths> {
+    let mut command = cargo_command(ctx, root)?;
+    command
         .args(["metadata", "--format-version", "1", "--locked", "--manifest-path"])
-        .arg(manifest)
+        .arg(manifest);
+    if matches!(scope, CargoMetadataScope::Declarations) {
+        command.arg("--no-deps");
+    }
+    let output = command
         .output()
         .map_err(|error| RailError::message(format!("failed to start auxiliary Cargo metadata: {error}")))?;
     let output = require_success(output, "cargo metadata --locked")?;
-    let metadata: CargoMetadataPaths = serde_json::from_slice(&output.stdout).map_err(|error| {
+    serde_json::from_slice(&output.stdout).map_err(|error| {
         RailError::message(format!(
             "failed to parse Cargo metadata for auxiliary manifest '{}': {error}",
+            manifest.display()
+        ))
+    })
+}
+
+fn validate_local_manifest(
+    snapshot: &crate::workspace::WorkspaceSnapshot,
+    source_root: &Path,
+    package_manifest: &Path,
+    manifest_path: &Path,
+) -> RailResult<PathBuf> {
+    let resolved = crate::utils::canonicalize_existing(package_manifest).map_err(|error| {
+        RailError::message(format!(
+            "failed to resolve local package manifest '{}' for auxiliary manifest '{}': {error}",
+            package_manifest.display(),
             manifest_path.display()
         ))
     })?;
-    let mut manifests = Vec::new();
-    for package in metadata.packages.into_iter().filter(|package| package.source.is_none()) {
-        let resolved = crate::utils::canonicalize_existing(&package.manifest_path).map_err(|error| {
-            RailError::message(format!(
-                "failed to resolve local package manifest '{}' for auxiliary manifest '{}': {error}",
-                package.manifest_path.display(),
+    let relative = crate::utils::path_relative_to(source_root, &resolved).map_err(|_| {
+        RailError::with_help(
+            format!(
+                "auxiliary Cargo manifest '{}' resolves local package manifest '{}' outside the captured source",
+                manifest_path.display(),
+                package_manifest.display()
+            ),
+            "keep every path dependency inside the captured Git worktree",
+        )
+    })?;
+    let captured_regular = snapshot
+        .source()
+        .tree()
+        .entries()
+        .iter()
+        .any(|entry| entry.path.as_path() == relative && matches!(entry.kind, SourceEntryKind::RegularFile { .. }));
+    if !captured_regular {
+        return Err(RailError::with_help(
+            format!(
+                "local package manifest '{}' resolved by auxiliary Cargo manifest '{}' is not a captured regular file",
+                package_manifest.display(),
                 manifest_path.display()
-            ))
-        })?;
-        let relative = crate::utils::path_relative_to(source_root, &resolved).map_err(|_| {
-            RailError::with_help(
-                format!(
-                    "auxiliary Cargo manifest '{}' resolves local package manifest '{}' outside the captured source",
-                    manifest_path.display(),
-                    package.manifest_path.display()
-                ),
-                "keep every path dependency inside the captured Git worktree",
-            )
-        })?;
-        let captured_regular =
-            snapshot.source().tree().entries().iter().any(|entry| {
-                entry.path.as_path() == relative && matches!(entry.kind, SourceEntryKind::RegularFile { .. })
-            });
-        if !captured_regular {
-            return Err(RailError::with_help(
-                format!(
-                    "local package manifest '{}' resolved by auxiliary Cargo manifest '{}' is not a captured regular file",
-                    package.manifest_path.display(),
-                    manifest_path.display()
-                ),
-                "commit a regular package manifest inside the captured Git worktree",
-            ));
-        }
-        let isolated = source_root.join(&relative);
-        let isolated_metadata = fs::symlink_metadata(&isolated).map_err(|error| {
+            ),
+            "commit a regular package manifest inside the captured Git worktree",
+        ));
+    }
+    let isolated = source_root.join(&relative);
+    let isolated_metadata = fs::symlink_metadata(&isolated).map_err(|error| {
             RailError::with_help(
                 format!(
                     "local package manifest '{}' resolved by auxiliary Cargo manifest '{}' is not available in the isolated captured source: {error}",
-                    package.manifest_path.display(),
+                    package_manifest.display(),
                     manifest_path.display()
                 ),
                 "keep every path dependency inside the captured Git worktree",
             )
         })?;
-        if !isolated_metadata.file_type().is_file() || crate::utils::is_symlink_or_reparse(&isolated_metadata) {
-            return Err(RailError::with_help(
-                format!(
-                    "local package manifest '{}' resolved by auxiliary Cargo manifest '{}' is not a regular file in the isolated captured source",
-                    package.manifest_path.display(),
-                    manifest_path.display()
-                ),
-                "commit a regular package manifest inside the captured Git worktree",
-            ));
-        }
-        manifests.push(isolated);
+    if !isolated_metadata.file_type().is_file() || crate::utils::is_symlink_or_reparse(&isolated_metadata) {
+        return Err(RailError::with_help(
+            format!(
+                "local package manifest '{}' resolved by auxiliary Cargo manifest '{}' is not a regular file in the isolated captured source",
+                package_manifest.display(),
+                manifest_path.display()
+            ),
+            "commit a regular package manifest inside the captured Git worktree",
+        ));
     }
-    Ok(manifests)
+    Ok(isolated)
 }
 
 fn require_head_file(ctx: &WorkspaceContext, workspace_path: &Path, description: &str) -> RailResult<()> {

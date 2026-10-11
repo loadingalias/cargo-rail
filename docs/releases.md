@@ -36,6 +36,12 @@ They receive no package bump, changelog, change-file requirement, or tag unless 
 Version groups remain explicit release policy.
 
 Cargo-Rail projects the primary and declared auxiliary workspaces before creating a transaction.
+An independent workspace with a tracked lockfile
+that resolves a selected package by path must appear in `release.auxiliary_cargo_manifests`.
+Ordinary and extended checks reject omissions before preparation;
+discovery diagnoses missing declarations and does not authorize extra writes.
+Cargo-declared paths include inactive optional dependencies.
+An unattributed local lockfile identity also requires a declaration before preparation.
 It preserves compatible requirements of unselected packages and path-only declarations.
 Selected released dependents retain the existing minimum-version refresh,
 including shared workspace requirements.
@@ -45,6 +51,14 @@ Cargo validates each projected lockfile with `metadata --locked`.
 The plan stores exact manifest and lockfile writes for preparation, drift detection, and recovery.
 Review the check output before requesting publication.
 Omit `--publish` when the release only creates Git and forge objects.
+
+`release status` distinguishes skipped effects from completed work using the retained intent.
+Text lists skipped effects; JSON includes them as `EFFECT:skipped` observations.
+Skipped steps do not count as the last completed effect or the next effect,
+even when the journal marks them complete because no work is required.
+A preparation-only transaction with tags, registry publication,
+and remote effects disabled reports workspace preparation as its completed effect.
+An interrupted preparation retains its recovery command and ambiguity report.
 
 When adopting from release-plz or cargo-release, finish any active release with its original tool.
 Replace its release job with the configured Cargo-Rail workflow,
