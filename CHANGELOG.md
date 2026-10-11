@@ -3,6 +3,11 @@
 Published versions are recorded below. Pending release intent lives in [`.changes/`](.changes/);
 see [releasing a workspace](docs/releases.md) for the current preparation and publication workflow.
 
+## [0.31.1](https://github.com/loadingalias/cargo-rail/compare/v0.31.0...v0.31.1) - 2026-10-11
+- Report disabled release effects as skipped instead of completed publication,
+  while preserving recovery instructions.
+  Reject undeclared tracked independent workspaces that resolve a released path package
+  before release preparation can invalidate their lockfiles.
 ## [0.31.0](https://github.com/loadingalias/cargo-rail/compare/v0.30.1...v0.31.0) - 2026-10-10
 - Build the compiler driver against nightlies that rename rustc's compiler entry point.
   Select the entry point from the exact compiler identity and keep macro observation bound to
