@@ -290,15 +290,30 @@ Qualification on 2026-10-10:
 Release-plan v10 and release-record v11 store exact Cargo writes.
 The companion Action's independent v11 schema, reader,
 and rejection tests are updated and qualified locally.
-Its source changes remain uncommitted and unpushed under the owner's selected scope.
+Its source changes remain local until the published producer pin is qualified.
+The owner authorized the coordinated Cargo-Rail and Action releases.
 Coordinate its adoption with a Cargo-Rail release before requiring the new record contract.
 After that release, update the Action's `.github/cargo-rail.lock` to the new producer and release its matching reader
 and cache installer together.
 Finish older active release transactions with their originating executable.
 
-Cargo-Rail's source package remains 0.30.1 until the owner requests release preparation.
+Cargo-Rail's source package currently remains 0.30.1.
 The latest released version remains v0.30.1 at `3551559d81e52c050c04d8351a6367d0121c4a9a`.
-This task commits and pushes source changes only; it creates no tag or registry publication.
+The initial implementation committed source changes without tagging or publication.
+The authorized release request targets Cargo-Rail 0.31.0 and Action 11.0.0.
+Native qualification remains required before publication:
+
+- [CI on the source commit](https://github.com/loadingalias/cargo-rail/actions/runs/38091403229)
+  found an unavailable running-kernel package in the pinned Ubuntu snapshot,
+  a Windows fixture using the reserved path name `aux`,
+  and a RISC-V procedural-macro Cargo-query capture failure.
+- The release request `release-8237825af143` was cancelled and aborted before preparation.
+  No version, tag, or package was published; the remote transaction record remains retained.
+- The Ubuntu snapshot now includes the required kernel tools on both native architectures.
+  The portable ordering fixtures use `auxiliary` and `auxiliary-extra` in both repositories.
+  Cache-test failures retain compiler diagnostics
+  so RISC-V qualification can identify the capture error.
+
 After a release, rscrypto Track 1 must bump its tooling pin,
 use the configuration at the top of this file, and verify that release-check exits 0 or 1,
 plans only rscrypto, and selects `v0.10.0` -> `v0.11.0`.

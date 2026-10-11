@@ -7613,6 +7613,10 @@ pub fn data(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
             anyhow::ensure!(output.status.success(), "{label} build: {output:?}");
             let events = coverage_events(&coverage_path)?;
             let mut outcomes = BTreeMap::new();
+            outcomes.insert(
+                "build diagnostics".to_string(),
+                (String::from_utf8_lossy(&output.stderr).into_owned(), String::new()),
+            );
             for package in ["direct", "reexport", "scriptless", "spawning", "locating"] {
                 let event = events
                     .iter()

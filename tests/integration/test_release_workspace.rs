@@ -384,7 +384,7 @@ fn release_projection_updates_renamed_inherited_and_target_path_requirements() {
 fn release_cargo_writes_use_portable_path_order_across_independent_workspaces() {
     finish_test((|| -> Result<()> {
         let ws = workspace(None, false)?;
-        for name in ["aux", "aux-extra"] {
+        for name in ["auxiliary", "auxiliary-extra"] {
             let root = ws.path.join(name);
             std::fs::create_dir_all(root.join("src"))?;
             std::fs::write(
@@ -397,7 +397,7 @@ fn release_cargo_writes_use_portable_path_order_across_independent_workspaces() 
             let lock = cargo_command(&root).args(["generate-lockfile", "--offline"]).output()?;
             ensure!(lock.status.success(), "{lock:?}");
         }
-        ws.write_release_config("tag_format = '{prefix}{version}'\nsemver_check = 'off'\nsign_tags = false\nremote_effects = 'none'\nauxiliary_cargo_manifests = ['aux/Cargo.toml', 'aux-extra/Cargo.toml']\n")?;
+        ws.write_release_config("tag_format = '{prefix}{version}'\nsemver_check = 'off'\nsign_tags = false\nremote_effects = 'none'\nauxiliary_cargo_manifests = ['auxiliary/Cargo.toml', 'auxiliary-extra/Cargo.toml']\n")?;
         ws.commit("Declare independent workspaces with prefix-related names")?;
         let check = run_cargo_rail(
             &ws.path,
@@ -425,8 +425,8 @@ fn release_cargo_writes_use_portable_path_order_across_independent_workspaces() 
             paths,
             [
                 "Cargo.lock",
-                "aux-extra/Cargo.lock",
-                "aux/Cargo.lock",
+                "auxiliary-extra/Cargo.lock",
+                "auxiliary/Cargo.lock",
                 "crates/core/Cargo.toml"
             ]
         );
@@ -445,7 +445,7 @@ fn release_cargo_writes_use_portable_path_order_across_independent_workspaces() 
             ],
         )?;
         assert!(prepare.status.success(), "{prepare:?}");
-        for root in [&ws.path, &ws.path.join("aux"), &ws.path.join("aux-extra")] {
+        for root in [&ws.path, &ws.path.join("auxiliary"), &ws.path.join("auxiliary-extra")] {
             let metadata = cargo_command(root)
                 .args(["metadata", "--locked", "--offline", "--format-version", "1"])
                 .output()?;
