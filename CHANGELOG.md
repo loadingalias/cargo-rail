@@ -3,6 +3,33 @@
 Published versions are recorded below. Pending release intent lives in [`.changes/`](.changes/);
 see [releasing a workspace](docs/releases.md) for the current preparation and publication workflow.
 
+## [0.31.0](https://github.com/loadingalias/cargo-rail/compare/v0.30.1...v0.31.0) - 2026-10-10
+- Build the compiler driver against nightlies that rename rustc's compiler entry point.
+  Select the entry point from the exact compiler identity and keep macro observation bound to
+  that same rustc function.
+
+- Release a package while unpublished workspace members depend on it.
+  Validate and retain exact Cargo manifest and lockfile writes before preparation,
+  without bumping or tagging the unpublished dependents.
+  Published dependents retain the strict release closure.
+  
+  Give each package an optional release tag format and include configuration warnings in JSON.
+  Required semver checks reject a missing baseline unless the registry proves a first release.
+  
+  Analyze declared independent Cargo workspaces in Unify
+  and move proven test-only normal dependencies into their matching development tables.
+  Restore a deleted cache installation from its exact managed wrapper path
+  and diagnose stale authenticated compiler components.
+  
+  Check cross-target Surface production code without linking or requiring std,
+  and report host-only test and doctest coverage.
+  Publish an authenticated archive-host manifest
+  so unsupported native archive hosts can select source installation.
+  
+  Release records use v11 with release-plan v10, and Surface reports use v5.
+  Finish older active release transactions with their originating executable.
+  The companion Action must adopt its independently validated v11 reader
+  before consuming these release records.
 ## [0.30.1](https://github.com/loadingalias/cargo-rail/compare/v0.30.0...v0.30.1) - 2026-09-30
 - Resolve PATH programs to one spelling per file, so a saved plan verifies from every launch.
   On Windows, a PATH entry with a doubled separator or an uppercase `PATHEXT` extension changed the
