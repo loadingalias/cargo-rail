@@ -31,6 +31,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+#[cfg(rail_compiler_entrypoint)]
+use rustc_driver::compiler_entrypoint;
+#[cfg(not(rail_compiler_entrypoint))]
+use rustc_driver::run_compiler as compiler_entrypoint;
 use rustc_driver::{Callbacks, Compilation};
 use rustc_interface::interface;
 use rustc_middle::ty::TyCtxt;
@@ -169,7 +173,7 @@ fn main() -> ExitCode {
                 native_input_protocol::NativeCodegenObservation::NotRun,
             )),
         };
-        return rustc_driver::catch_with_exit_code(move || rustc_driver::run_compiler(&arguments, &mut callbacks));
+        return rustc_driver::catch_with_exit_code(move || compiler_entrypoint(&arguments, &mut callbacks));
     }
     if arguments.len() < 2 {
         eprintln!("cargo-rail fact driver: this internal executable must be invoked as a rustc wrapper");
@@ -225,7 +229,7 @@ fn main() -> ExitCode {
         )),
     };
     rustc_driver::catch_with_exit_code(move || {
-        rustc_driver::run_compiler(&arguments, &mut callbacks);
+        compiler_entrypoint(&arguments, &mut callbacks);
         if let (Some(invocation), Some(mut observation)) = (callbacks.native_invocation, callbacks.native_observation)
             && let Ok(codegen) = callbacks.codegen.lock()
         {

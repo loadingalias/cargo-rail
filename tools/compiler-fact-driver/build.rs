@@ -23,6 +23,8 @@ const RUSTC_API_CHANGES: &[(&str, u64, &str)] = &[
     ("rail_early_session_backend", 100, "2026-09-16"),
     // rust-lang/rust#161349: HIR keeps each `use` item's tree; nested imports are no longer items.
     ("rail_nested_use_trees", 100, "2026-09-25"),
+    // rust-lang/rust#163647: `run_compiler` is named `compiler_entrypoint`.
+    ("rail_compiler_entrypoint", 101, "2026-10-02"),
 ];
 
 fn main() {

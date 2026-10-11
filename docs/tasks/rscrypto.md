@@ -313,6 +313,9 @@ Native qualification remains required before publication:
   The portable ordering fixtures use `auxiliary` and `auxiliary-extra` in both repositories.
   Cache-test failures retain compiler diagnostics
   so RISC-V qualification can identify the capture error.
+- Native CI also found rustc's current nightly entry-point rename.
+  The driver selects the old or new name through its existing exact-compiler API table.
+  Baseline and dated-nightly driver checks pass locally; native CI qualification remains pending.
 
 After a release, rscrypto Track 1 must bump its tooling pin,
 use the configuration at the top of this file, and verify that release-check exits 0 or 1,

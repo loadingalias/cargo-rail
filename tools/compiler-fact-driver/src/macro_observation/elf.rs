@@ -111,7 +111,7 @@ pub(super) fn macro_image_contains(address: usize) -> bool {
 
 /// Rebind rustc's `dlopen` import so every macro load passes through `rustc_dlopen`.
 pub(super) fn install() {
-    let anchor = rustc_driver::run_compiler as *const () as usize;
+    let anchor = crate::compiler_entrypoint as *const () as usize;
     let images = loaded_images();
     let Some(rustc) = images.iter().find(|image| {
         image
