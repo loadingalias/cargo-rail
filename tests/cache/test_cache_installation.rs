@@ -6079,6 +6079,65 @@ fn cache_reporting_intervals_capture_cold_and_warm_production_outcomes() {
     super::helpers::finish_test(result);
 }
 
+#[cfg(not(windows))]
+#[test]
+fn an_unreadable_compiler_session_bypasses_and_reports_its_cause() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_single_crate("session-unavailable", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let reports = tempfile::tempdir()?;
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(setup.status.success(), "{setup:?}");
+        // A persistent read failure must survive the retry under the session lock.
+        let memo = selected_profile_state_root(&workspace.path, cargo_home.path())?.join("session.json");
+        fs::create_dir(&memo)?;
+        let recording = reports.path().join("report.json");
+        let path = recording.to_str().context("report path")?;
+        let started = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "report", "--start", path],
+        )?;
+        assert!(started.status.success(), "{started:?}");
+        let compiled = Command::new("cargo")
+            .current_dir(&workspace.path)
+            .args(["check", "--quiet"])
+            .env("CARGO_HOME", cargo_home.path())
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_RAIL_CACHE_REPORT", &recording)
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .output()?;
+        assert!(compiled.status.success(), "{compiled:?}");
+        let finished = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &["rail", "cache", "report", "--finish", path, "-f", "json"],
+        )?;
+        assert!(finished.status.success(), "{finished:?}");
+        let output = json(&finished)?;
+        assert_eq!(output["measurements"]["hits"], 0, "{output}");
+        assert_eq!(output["measurements"]["misses"], 0, "{output}");
+        assert_eq!(
+            output["measurements"]["bypass_reasons"]["native_cache_session_unavailable"], 1,
+            "{output}"
+        );
+        let detail = output["details"]
+            .as_array()
+            .context("report details")?
+            .iter()
+            .find(|detail| detail["reason"] == "native_cache_session_unavailable")
+            .and_then(|detail| detail["detail"].as_str())
+            .context("session bypass detail")?;
+        assert!(
+            detail.starts_with("native compiler session: ") && detail.contains("session.json"),
+            "{detail}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn cross_windows_link_restores_the_exact_dll_pdb_and_import_library() {
@@ -6090,10 +6149,16 @@ fn cross_windows_link_restores_the_exact_dll_pdb_and_import_library() {
         let reports = tempfile::tempdir()?;
         let target = "x86_64-pc-windows-msvc";
         let mut rustflags = Vec::new();
-        for (directory, name) in [("link", "first"), ("link-inputs", "second")] {
+        for directory in ["link", "link-inputs"] {
             let directory = workspace.path.join(directory);
             fs::create_dir(&directory)?;
-            let source = directory.join("lib.rs");
+            rustflags.push(format!("-Lnative={}", directory.display()));
+        }
+        // `third` has no kind, so rustc resolves it with the MSVC import-library forms and names the file to
+        // the linker. Its block imports nothing, so an archive serves as the library.
+        for (directory, name) in [("link", "first"), ("link-inputs", "second"), ("link-inputs", "third")] {
+            let directory = workspace.path.join(directory);
+            let source = directory.join(format!("{name}.rs"));
             fs::write(
                 &source,
                 format!("#![no_std]\n#[unsafe(no_mangle)] pub extern \"C\" fn {name}() -> u32 {{ 1 }}\n"),
@@ -6112,7 +6177,6 @@ fn cross_windows_link_restores_the_exact_dll_pdb_and_import_library() {
                 .arg(directory.join(format!("{name}.lib")))
                 .output()?;
             anyhow::ensure!(compiled.status.success(), "COFF input archive failed: {compiled:?}");
-            rustflags.push(format!("-Lnative={}", directory.display()));
         }
         fs::write(
             workspace.path.join("Cargo.toml"),
@@ -6121,6 +6185,7 @@ fn cross_windows_link_restores_the_exact_dll_pdb_and_import_library() {
         let source = workspace.path.join("src/lib.rs");
         let original_source = "#[link(name = \"first\", kind = \"static\")] unsafe extern \"C\" { fn first() -> u32; }\n\
             #[link(name = \"second\", kind = \"static\")] unsafe extern \"C\" { fn second() -> u32; }\n\
+            #[link(name = \"third\")] unsafe extern \"C\" {}\n\
             #[unsafe(no_mangle)] pub extern \"C\" fn answer() -> u32 { unsafe { first() + second() + 42 } }\n";
         fs::write(&source, original_source)?;
         let target_directory = workspace.path.join("target").join(target);
@@ -6186,9 +6251,29 @@ fn cross_windows_link_restores_the_exact_dll_pdb_and_import_library() {
         let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
         assert!(setup.status.success(), "COFF cache setup failed: {setup:?}");
         let mut cold_outputs = None;
-        for (phase, hits, misses) in [("cold", 0, 1), ("warm", 1, 0), ("source-change", 0, 1)] {
-            if phase == "source-change" {
-                fs::write(&source, original_source.replace("42", "43"))?;
+        let mut changed_outputs = None;
+        let earlier = |name: &str| workspace.path.join("link").join(name);
+        let later = |name: &str| workspace.path.join("link-inputs").join(name);
+        for (phase, hits, misses) in [
+            ("cold", 0, 1),
+            ("warm", 1, 0),
+            ("source-change", 0, 1),
+            // A copy in an earlier search directory changes which library rustc selects.
+            ("shadowed-static", 0, 1),
+            ("shadowed-import", 0, 1),
+            ("unshadowed", 1, 0),
+        ] {
+            match phase {
+                "source-change" => fs::write(&source, original_source.replace("42", "43"))?,
+                "shadowed-static" => {
+                    fs::copy(later("second.lib"), earlier("second.lib"))?;
+                }
+                "shadowed-import" => {
+                    fs::remove_file(earlier("second.lib"))?;
+                    fs::copy(later("third.lib"), earlier("third.lib"))?;
+                }
+                "unshadowed" => fs::remove_file(earlier("third.lib"))?,
+                _ => {}
             }
             fs::remove_dir_all(&target_directory)?;
             let recording = reports.path().join(format!("{phase}.json"));
@@ -6250,11 +6335,18 @@ fn cross_windows_link_restores_the_exact_dll_pdb_and_import_library() {
                     cold_outputs,
                     "warm restore changed COFF output bytes or modes"
                 );
-            } else {
+            } else if phase == "source-change" {
                 assert_ne!(
-                    Some(current),
-                    cold_outputs,
+                    Some(&current),
+                    cold_outputs.as_ref(),
                     "same-size source mutation did not change linked outputs"
+                );
+                changed_outputs = Some(current);
+            } else if phase == "unshadowed" {
+                assert_eq!(
+                    Some(current),
+                    changed_outputs,
+                    "restore after shadowing changed COFF output bytes or modes"
                 );
             }
         }
@@ -7700,6 +7792,266 @@ pub fn data(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
             expect_all(&build(label, true, variable)?, "miss", value);
             expect_all(&build(&format!("{label} recovered"), true, variable)?, "hit", value);
         }
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}
+
+/// A static archive with one data member, which rustc bundles into an rlib unchanged.
+#[cfg(unix)]
+fn one_member_archive(contents: &[u8; 3]) -> Vec<u8> {
+    let mut archive = b"!<arch>\n".to_vec();
+    archive.extend_from_slice(
+        format!(
+            "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+            "value.txt/",
+            0,
+            0,
+            0,
+            644,
+            contents.len()
+        )
+        .as_bytes(),
+    );
+    archive.extend_from_slice(contents);
+    // Members start at even offsets.
+    archive.push(b'\n');
+    archive
+}
+
+/// GH18: a build script's `rustc-link-search` directory reaches every dependent. Each dependent binds only
+/// the libraries that rustc selects there, so a system library directory full of versioned links neither
+/// blocks nor invalidates reuse, while every input that rustc does read still decides it.
+#[cfg(unix)]
+#[test]
+fn native_search_directories_bind_only_the_libraries_rustc_selects() {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let result: Result<()> = (|| {
+        let root = tempfile::tempdir()?;
+        let root_path = cargo_rail::utils::canonicalize_existing(root.path())?;
+        let workspace = root_path.join("workspace");
+        let system = root_path.join("native/system");
+        let selected = root_path.join("native/selected");
+        let versions = root_path.join("native/versions");
+        for directory in [&system, &selected, &versions] {
+            fs::create_dir_all(directory)?;
+        }
+        // A system library directory: a versioned shared library behind its links, a subdirectory, and an
+        // unrelated file. `-l fixture_dynamic` names it; no compilation here links it.
+        fs::write(system.join("libfixture_dynamic.so.1.2"), b"shared library")?;
+        symlink("libfixture_dynamic.so.1.2", system.join("libfixture_dynamic.so.1"))?;
+        symlink("libfixture_dynamic.so.1", system.join("libfixture_dynamic.so"))?;
+        fs::create_dir(system.join("pkgconfig"))?;
+        fs::write(system.join("pkgconfig/fixture.pc"), b"Name: fixture\n")?;
+        fs::write(system.join("README"), b"unrelated\n")?;
+        fs::write(selected.join("libbar.a"), one_member_archive(b"one"))?;
+        fs::write(selected.join("libbaz.a"), one_member_archive(b"one"))?;
+
+        let write = |relative: &str, contents: &str| -> Result<()> {
+            let path = workspace.join(relative);
+            fs::create_dir_all(path.parent().context("fixture parent")?)?;
+            Ok(fs::write(path, contents)?)
+        };
+        write(
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"sys\", \"consumer\", \"bundler\", \"expanded\", \"linked\"]\nresolver = \"3\"\n",
+        )?;
+        write(
+            "sys/Cargo.toml",
+            "[package]\nname = \"sys\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )?;
+        write(
+            "sys/build.rs",
+            &format!(
+                "fn main() {{\n    println!(\"cargo::rustc-link-search=native={}\");\n    println!(\"cargo::rustc-link-search=native={}\");\n    println!(\"cargo::rustc-link-lib=fixture_dynamic\");\n}}\n",
+                system.display(),
+                selected.display()
+            ),
+        )?;
+        write("sys/src/lib.rs", "pub const VALUE: u8 = 7;\n")?;
+        let member = |package: &str, source: &str| -> Result<()> {
+            write(
+                &format!("{package}/Cargo.toml"),
+                &format!(
+                    "[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nsys = {{ path = \"../sys\" }}\n"
+                ),
+            )?;
+            write(&format!("{package}/src/lib.rs"), source)
+        };
+        member("consumer", "pub const VALUE: u8 = sys::VALUE;\n")?;
+        // Rustc bundles each static library into the rlib, from `#[link]` in source and from macro output.
+        member(
+            "bundler",
+            "#[link(name = \"bar\", kind = \"static\")]\nunsafe extern \"C\" {\n    pub fn bar_value() -> u8;\n}\npub const VALUE: u8 = sys::VALUE;\n",
+        )?;
+        member(
+            "expanded",
+            "macro_rules! bundled {\n    ($name:literal) => {\n        #[link(name = $name, kind = \"static\")]\n        unsafe extern \"C\" {\n            pub fn baz_value() -> u8;\n        }\n    };\n}\nbundled!(\"baz\");\npub const VALUE: u8 = sys::VALUE;\n",
+        )?;
+        // A linked source entry is a capture bypass whose report names the entry.
+        member("linked", "mod alias;\npub use alias::VALUE;\n")?;
+        write("linked/src/value.rs", "pub const VALUE: u8 = 1;\n")?;
+        symlink("value.rs", workspace.join("linked/src/alias.rs"))?;
+        for arguments in [vec!["init", "--quiet"], vec!["add", "."]] {
+            let output = Command::new("git").current_dir(&workspace).args(arguments).output()?;
+            anyhow::ensure!(output.status.success(), "git: {output:?}");
+        }
+        let lock = Command::new("cargo")
+            .current_dir(&workspace)
+            .args(["generate-lockfile", "--offline"])
+            .output()?;
+        anyhow::ensure!(lock.status.success(), "lockfile: {lock:?}");
+        let cargo_home = tempfile::tempdir()?;
+        let setup = rail(&workspace, cargo_home.path(), &["rail", "cache", "setup"])?;
+        anyhow::ensure!(setup.status.success(), "cache setup: {setup:?}");
+
+        let cargo_build = |coverage: Option<&Path>, report: Option<&Path>| -> Result<Output> {
+            let clean = Command::new("cargo")
+                .current_dir(&workspace)
+                .args(["clean", "--quiet"])
+                .env("CARGO_HOME", cargo_home.path())
+                .output()?;
+            anyhow::ensure!(clean.status.success(), "clean: {clean:?}");
+            let mut command = Command::new("cargo");
+            command
+                .current_dir(&workspace)
+                .args(["build", "--offline", "--workspace", "--quiet"])
+                .env("CARGO_HOME", cargo_home.path())
+                .env("CARGO_INCREMENTAL", "0")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("CARGO_RAIL_CACHE_REMOTE")
+                .env_remove("CARGO_RAIL_CACHE_MODE")
+                .env_remove("CARGO_RAIL_CACHE_REMOTE_ENVIRONMENT")
+                .env_remove("CARGO_RAIL_CACHE_REPORT");
+            if let Some(coverage) = coverage {
+                command
+                    .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
+                    .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", coverage);
+            }
+            if let Some(report) = report {
+                command.env("CARGO_RAIL_CACHE_REPORT", report);
+            }
+            Ok(command.output()?)
+        };
+        let packages = ["sys", "consumer", "bundler", "expanded"];
+        let build = |label: &str| -> Result<BTreeMap<&str, String>> {
+            let coverage = tempfile::tempdir()?;
+            fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
+            let coverage_path = cargo_rail::utils::canonicalize_existing(coverage.path())?;
+            let output = cargo_build(Some(&coverage_path), None)?;
+            anyhow::ensure!(output.status.success(), "{label} build: {output:?}");
+            let events = coverage_events(&coverage_path)?;
+            packages
+                .iter()
+                .map(|package| {
+                    let event = events
+                        .iter()
+                        .find(|event| {
+                            event["action"]["crate_name"] == *package
+                                && event["action"]["action_class"] == "rust_library"
+                        })
+                        .with_context(|| format!("{label}: no coverage event for {package}"))?;
+                    let status = event["status"].as_str().unwrap_or_default();
+                    let reason = event["reason"].as_str().unwrap_or_default();
+                    Ok((
+                        *package,
+                        if status == "bypassed" {
+                            format!("{status}: {reason}")
+                        } else {
+                            status.into()
+                        },
+                    ))
+                })
+                .collect()
+        };
+        let expect = |label: &str, misses: &[&str]| -> Result<()> {
+            let outcomes = build(label)?;
+            for package in packages {
+                let expected = if misses.contains(&package) { "miss" } else { "hit" };
+                assert_eq!(outcomes[package], expected, "{label}: {package} in {outcomes:?}");
+            }
+            Ok(())
+        };
+
+        expect("cold", &packages)?;
+        expect("warm", &[])?;
+        // Entries that rustc never selects are not inputs.
+        fs::write(system.join("README"), b"changed\n")?;
+        fs::write(system.join("pkgconfig/other.pc"), b"Name: other\n")?;
+        fs::remove_file(system.join("libfixture_dynamic.so"))?;
+        symlink("libfixture_dynamic.so.1.2", system.join("libfixture_dynamic.so"))?;
+        expect("unrelated entries", &[])?;
+        // The selected archive's bytes are inputs.
+        fs::write(selected.join("libbar.a"), one_member_archive(b"two"))?;
+        expect("same-size archive", &["bundler"])?;
+        expect("same-size archive recovered", &[])?;
+        // An archive in an earlier directory shadows the selected one.
+        fs::write(system.join("libbar.a"), one_member_archive(b"two"))?;
+        expect("shadowing archive", &["bundler"])?;
+        expect("shadowing archive recovered", &[])?;
+        fs::remove_file(system.join("libbar.a"))?;
+        expect("shadow removed", &[])?;
+        // The selected path keeps its canonical target.
+        fs::write(versions.join("one"), one_member_archive(b"one"))?;
+        fs::write(versions.join("two"), one_member_archive(b"one"))?;
+        fs::remove_file(selected.join("libbaz.a"))?;
+        symlink(versions.join("one"), selected.join("libbaz.a"))?;
+        expect("linked archive", &["expanded"])?;
+        fs::remove_file(selected.join("libbaz.a"))?;
+        symlink(versions.join("two"), selected.join("libbaz.a"))?;
+        expect("retargeted archive", &["expanded"])?;
+        expect("retargeted archive recovered", &[])?;
+
+        // Without benchmark coverage, the cache report names the entry behind a capture bypass.
+        let reports = tempfile::tempdir()?;
+        let recording = reports.path().join("report.json");
+        let path = recording.to_str().context("report path")?;
+        let started = rail(
+            &workspace,
+            cargo_home.path(),
+            &["rail", "cache", "report", "--start", path],
+        )?;
+        anyhow::ensure!(started.status.success(), "report start: {started:?}");
+        let built = cargo_build(None, Some(&recording))?;
+        anyhow::ensure!(built.status.success(), "report build: {built:?}");
+        let finished = rail(
+            &workspace,
+            cargo_home.path(),
+            &["rail", "cache", "report", "--finish", path, "-f", "json"],
+        )?;
+        anyhow::ensure!(finished.status.success(), "report finish: {finished:?}");
+        let output = json(&finished)?;
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../schemas/cache-report-v1.schema.json"))?;
+        assert!(
+            jsonschema::validator_for(&schema)
+                .map_err(|error| anyhow::anyhow!("invalid report schema: {error}"))?
+                .is_valid(&output),
+            "{output}"
+        );
+        assert_eq!(
+            output["measurements"]["bypass_reasons"]["source_namespace_entry_unsupported"], 1,
+            "{output}"
+        );
+        let detail = output["details"]
+            .as_array()
+            .and_then(|details| {
+                details
+                    .iter()
+                    .find(|detail| detail["reason"] == "source_namespace_entry_unsupported")
+            })
+            .with_context(|| format!("no capture detail in {output}"))?;
+        assert!(
+            detail["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("linked/src/alias.rs")),
+            "{detail}"
+        );
         Ok(())
     })();
     crate::helpers::finish_test(result);

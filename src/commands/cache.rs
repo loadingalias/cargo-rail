@@ -598,12 +598,12 @@ pub(crate) fn run_status(workspace_root: &Path, scope: CacheScope, format: TextJ
 }
 
 pub(crate) fn run_report(start: Option<&Path>, finish: Option<&Path>, format: TextJsonOutputFormat) -> RailResult<()> {
-    let (mode, measurements) = match (start, finish) {
+    let (mode, finished) = match (start, finish) {
         (Some(path), None) => {
             crate::cache::report::start(path)?;
             ("start", None)
         }
-        (None, Some(path)) => ("finish", Some(crate::cache::report::finish(path)?)),
+        (None, Some(path)) => ("finish", Some(crate::cache::report::finish_with_details(path)?)),
         _ => {
             return Err(RailError::message(
                 "choose exactly one cache report operation: --start or --finish",
@@ -611,21 +611,33 @@ pub(crate) fn run_report(start: Option<&Path>, finish: Option<&Path>, format: Te
         }
     };
     if format.is_json() {
+        let mut result = serde_json::json!({
+            "operation": mode,
+            "measurements": finished.as_ref().map(|(measurements, _)| measurements),
+        });
+        // One example of each of the first bypass reasons; measurement consumers never read it.
+        if let Some((_, details)) = finished.as_ref().filter(|(_, details)| !details.is_empty()) {
+            result["details"] = serde_json::to_value(details)?;
+        }
         println!(
             "{}",
             serde_json::to_string(&crate::output::machine_json_envelope(
-                "cache",
-                "report",
-                "success",
-                0,
-                serde_json::json!({"operation": mode, "measurements": measurements})
+                "cache", "report", "success", 0, result
             ))?
         );
-    } else if let Some(counts) = measurements {
+    } else if let Some((counts, details)) = finished {
         println!(
             "Cache: {} reused, {} misses, {} bypasses, {} failures",
             counts.hits, counts.misses, counts.bypasses, counts.failures
         );
+        let mut reasons = counts.bypass_reasons.iter().collect::<Vec<_>>();
+        reasons.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+        for (reason, count) in reasons {
+            println!("Bypassed {count}: {reason}");
+            if let Some(detail) = details.iter().find(|detail| &detail.reason == reason) {
+                println!("  For example: {}", detail.detail);
+            }
+        }
         if counts.incomplete {
             println!("Measurements are incomplete.");
         }

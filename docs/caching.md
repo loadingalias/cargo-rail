@@ -86,6 +86,11 @@ and a crate that links a library receives both files under one extern name.
 A result binds both outputs, and a result without its rmeta is refused.
 Each file of a paired extern, and each rlib and rmeta found through `-L dependency=`,
 enters the action identity separately, so a change to either one misses.
+A compilation that reads only crate metadata,
+because every output is an rlib or nothing is compiled to object code,
+never reads the rlib beside an rmeta that rustc selected.
+That rlib is not an input, so Cargo writing it while a pipelined dependent compiles neither blocks
+nor invalidates reuse.
 Nightly Cargo's per-unit build directories (`build/PACKAGE/HASH/out`) restore like the classic layout.
 
 Limits:
@@ -154,7 +159,7 @@ linked authority paths, or changed owned state.
 
 Cargo freshness and incremental compilation remain L0.
 An L1 action binds the compiler, toolchain, arguments, target, environment, dependencies,
-source topology and bytes, native-search inputs, and declared outputs.
+source topology and bytes, the [native libraries](#native-libraries) that rustc resolves itself, and declared outputs.
 Physical mode also binds the canonical workspace root.
 Remap mode replaces that root only for certified portable result classes
 while keeping the executor's physical output directory out of the portable operation identity.
@@ -193,6 +198,20 @@ A result is:
 - a `miss` when no authoritative result exists and successful cold output may populate the CAS;
 - a `bypass` when the invocation is outside the supported class and executes normally; or
 - a `conflict` when one action produced distinct semantic results, in which case neither result restores.
+
+An action whose inputs cannot be captured bypasses with a reason that names the cause:
+
+| Reason                                  | Condition |
+| --------------------------------------- | --------- |
+| `source_namespace_entry_unsupported`    | The crate's source directory holds a symbolic link, reparse point, or special file |
+| `generated_namespace_entry_unsupported` | The build script's `OUT_DIR` holds a symbolic link, reparse point, or special file |
+| `action_capture_bound_exceeded`         | Capturing the inputs reached an entry, path, byte, depth, or time bound |
+| `native_library_capture_unavailable`    | A native-library candidate that rustc tested cannot be observed, or it changed while rustc searched |
+| `cold_input_changed_during_execution`   | An input captured after the compiler exited, such as a linker input, native-library candidate, or macro read, changed after the compiler started |
+| `native_library_search_unreported`      | The linker received a file by path from a native search directory that no reported native-library search selected |
+| `complete_action_capture_unavailable`   | Any other capture error; `cache status` counts it as a failure |
+
+A [cache report](#aggregate-cache-measurements) names the entry, bound, or candidate behind each of these reasons.
 
 Disable reuse for one process tree without changing setup:
 
@@ -292,23 +311,31 @@ These units execute normally:
 | `procedural_macro_read_outside_repository` | The macro reads a path outside the repository and outside the captured namespaces |
 | `procedural_macro_read_through_symlink`    | The macro reads a repository path through a symbolic link |
 | `procedural_macro_process_unmodeled`       | The macro starts a process other than a modeled `cargo locate-project` query |
-| `procedural_macro_process_control`         | The macro forks, replaces its process, or starts a process with a changed environment, directory, or descriptors |
+| `procedural_macro_process_control`         | The macro forks, replaces its process, changes its user, group, or session, or starts a process with a changed environment, directory, or descriptors |
 | `procedural_macro_secret_environment`      | The macro reads a variable with a secret-like name |
 | `procedural_macro_environment_enumeration` | The macro walks the whole environment |
 | `procedural_macro_environment_write`       | The macro changes the environment |
 | `procedural_macro_file_write`              | The macro creates, writes, renames, or removes a file |
-| `procedural_macro_network`                 | The macro opens a network connection |
+| `procedural_macro_network`                 | The macro creates, connects, or uses a socket |
 | `procedural_macro_host_state`              | The macro reads host state, such as the host name, kernel identity, or file-system statistics |
 | `procedural_macro_working_directory`       | The macro changes the working directory |
 | `procedural_macro_dynamic_load`            | The macro loads a library at run time |
 | `procedural_macro_executable_memory`       | The macro maps or generates executable memory |
 | `procedural_macro_dynamic_dependency`      | The macro links a shared library other than the system C library |
-| `procedural_macro_import_unclassified`     | The macro imports a C library function that the driver does not classify |
+| `procedural_macro_import_unclassified`     | The macro imports a C library function that the driver does not classify; a cache report names it |
 | `procedural_macro_initializer`             | The macro ran initialization code before the driver could observe it |
 | `procedural_macro_raw_system_call`         | The macro issues a system call without the C library, and the platform cannot observe it |
 | `procedural_macro_path_unavailable`        | A path the macro used cannot be resolved to a stable name |
 | `procedural_macro_observation_limit`       | The macro reads more paths or variables than an action binds |
 | `procedural_macro_observation_unavailable` | The platform cannot observe macros, as described below |
+
+Linking a function is not calling it.
+A macro library often links code that expansion never runs,
+such as an asynchronous runtime's event queue, fork handlers, and sockets.
+The driver classifies every function that the standard library and common runtimes import.
+A function with an effect is hooked and records that effect only when the macro calls it.
+The import tables and the Linux system-call table classify each operation alike,
+and a test enforces it.
 
 Observation depends on the host:
 
@@ -341,7 +368,44 @@ Exact reuse would need file tracing of the whole build-script process tree on ev
 Build scripts therefore run normally when Cargo decides they must run,
 and Cargo's own freshness still skips them while their declared inputs are unchanged.
 The crates that consume their output remain reusable,
-because each consumer's action binds the generated files and native search directories it reads.
+because each consumer's action binds the generated files it reads and the [native libraries](#native-libraries)
+that rustc selects from the build script's search directories.
+
+## Native libraries
+
+A build script's `rustc-link-search` directory reaches every crate that depends on it.
+It is often a system library directory, such as `/usr/lib/x86_64-linux-gnu`.
+An action binds what each native search directory selects, never the directory's content:
+
+| Role of a `-L` directory                                          | What the action binds |
+| ----------------------------------------------------------------- | --------------------- |
+| Rustc looks up Rust crates in `-L all=` and bare `-L` directories | The candidate filenames of each search and the files rustc selects |
+| The linker resolves the libraries of a linked output              | The linker witness: each file the linker read and each lookup that failed |
+| Rustc resolves a native library itself                            | Each candidate rustc tests, in its order, through the first that exists |
+
+Rustc resolves a native library itself to bundle a static library into an rlib or staticlib.
+It also does so when it names a library to the linker by path:
+an Apple whole-archive static library, a static library whose symbols a `cdylib` exports,
+and every MSVC library.
+On every miss, the compiler driver reports each such search,
+including libraries that `#[link]` attributes and macro output name.
+Each candidate before the match must stay absent, and the match keeps its spelling,
+canonical target, and bytes.
+A new library in an earlier directory, a changed archive, and a retargeted link each miss.
+
+A directory that selects no such library binds only its spelling,
+which the compiler arguments carry.
+Symbolic links, unrelated files, and subdirectories there neither block nor invalidate reuse.
+
+`-l NAME`, `-l dylib=NAME`, and `-l static=NAME`, with or without modifiers, are reusable.
+An action that does not link only names a dynamic library in its metadata,
+so a `-sys` crate such as `pq-sys` is reusable.
+Framework libraries bypass with `dynamic_native_library_search_evidence_unavailable`, and other library kinds bypass with `native_library_input_evidence_unavailable`.
+Actions that name a native search directory stay local:
+distributed and root-portable reuse do not model these directories.
+A `-L all=` or bare `-L` directory outside the repository and the target directory,
+such as a system library directory, binds its Rust crate search by absolute host path.
+A `-L dependency=` or `-L crate=` directory there still bypasses, because those actions may reach distributed reuse.
 
 ## Native host eligibility
 
@@ -710,6 +774,12 @@ After their compiler processes exit,
 Finishing again returns the recorded totals; starting over an existing file is rejected.
 
 The recording contains bounded aggregate counters and reason counts.
+The finished interval also names, in `details`, one example of each of the first eight bypass reasons,
+such as the source entry, native-library candidate, macro import,
+or session or admission error behind it.
+Examples can name host paths.
+They never enter the measurements, a cache key, or restore authority,
+and text output lists each bypass reason with its example.
 Concurrent wrapper outcomes are serialized;
 report storage never authorizes a restore or changes a cache key.
 Known recording errors and counter overflow mark the measurements incomplete.

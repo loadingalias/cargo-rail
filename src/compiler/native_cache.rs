@@ -39,6 +39,7 @@ mod cargo_inputs;
 mod clippy;
 pub(crate) mod coff;
 pub(crate) mod macro_inputs;
+pub(crate) mod native_libraries;
 pub(crate) mod pack;
 mod rust_inputs;
 
@@ -203,6 +204,8 @@ pub(crate) struct NativeCacheContext {
     source_root: PathBuf,
     source_root_spelling: PathBuf,
     output_parent_authority: Option<PathBuf>,
+    /// Cargo's canonical target directory, where Cargo and rustc write during every compilation.
+    target_root: Option<PathBuf>,
     observation_directory: PathBuf,
     local_cas: Option<LocalCas>,
     remote: Option<crate::remote_cache::RemoteCacheSelection>,
@@ -674,30 +677,35 @@ pub(crate) struct NativeDynamicInputSelector {
     /// Repository paths that loaded procedural macros read during an earlier execution.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     macro_paths: Vec<macro_inputs::MacroPathSelector>,
+    /// Native-library searches that rustc performed itself during an earlier execution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    native_libraries: Vec<native_libraries::NativeLibrarySelector>,
 }
 
 impl NativeDynamicInputSelector {
     pub(crate) fn new(environment_names: Vec<String>, repository_paths: Vec<String>) -> RailResult<Self> {
         let selector = Self {
-            version: 3,
+            version: 4,
             environment_names,
             repository_paths,
             rust_inputs: RustInputSelector::default(),
             diagnostic_width: false,
             macro_paths: Vec::new(),
+            native_libraries: Vec::new(),
         };
         selector.validate()?;
         Ok(selector)
     }
 
     pub(crate) fn validate(&self) -> RailResult<()> {
-        if self.version != 3 {
+        if self.version != 4 {
             return Err(RailError::message(
                 "native dynamic-input selector has an incompatible schema",
             ));
         }
         self.rust_inputs.validate()?;
         macro_inputs::validate_selectors(&self.macro_paths)?;
+        native_libraries::validate_selectors(&self.native_libraries)?;
         validate_environment_selector_names(self.environment_names.iter().map(String::as_str))?;
         let mut total_bytes = 0usize;
         let mut previous = None::<&str>;
@@ -859,6 +867,36 @@ struct FileLinkerWitness {
     missing: Vec<String>,
     endogenous_objects: u32,
     dependency_archives: Vec<String>,
+}
+
+impl LinkerWitness {
+    /// The linker inputs and failed lookups that the witness binds.
+    fn post_execution_paths(&self) -> Vec<PostExecutionPath> {
+        let (driver, linker, found, missing) = match self {
+            Self::Apple(witness) => (&witness.driver, &witness.linker, &witness.found, &witness.missing),
+            Self::Elf(witness) => (&witness.driver, &witness.linker, &witness.found, &witness.missing),
+            Self::Coff(witness) => (
+                &witness.files.driver,
+                &witness.files.linker,
+                &witness.files.found,
+                &witness.files.missing,
+            ),
+        };
+        let mut paths = [driver, linker]
+            .into_iter()
+            .chain(found)
+            .map(|file| PostExecutionPath::Present(PathBuf::from(&file.path)))
+            .chain(
+                missing
+                    .iter()
+                    .map(|path| PostExecutionPath::Absent(PathBuf::from(path))),
+            )
+            .collect::<Vec<_>>();
+        if let Self::Coff(witness) = self {
+            paths.extend(witness.search_directories());
+        }
+        paths
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1189,8 +1227,6 @@ pub(crate) struct NativeActionCapture {
     package_binding: Option<NativePackageBinding>,
     source_state: NativeSourceState,
     generated: Option<NativeNamespaceCapture>,
-    native_searches: Vec<NativeNamespaceCapture>,
-    missing_native_searches: Vec<NativeMissingSearchCapture>,
     pathless_extern_searches: Vec<NativePathlessExternSearchCapture>,
     approved_environment: ApprovedEnvState,
     selected_repository_inputs: Vec<NativeSelectedRepositoryInput>,
@@ -1201,6 +1237,8 @@ pub(crate) struct NativeActionCapture {
     clippy: Option<clippy::ClippyActionCapture>,
     /// Repository paths that loaded procedural macros read, with their captured states.
     macro_inputs: Vec<macro_inputs::MacroPathInput>,
+    /// Native-library searches that rustc performs itself, with each candidate's captured state.
+    native_libraries: Vec<native_libraries::NativeLibraryInput>,
     guard: NativeCaptureGuard,
     capture_entries: usize,
     capture_path_bytes: usize,
@@ -1213,13 +1251,6 @@ struct NativeNamespaceCapture {
     root_spelling: PathBuf,
     state: NativeSourceState,
     guard: NativeCaptureGuard,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct NativeMissingSearchCapture {
-    spelling: PathBuf,
-    ancestor: PathBuf,
-    guard: NativeMetadataGuard,
 }
 
 /// Matching CLI search-path candidates for one toolchain-owned pathless extern.
@@ -1250,6 +1281,8 @@ struct NativePublicationProof {
     diagnostic_width: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     macro_paths: Vec<macro_inputs::MacroPathSelector>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    native_libraries: Vec<native_libraries::NativeLibrarySelector>,
 }
 
 #[derive(Debug)]
@@ -1258,24 +1291,57 @@ pub(crate) struct NativeInputFailure {
     error: RailError,
 }
 
+/// Capture bypass reasons that name the input shape or bound that stopped a capture.
+const SOURCE_NAMESPACE_ENTRY_UNSUPPORTED: &str = "source_namespace_entry_unsupported";
+const GENERATED_NAMESPACE_ENTRY_UNSUPPORTED: &str = "generated_namespace_entry_unsupported";
+const ACTION_CAPTURE_BOUND_EXCEEDED: &str = "action_capture_bound_exceeded";
+
 impl NativeInputFailure {
     pub(crate) fn new(reason: &'static str, error: RailError) -> Self {
         Self { reason, error }
     }
+
+    /// An error with a specific reason that survives `RailResult` code up to the capture boundary.
+    fn raise(reason: &'static str, message: impl Into<String>) -> RailError {
+        Self::new(reason, RailError::message(message)).into()
+    }
 }
 
+/// Recover the specific reason that a capture raised; any other error is an unclassified capture failure.
 impl From<RailError> for NativeInputFailure {
     fn from(error: RailError) -> Self {
-        Self::new(
-            crate::cache::installation::NativeCacheFailureReason::ActionCapture.as_str(),
-            error,
-        )
+        match error {
+            RailError::External { message, source } => match source.downcast::<NativeInputFailure>() {
+                Ok(failure) => *failure,
+                Err(source) => Self::new(
+                    crate::cache::installation::NativeCacheFailureReason::ActionCapture.as_str(),
+                    RailError::External { message, source },
+                ),
+            },
+            RailError::Context { context, source } => {
+                let failure = Self::from(*source);
+                Self::new(
+                    failure.reason,
+                    RailError::Context {
+                        context,
+                        source: Box::new(failure.error),
+                    },
+                )
+            }
+            error => Self::new(
+                crate::cache::installation::NativeCacheFailureReason::ActionCapture.as_str(),
+                error,
+            ),
+        }
     }
 }
 
 impl From<NativeInputFailure> for RailError {
     fn from(failure: NativeInputFailure) -> Self {
-        failure.error
+        RailError::External {
+            message: failure.reason,
+            source: Box::new(failure),
+        }
     }
 }
 
@@ -1608,6 +1674,11 @@ impl NativeActionCapture {
             selector.rust_inputs = inputs.witness().selector().clone();
         }
         selector.macro_paths = self.macro_inputs.iter().map(|input| input.selector()).collect();
+        selector.native_libraries = self
+            .native_libraries
+            .iter()
+            .map(|input| input.selector().clone())
+            .collect();
         selector.diagnostic_width = self.diagnostic_width.is_some();
         Ok(selector)
     }
@@ -1628,6 +1699,24 @@ impl NativeActionCapture {
         let inputs = macro_inputs::capture(workspace_root, selectors, Instant::now(), &mut budget)?;
         self.bytes_hashed = self.bytes_hashed.saturating_add(budget.bytes_hashed);
         self.macro_inputs = inputs;
+        Ok(())
+    }
+
+    /// Capture the current state of each candidate of the native-library searches that rustc performs.
+    fn select_native_libraries(
+        &mut self,
+        observation: &RawCompilerInvocation,
+        workspace_root: &Path,
+        selectors: &[native_libraries::NativeLibrarySelector],
+    ) -> RailResult<()> {
+        let directories = native_search_paths(
+            &observation.compiler_arguments,
+            &std::env::current_dir()?,
+            workspace_root,
+        )?;
+        let (inputs, bytes_hashed) = native_libraries::capture(selectors, &directories)?;
+        self.bytes_hashed = self.bytes_hashed.saturating_add(bytes_hashed);
+        self.native_libraries = inputs;
         Ok(())
     }
 
@@ -1754,6 +1843,7 @@ impl NativeActionCapture {
         capture.select_rust_inputs(observation, source_root, &proof.rust_inputs)?;
         capture.bind_diagnostic_width(proof.diagnostic_width, observation);
         capture.select_macro_inputs(source_root, &proof.macro_paths)?;
+        capture.select_native_libraries(observation, source_root, &proof.native_libraries)?;
         Ok(capture)
     }
 
@@ -1833,7 +1923,13 @@ impl NativeActionCapture {
             ));
         };
         if declared.symlink_target.is_some() {
-            return Err(RailError::message("native crate root must not be a symlink"));
+            return Err(NativeInputFailure::raise(
+                SOURCE_NAMESPACE_ENTRY_UNSUPPORTED,
+                format!(
+                    "native crate root '{}' is a symlink",
+                    declared.path.resolve(source_root).display()
+                ),
+            ));
         }
         let crate_root = declared.path.resolve(source_root);
         let namespace_spelling = crate_root
@@ -1885,17 +1981,11 @@ impl NativeActionCapture {
             Some(&crate_root),
             &source_exclusions,
             source_root,
+            SOURCE_NAMESPACE_ENTRY_UNSUPPORTED,
             started,
             &mut budget,
         )?;
         let generated = capture_native_generated_namespace(observation, source_root, started, &mut budget)?;
-        let (native_searches, missing_native_searches) = capture_native_search_namespaces(
-            &observation.compiler_arguments,
-            generated.as_ref(),
-            source_root,
-            started,
-            &mut budget,
-        )?;
         let pathless_extern_searches =
             capture_pathless_extern_searches(&observation.compiler_arguments, source_root, started, &mut budget)?;
         let (selected_repository_inputs, selected_guards) =
@@ -1940,8 +2030,6 @@ impl NativeActionCapture {
             package_binding,
             source_state,
             generated,
-            native_searches,
-            missing_native_searches,
             pathless_extern_searches,
             approved_environment,
             selected_repository_inputs,
@@ -1949,6 +2037,7 @@ impl NativeActionCapture {
             diagnostic_width: None,
             clippy: None,
             macro_inputs: Vec::new(),
+            native_libraries: Vec::new(),
             guard: NativeCaptureGuard { entries: guard_entries },
             capture_entries: budget.entries,
             capture_path_bytes: budget.path_bytes,
@@ -1984,7 +2073,13 @@ impl NativeActionCapture {
             ));
         };
         if declared.symlink_target.is_some() {
-            return Err(RailError::message("native crate root must not be a symlink"));
+            return Err(NativeInputFailure::raise(
+                SOURCE_NAMESPACE_ENTRY_UNSUPPORTED,
+                format!(
+                    "native crate root '{}' is a symlink",
+                    declared.path.resolve(workspace_root).display()
+                ),
+            ));
         }
         let crate_root_spelling = declared.path.resolve(workspace_root);
         let namespace_spelling = crate_root_spelling
@@ -2095,7 +2190,14 @@ impl NativeActionCapture {
         }
 
         self.revalidate_generated_before_restore_commit(workspace_root, std::env::var_os("OUT_DIR"))?;
-        self.revalidate_native_searches_before_restore_commit(observation, workspace_root)?;
+        let native_library_bytes = native_libraries::revalidate(
+            &self.native_libraries,
+            &native_search_paths(
+                &observation.compiler_arguments,
+                &std::env::current_dir()?,
+                workspace_root,
+            )?,
+        )?;
         self.revalidate_pathless_extern_searches_before_restore_commit(observation, workspace_root)?;
         if let Some(clippy) = &self.clippy {
             clippy.revalidate(&mut NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS))?;
@@ -2119,7 +2221,9 @@ impl NativeActionCapture {
                 "native compiler environment changed before the restore commit",
             ));
         }
-        Ok(bytes_hashed.saturating_add(toolchain_bytes))
+        Ok(bytes_hashed
+            .saturating_add(toolchain_bytes)
+            .saturating_add(native_library_bytes))
     }
 
     fn revalidate_generated_before_restore_commit(
@@ -2156,60 +2260,6 @@ impl NativeActionCapture {
                     "native generated namespace changed before the restore commit",
                 ));
             }
-        }
-        Ok(())
-    }
-
-    fn revalidate_native_searches_before_restore_commit(
-        &self,
-        observation: &RawCompilerInvocation,
-        workspace_root: &Path,
-    ) -> RailResult<()> {
-        let current_directory = std::env::current_dir()?;
-        let mut roots = Vec::<(PathBuf, PathBuf)>::new();
-        let mut missing = Vec::new();
-        for spelling in native_search_paths(&observation.compiler_arguments, &current_directory, workspace_root)? {
-            let metadata = match fs::symlink_metadata(&spelling) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    if !missing
-                        .iter()
-                        .any(|captured: &NativeMissingSearchCapture| captured.spelling == spelling)
-                    {
-                        missing.push(capture_missing_native_search(&spelling)?);
-                    }
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
-                return Err(RailError::message(
-                    "native library search namespace changed before the restore commit",
-                ));
-            }
-            let root = crate::utils::canonicalize_existing(&spelling)?;
-            if self.generated.as_ref().is_some_and(|generated| generated.root == root)
-                || roots.iter().any(|(captured, _)| captured == &root)
-            {
-                continue;
-            }
-            roots.push((root, spelling));
-        }
-        if roots.len() != self.native_searches.len() || missing != self.missing_native_searches {
-            return Err(RailError::message(
-                "native library search namespaces changed before the restore commit",
-            ));
-        }
-        for ((root, spelling), captured) in roots.iter().zip(&self.native_searches) {
-            if root != &captured.root
-                || spelling != &captured.root_spelling
-                || ObservationPath::capture(root, workspace_root, workspace_root) != captured.state.root
-            {
-                return Err(RailError::message(
-                    "native library search namespace changed before the restore commit",
-                ));
-            }
-            revalidate_captured_namespace(captured, "native library search")?;
         }
         Ok(())
     }
@@ -2255,11 +2305,6 @@ impl NativeActionCapture {
                     .as_ref()
                     .and_then(|binding| binding.compiler_library_ancestors.as_deref()),
                 self.generated.as_ref().map(|generated| &generated.guard),
-                self.native_searches
-                    .iter()
-                    .map(|captured| &captured.guard)
-                    .collect::<Vec<_>>(),
-                &self.missing_native_searches,
                 self.pathless_extern_searches
                     .iter()
                     .map(|captured| &captured.guard)
@@ -2316,25 +2361,6 @@ impl NativeActionCapture {
         }
         if self.generated.is_some() {
             append_frame(&mut framed, b"generated-root", PORTABLE_GENERATED_ROOT.as_bytes());
-        }
-        for native in &self.native_searches {
-            append_frame(
-                &mut framed,
-                b"native-search-root",
-                native.root.as_os_str().as_encoded_bytes(),
-            );
-            append_frame(
-                &mut framed,
-                b"native-search-root-spelling",
-                native.root_spelling.as_os_str().as_encoded_bytes(),
-            );
-        }
-        for missing in &self.missing_native_searches {
-            append_frame(
-                &mut framed,
-                b"missing-native-search",
-                missing.spelling.as_os_str().as_encoded_bytes(),
-            );
         }
         crate::instrumentation::record_hash(framed.len());
         Ok(format!("sha256:{}", ContentDigest::sha256(&framed)))
@@ -4040,6 +4066,200 @@ fn link_file_spelling(path: &Path) -> RailResult<&str> {
         .ok_or_else(|| RailError::message("Apple linker input path is not valid UTF-8"))
 }
 
+/// A path that a cold execution binds after the compiler ran: a linker input, a native-library candidate,
+/// a procedural-macro read, or a selected repository input.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum PostExecutionPath {
+    /// An entry that exists. It and every symbolic link that it resolves through must predate the compiler.
+    Present(PathBuf),
+    /// A path that does not exist. Its nearest existing ancestor must predate the compiler, because creating
+    /// and removing the path while the compiler ran changes that ancestor.
+    Absent(PathBuf),
+}
+
+/// Every path that the cold capture bound after the compiler ran.
+fn post_execution_paths(
+    observation: &RawCompilerInvocation,
+    capture: &NativeActionCapture,
+    witness: &NativeCompilerWitness,
+    source_root: &Path,
+) -> RailResult<Vec<PostExecutionPath>> {
+    let directories = native_search_paths(&observation.compiler_arguments, &std::env::current_dir()?, source_root)?;
+    let mut paths = native_libraries::post_execution_paths(&capture.native_libraries, &directories)?;
+    paths.extend(macro_inputs::post_execution_paths(source_root, &capture.macro_inputs)?);
+    paths.extend(
+        capture
+            .selected_repository_inputs
+            .iter()
+            .map(|input| PostExecutionPath::Present(source_root.join(&input.path))),
+    );
+    if let Some(linker) = &witness.linker {
+        paths.extend(linker.post_execution_paths());
+    }
+    Ok(paths)
+}
+
+/// Fail when a path bound after the compiler ran changed after the compiler started.
+///
+/// The capture reads each such path after the compiler exits, so it can bind a state that the compiler
+/// never read: a file changed and changed back, or a candidate that appeared and disappeared. A change
+/// time at or after `started` cannot exclude that. `started` must be separated before the compiler starts.
+fn verify_unchanged_since(
+    started: crate::utils::ChangeMark,
+    target_root: Option<&Path>,
+    paths: impl IntoIterator<Item = PostExecutionPath>,
+) -> RailResult<()> {
+    const MAX_LINKS: usize = 40;
+    let mut checked = BTreeSet::new();
+    let paths = paths.into_iter().collect::<BTreeSet<_>>();
+    for path in paths {
+        let mut current = match path {
+            PostExecutionPath::Present(path) => path,
+            // Cargo and rustc write in the target directory during every compilation, so its directories
+            // change for reasons unrelated to an absent candidate. Such an absence keeps its captured binding.
+            PostExecutionPath::Absent(path)
+                if target_root.is_some_and(|root| {
+                    crate::utils::canonicalize_allow_missing(&path).is_ok_and(|path| path.starts_with(root))
+                }) =>
+            {
+                continue;
+            }
+            PostExecutionPath::Absent(path) => {
+                let mut ancestor = path.parent();
+                loop {
+                    let Some(directory) = ancestor else {
+                        return Err(RailError::message(format!(
+                            "absent input '{}' has no existing ancestor",
+                            path.display()
+                        )));
+                    };
+                    match fs::symlink_metadata(directory) {
+                        Ok(_) => break directory.to_path_buf(),
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                            ) =>
+                        {
+                            ancestor = directory.parent();
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        };
+        for hop in 0.. {
+            if !checked.insert(current.clone()) {
+                break;
+            }
+            let metadata = fs::symlink_metadata(&current)?;
+            if started.changed_since(&metadata) {
+                return Err(RailError::message(format!(
+                    "'{}' changed while the compiler ran",
+                    current.display()
+                )));
+            }
+            if !metadata.file_type().is_symlink() {
+                break;
+            }
+            if hop == MAX_LINKS {
+                return Err(RailError::message(format!(
+                    "'{}' resolves through too many symbolic links",
+                    current.display()
+                )));
+            }
+            let target = fs::read_link(&current)?;
+            current = current
+                .parent()
+                .map_or_else(|| target.clone(), |parent| parent.join(&target));
+        }
+    }
+    Ok(())
+}
+
+/// The files that a linked action's linker received by path, as its evidence records them.
+fn linked_direct_inputs(
+    observation: &RawCompilerInvocation,
+    target_format: NativeTargetFormat,
+    observation_directory: &Path,
+) -> RailResult<Vec<PathBuf>> {
+    if !linked_observation(observation) {
+        return Ok(Vec::new());
+    }
+    let inputs = if apple_linked_observation(observation, target_format) {
+        read_apple_link_driver_evidence(&observation_directory.join(APPLE_LINK_DRIVER_INPUTS_FILE))?.direct_inputs
+    } else if elf_linked_observation(observation, target_format) {
+        read_elf_link_driver_evidence(&observation_directory.join(ELF_LINK_DRIVER_INPUTS_FILE))?.direct_inputs
+    } else if target_format == NativeTargetFormat::Coff {
+        return coff::direct_inputs(&observation_directory.join(coff::EVIDENCE_FILE));
+    } else {
+        Vec::new()
+    };
+    Ok(inputs.into_iter().map(PathBuf::from).collect())
+}
+
+/// Fail when the linker received a file by path from a native search directory that no bound native-library
+/// search selected.
+///
+/// Rustc names some libraries to the linker by path after it searches the native search directories itself,
+/// and the compiler driver reports each such search. A file from those directories that no reported search
+/// selected means that rustc resolved a library the driver did not report, so the search that chose it,
+/// including any earlier directory that could shadow it, is unbound. A file that the compiler arguments name,
+/// such as a link argument, involves no search.
+fn verify_linked_native_libraries(
+    direct_inputs: Vec<PathBuf>,
+    observation: &RawCompilerInvocation,
+    capture: &NativeActionCapture,
+    source_root: &Path,
+) -> RailResult<()> {
+    if direct_inputs.is_empty() {
+        return Ok(());
+    }
+    let current_directory = std::env::current_dir()?;
+    let canonical = |path: &Path| crate::utils::canonicalize_existing(path).ok();
+    let directories = native_search_paths(&observation.compiler_arguments, &current_directory, source_root)?
+        .iter()
+        .filter_map(|directory| canonical(directory))
+        .collect::<BTreeSet<_>>();
+    let selected = native_libraries::selected_files(&capture.native_libraries)
+        .map(PathBuf::from)
+        .collect::<BTreeSet<_>>();
+    let named = observation
+        .compiler_arguments
+        .iter()
+        .flat_map(|argument| argument.split(['=', ',', ' ']))
+        .filter(|token| !token.is_empty())
+        .filter_map(|token| resolve_portable_compiler_path(token, &current_directory, source_root).ok())
+        .filter_map(|path| canonical(&path))
+        .collect::<BTreeSet<_>>();
+    let inputs = direct_inputs
+        .iter()
+        .filter_map(|input| canonical(input))
+        .collect::<Vec<_>>();
+    match unselected_native_input(&inputs, &directories, &selected, &named) {
+        Some(input) => Err(RailError::message(format!(
+            "the linker received '{}' from a native search directory, but no reported native-library search selected it",
+            input.display()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The first canonical direct input in a native search directory that neither a bound search selected nor
+/// the compiler arguments named.
+fn unselected_native_input<'a>(
+    inputs: &'a [PathBuf],
+    directories: &BTreeSet<PathBuf>,
+    selected: &BTreeSet<PathBuf>,
+    named: &BTreeSet<PathBuf>,
+) -> Option<&'a PathBuf> {
+    inputs.iter().find(|input| {
+        input.parent().is_some_and(|parent| directories.contains(parent))
+            && !selected.contains(*input)
+            && !named.contains(*input)
+    })
+}
+
 fn capture_link_file(
     path: &Path,
     started: Instant,
@@ -4291,19 +4511,23 @@ impl NativeCaptureBudget {
     }
 
     fn account_entry(&mut self, path: &str) -> RailResult<()> {
-        let entries = self
-            .entries
-            .checked_add(1)
-            .ok_or_else(|| RailError::message("native source entry bound exceeded"))?;
-        let path_bytes = self
-            .path_bytes
-            .checked_add(path.len())
-            .ok_or_else(|| RailError::message("native source path-byte bound exceeded"))?;
+        let entries = self.entries.checked_add(1).ok_or_else(|| {
+            NativeInputFailure::raise(ACTION_CAPTURE_BOUND_EXCEEDED, "native source entry bound exceeded")
+        })?;
+        let path_bytes = self.path_bytes.checked_add(path.len()).ok_or_else(|| {
+            NativeInputFailure::raise(ACTION_CAPTURE_BOUND_EXCEEDED, "native source path-byte bound exceeded")
+        })?;
         if entries > self.limits.entries {
-            return Err(RailError::message("native source entry bound exceeded"));
+            return Err(NativeInputFailure::raise(
+                ACTION_CAPTURE_BOUND_EXCEEDED,
+                "native source entry bound exceeded",
+            ));
         }
         if path_bytes > self.limits.path_bytes {
-            return Err(RailError::message("native source path-byte bound exceeded"));
+            return Err(NativeInputFailure::raise(
+                ACTION_CAPTURE_BOUND_EXCEEDED,
+                "native source path-byte bound exceeded",
+            ));
         }
         self.entries = entries;
         self.path_bytes = path_bytes;
@@ -4311,12 +4535,14 @@ impl NativeCaptureBudget {
     }
 
     fn account_hashed_bytes(&mut self, bytes: u64) -> RailResult<()> {
-        let bytes_hashed = self
-            .bytes_hashed
-            .checked_add(bytes)
-            .ok_or_else(|| RailError::message("native source byte bound exceeded"))?;
+        let bytes_hashed = self.bytes_hashed.checked_add(bytes).ok_or_else(|| {
+            NativeInputFailure::raise(ACTION_CAPTURE_BOUND_EXCEEDED, "native source byte bound exceeded")
+        })?;
         if bytes_hashed > self.limits.bytes_hashed {
-            return Err(RailError::message("native source byte bound exceeded"));
+            return Err(NativeInputFailure::raise(
+                ACTION_CAPTURE_BOUND_EXCEEDED,
+                "native source byte bound exceeded",
+            ));
         }
         self.bytes_hashed = bytes_hashed;
         Ok(())
@@ -4324,23 +4550,35 @@ impl NativeCaptureBudget {
 
     fn check(&self, depth: usize, elapsed: Duration) -> RailResult<()> {
         if depth > self.limits.depth {
-            return Err(RailError::message("native source depth bound exceeded"));
+            return Err(NativeInputFailure::raise(
+                ACTION_CAPTURE_BOUND_EXCEEDED,
+                "native source depth bound exceeded",
+            ));
         }
         if self.bytes_hashed > self.limits.bytes_hashed {
-            return Err(RailError::message("native source byte bound exceeded"));
+            return Err(NativeInputFailure::raise(
+                ACTION_CAPTURE_BOUND_EXCEEDED,
+                "native source byte bound exceeded",
+            ));
         }
         if self.limits.elapsed.is_some_and(|limit| elapsed > limit) {
-            return Err(RailError::message("native source capture time bound exceeded"));
+            return Err(NativeInputFailure::raise(
+                ACTION_CAPTURE_BOUND_EXCEEDED,
+                "native source capture time bound exceeded",
+            ));
         }
         Ok(())
     }
 }
 
+/// Capture every entry of one namespace that the action binds whole. `entry_reason` names the bypass when
+/// the namespace holds an entry that the capture cannot bind, such as a symbolic link.
 fn capture_native_source_namespace(
     namespace: &Path,
     required_file: Option<&Path>,
     excluded_roots: &[PathBuf],
     source_root: &Path,
+    entry_reason: &'static str,
     started: Instant,
     budget: &mut NativeCaptureBudget,
 ) -> RailResult<(NativeSourceState, NativeCaptureGuard)> {
@@ -4417,20 +4655,26 @@ fn capture_native_source_namespace(
             let absolute = namespace.join(&child);
             let metadata = fs::symlink_metadata(&absolute)?;
             if crate::utils::is_symlink_or_reparse(&metadata) {
-                return Err(RailError::message(format!(
-                    "native source namespace contains a symlink or reparse point at '{}'",
-                    absolute.display()
-                )));
+                return Err(NativeInputFailure::raise(
+                    entry_reason,
+                    format!(
+                        "native source namespace contains a symlink or reparse point at '{}'",
+                        absolute.display()
+                    ),
+                ));
             }
             if metadata.is_dir() {
                 pending.push((child, child_depth));
                 continue;
             }
             if !metadata.is_file() {
-                return Err(RailError::message(format!(
-                    "native source namespace contains an unsupported entry at '{}'",
-                    absolute.display()
-                )));
+                return Err(NativeInputFailure::raise(
+                    entry_reason,
+                    format!(
+                        "native source namespace contains an unsupported entry at '{}'",
+                        absolute.display()
+                    ),
+                ));
             }
             let mode = semantic_mode(&metadata);
             let generation = memo.and_then(|_| crate::utils::stable_metadata_generation(&metadata));
@@ -4525,119 +4769,30 @@ fn capture_native_generated_namespace_from(
         Err(error) => return Err(error.into()),
     };
     if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
-        return Err(RailError::message("native compiler OUT_DIR is not a real directory"));
+        return Err(NativeInputFailure::raise(
+            GENERATED_NAMESPACE_ENTRY_UNSUPPORTED,
+            format!(
+                "native compiler OUT_DIR '{}' is not a real directory",
+                root_spelling.display()
+            ),
+        ));
     }
     let root = crate::utils::canonicalize_existing(&root_spelling)?;
-    let (state, guard) = capture_native_source_namespace(&root, None, excluded_roots, source_root, started, budget)?;
+    let (state, guard) = capture_native_source_namespace(
+        &root,
+        None,
+        excluded_roots,
+        source_root,
+        GENERATED_NAMESPACE_ENTRY_UNSUPPORTED,
+        started,
+        budget,
+    )?;
     Ok(Some(NativeNamespaceCapture {
         root,
         root_spelling,
         state,
         guard,
     }))
-}
-
-fn capture_native_search_namespaces(
-    arguments: &[String],
-    generated: Option<&NativeNamespaceCapture>,
-    source_root: &Path,
-    started: Instant,
-    budget: &mut NativeCaptureBudget,
-) -> RailResult<(Vec<NativeNamespaceCapture>, Vec<NativeMissingSearchCapture>)> {
-    let current_directory = std::env::current_dir()?;
-    let mut captures = Vec::<NativeNamespaceCapture>::new();
-    let mut missing = Vec::<NativeMissingSearchCapture>::new();
-    let paths = native_search_paths(arguments, &current_directory, source_root)?;
-    if paths.is_empty()
-        && arguments
-            .iter()
-            .any(|argument| argument == "-l" || argument.starts_with("-l"))
-    {
-        return Err(RailError::message(
-            "native static library has no captured search namespace",
-        ));
-    }
-    for spelling in paths {
-        let metadata = match fs::symlink_metadata(&spelling) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if !missing.iter().any(|captured| captured.spelling == spelling) {
-                    budget.account_entry(&spelling.to_string_lossy())?;
-                    budget.check(0, started.elapsed())?;
-                    missing.push(capture_missing_native_search(&spelling)?);
-                }
-                continue;
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
-            return Err(RailError::message(
-                "native compiler library search namespace is not a real directory",
-            ));
-        }
-        let root = crate::utils::canonicalize_existing(&spelling)?;
-        if generated.is_some_and(|generated| generated.root == root)
-            || captures.iter().any(|captured| captured.root == root)
-        {
-            continue;
-        }
-        let (state, guard) = capture_native_source_namespace(&root, None, &[], source_root, started, budget)?;
-        captures.push(NativeNamespaceCapture {
-            root,
-            root_spelling: spelling,
-            state,
-            guard,
-        });
-    }
-    Ok((captures, missing))
-}
-
-fn capture_missing_native_search(spelling: &Path) -> RailResult<NativeMissingSearchCapture> {
-    if !spelling.is_absolute()
-        || spelling
-            .components()
-            .any(|part| matches!(part, std::path::Component::ParentDir))
-    {
-        return Err(RailError::message(
-            "missing native search path is not absolute and normalized",
-        ));
-    }
-    let mut ancestor = spelling
-        .parent()
-        .ok_or_else(|| RailError::message("missing native search has no parent"))?;
-    let metadata = loop {
-        match fs::symlink_metadata(ancestor) {
-            Ok(metadata) => break metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                ancestor = ancestor
-                    .parent()
-                    .ok_or_else(|| RailError::message("missing native search has no existing ancestor"))?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    };
-    // The nearest existing parent witnesses creation/removal during compilation.
-    // Aliased parents need a separate selection witness; canonical bytes alone
-    // cannot detect a changed-and-restored intermediate symlink.
-    if !metadata.is_dir()
-        || crate::utils::is_symlink_or_reparse(&metadata)
-        || crate::utils::canonicalize_existing(ancestor)? != ancestor
-    {
-        return Err(RailError::message(
-            "missing native search ancestor is not a canonical real directory",
-        ));
-    }
-    let captured = NativeMissingSearchCapture {
-        spelling: spelling.to_path_buf(),
-        ancestor: ancestor.to_path_buf(),
-        guard: native_metadata_guard(ancestor, &metadata)?,
-    };
-    if !fs::symlink_metadata(spelling).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-        || native_metadata_guard(ancestor, &fs::symlink_metadata(ancestor)?)? != captured.guard
-    {
-        return Err(RailError::message("missing native search changed during capture"));
-    }
-    Ok(captured)
 }
 
 fn capture_pathless_extern_searches(
@@ -4812,6 +4967,18 @@ fn pathless_proc_macro_candidate_name(name: &str) -> bool {
         )
 }
 
+/// Whether the arguments name a native search directory: `-L native=`, `-L all=`, or a bare `-L`. Distributed
+/// and root-portable reuse do not model these directories, so an action that names one stays local.
+fn names_native_search_directory(arguments: &[String]) -> bool {
+    compiler_library_search_values(arguments).map_or(true, |values| {
+        values
+            .iter()
+            .any(|value| native_search_path(value).map_or(true, |path| path.is_some()))
+    })
+}
+
+/// The action's native search directories in argument order: the directories rustc searches for a native
+/// library itself, with relative and repository paths resolved.
 fn native_search_paths(arguments: &[String], current_directory: &Path, source_root: &Path) -> RailResult<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for value in compiler_library_search_values(arguments)? {
@@ -5452,16 +5619,16 @@ impl NativeCacheContext {
         let receipt = bench_phase("installation_load", || {
             crate::cache::installation::load_for_wrapper(invoked, &source_root)
         })
-        .map_err(|_| "native_cache_installation_unavailable")?;
+        .map_err(|error| early_bypass("cache installation", &error, "native_cache_installation_unavailable"))?;
         let local_cas = bench_phase("local_cache_open", || {
             LocalCas::open_initialized_selected(receipt.cache().map_err(|_| RailError::message("local cache"))?)
         })
-        .map_err(|_| "local_cache_unavailable")?;
+        .map_err(|error| early_bypass("local cache", &error, "local_cache_unavailable"))?;
         crate::cache::digest_memo::activate(local_cas.root());
         let (session, session_inputs) = bench_phase("native_session_load", || {
             installed_native_session(&receipt, &source_root, &target_root_authority, rustc_program)
         })
-        .map_err(|_| "native_cache_session_unavailable")?;
+        .map_err(|error| early_bypass("native compiler session", &error, "native_cache_session_unavailable"))?;
         let runtime = private_command_directory().map_err(|_| "native_cache_runtime_unavailable")?;
         let remote = crate::remote_cache::RemoteCacheSelection::from_environment_or_installed(receipt.remote())
             .ok()
@@ -5474,6 +5641,7 @@ impl NativeCacheContext {
             source_root,
             source_root_spelling,
             output_parent_authority: Some(output_parent_authority),
+            target_root: Some(target_root_authority),
             observation_directory: runtime.path().to_path_buf(),
             local_cas: Some(local_cas),
             remote,
@@ -5649,7 +5817,9 @@ fn installed_native_session(
         Ok(session.filter(|(session, _)| session.root_portability == receipt.root_portability()))
     }
 
-    if let Some(session) = load(receipt, source_root, target_root, rustc_program)? {
+    // A concurrent wrapper can replace the memo during this unlocked read. Every writer
+    // holds the session lock, so a failed read retries under it.
+    if let Ok(Some(session)) = load(receipt, source_root, target_root, rustc_program) {
         return Ok(session);
     }
     let _lock = crate::cache::installation::lock_session(receipt)?;
@@ -5875,6 +6045,9 @@ pub(crate) struct NativeCompilerValidation {
     /// Repository paths that loaded procedural macros read, with their captured states.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     macro_inputs: Vec<macro_inputs::MacroPathInput>,
+    /// Native-library searches that rustc performed itself, with each candidate's captured state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    native_libraries: Vec<native_libraries::NativeLibraryInput>,
 }
 
 impl NativeCompilerValidation {
@@ -5898,7 +6071,7 @@ impl NativeCompilerValidation {
             stderr_bytes,
         } = descriptor;
         let validation = Self {
-            version: 19,
+            version: 20,
             action_key,
             result_key,
             session_identity: session.identity.clone(),
@@ -5920,6 +6093,7 @@ impl NativeCompilerValidation {
             stderr_bytes,
             diagnostic_width_bound: capture.diagnostic_width.is_some(),
             macro_inputs: capture.macro_inputs.clone(),
+            native_libraries: capture.native_libraries.clone(),
         };
         validation.validate_object()?;
         Ok(validation)
@@ -5968,6 +6142,7 @@ impl NativeCompilerValidation {
             Some(&self.witness.rust_inputs),
             diagnostic_width.as_ref(),
             &self.macro_inputs,
+            &self.native_libraries,
         )?;
         let selected_action = if linked_observation(&self.observation) {
             witnessed_action_key(&pre_link_action, &self.witness)?
@@ -5989,6 +6164,11 @@ impl NativeCompilerValidation {
         selector.rust_inputs = self.witness.rust_inputs.selector().clone();
         selector.diagnostic_width = self.diagnostic_width_bound;
         selector.macro_paths = self.macro_inputs.iter().map(|input| input.selector()).collect();
+        selector.native_libraries = self
+            .native_libraries
+            .iter()
+            .map(|input| input.selector().clone())
+            .collect();
         selector.validate()?;
         Ok(selector)
     }
@@ -6089,12 +6269,13 @@ impl NativeCompilerValidation {
     }
 
     pub(crate) fn validate_object(&self) -> RailResult<()> {
-        if self.version != 19 {
+        if self.version != 20 {
             return Err(RailError::message(
                 "native compiler observation has an incompatible schema",
             ));
         }
         macro_inputs::validate_inputs(&self.macro_inputs)?;
+        native_libraries::validate_inputs(&self.native_libraries)?;
         validate_identity(&self.action_key, ACTION_KEY_PREFIX)?;
         validate_identity(&self.result_key, RESULT_KEY_PREFIX)?;
         for digest in [&self.session_identity, &self.stdout_digest, &self.stderr_digest] {
@@ -6237,12 +6418,13 @@ impl NativeCompilerValidation {
 
 impl NativePublicationProof {
     fn validate_object(&self) -> RailResult<()> {
-        if self.version != 8 {
+        if self.version != 9 {
             return Err(RailError::message(
                 "native publication proof has an incompatible schema",
             ));
         }
         macro_inputs::validate_selectors(&self.macro_paths)?;
+        native_libraries::validate_selectors(&self.native_libraries)?;
         validate_native_source_state(&self.source_state)?;
         match (&self.source_state.root, &self.package_binding) {
             (ObservationPath::Repository(_), None) => {}
@@ -6411,6 +6593,7 @@ fn action_key(
         capture.rust_inputs.as_ref().map(RustInputCapture::witness),
         capture.diagnostic_width.as_ref(),
         &capture.macro_inputs,
+        &capture.native_libraries,
     )
 }
 
@@ -6487,6 +6670,7 @@ fn action_key_from_base(
     rust_inputs: Option<&RustInputWitness>,
     diagnostic_width: Option<&Option<String>>,
     macro_inputs: &[macro_inputs::MacroPathInput],
+    native_libraries: &[native_libraries::NativeLibraryInput],
 ) -> RailResult<String> {
     validate_identity(base_action, BASE_ACTION_KEY_PREFIX)?;
     approved_environment.validate_object()?;
@@ -6499,7 +6683,7 @@ fn action_key_from_base(
     let rust_inputs = serde_json::to_vec(&rust_inputs)?;
     // The base action omits the width; rendered diagnostics alone make it an input.
     let diagnostic_width = serde_json::to_vec(&diagnostic_width)?;
-    let version = 17_u32.to_le_bytes();
+    let version = 18_u32.to_le_bytes();
     let unconditional: [(&[u8], &[u8]); 6] = [
         (b"version", &version),
         (b"base-action", base_action.as_bytes()),
@@ -6516,6 +6700,14 @@ fn action_key_from_base(
         .transpose()?;
     if let Some(macro_inputs) = &macro_inputs {
         frames.push((b"procedural-macro-inputs", macro_inputs));
+    }
+    // Only actions in which rustc searches for a native library itself bind its candidates.
+    native_libraries::validate_inputs(native_libraries)?;
+    let native_libraries = (!native_libraries.is_empty())
+        .then(|| serde_json::to_vec(native_libraries))
+        .transpose()?;
+    if let Some(native_libraries) = &native_libraries {
+        frames.push((b"native-library-inputs", native_libraries));
     }
     Ok(sha256_identity(
         ACTION_KEY_PREFIX,
@@ -6566,13 +6758,6 @@ fn base_action_key(
     ))?;
     let source_state = serde_json::to_vec(&capture.portable_source_state()?)?;
     let generated_state = serde_json::to_vec(&capture.portable_generated_state())?;
-    let native_search_states = serde_json::to_vec(
-        &capture
-            .native_searches
-            .iter()
-            .map(|captured| &captured.state)
-            .collect::<Vec<_>>(),
-    )?;
     let pathless_extern_search_states = serde_json::to_vec(
         &capture
             .pathless_extern_searches
@@ -6581,8 +6766,10 @@ fn base_action_key(
             .collect::<Vec<_>>(),
     )?;
     let compilation_root = capture.compilation_root_identity(observation)?;
-    let version = 12_u32.to_le_bytes();
-    let rustc_frames: [(&[u8], &[u8]); 10] = [
+    // Native search directories bind through their spellings in the arguments and the libraries rustc
+    // selects from them; see `native_libraries`.
+    let version = 13_u32.to_le_bytes();
+    let rustc_frames: [(&[u8], &[u8]); 9] = [
         (b"version", &version),
         (b"session", session_identity.as_bytes()),
         (b"target-toolchain", &toolchain_identity),
@@ -6591,7 +6778,6 @@ fn base_action_key(
         (b"pre-execution", &pre_execution),
         (b"source-state", &source_state),
         (b"generated-state", &generated_state),
-        (b"native-search-states", &native_search_states),
         (b"pathless-extern-search-states", &pathless_extern_search_states),
     ];
     let mut frames = rustc_frames.to_vec();
@@ -6856,8 +7042,8 @@ fn distributed_rust_library_authority_with_remap(
         || !observation.environment_reads.is_empty()
         || !observation.bypasses.is_empty()
         || capture.generated.is_some()
-        || !capture.native_searches.is_empty()
-        || !capture.missing_native_searches.is_empty()
+        || names_native_search_directory(&observation.compiler_arguments)
+        || !capture.native_libraries.is_empty()
         || !capture.pathless_extern_searches.is_empty()
             && !(crate_type == "proc-macro" && pathless_extern_names(&observation.compiler_arguments) == ["proc_macro"])
         || !capture.approved_environment.entries.is_empty()
@@ -7161,6 +7347,7 @@ fn distributed_dependency_inputs(
                     .ok_or("distributed_output_contract_ineligible")?
                     .join(relative),
                 rust_inputs::RustInputPath::HostToolchain(_) | rust_inputs::RustInputPath::TargetLibrary(_) => continue,
+                rust_inputs::RustInputPath::Host(_) => return Err("distributed_rust_inputs_require_local_execution"),
             };
             if dependencies.iter().any(|dependency| dependency.path == path) {
                 continue;
@@ -8766,7 +8953,7 @@ fn witness_dependency_names(observation: &RawCompilerInvocation) -> Option<Vec<S
 }
 
 fn native_library_bypass_reason(value: &str) -> &'static str {
-    if value.starts_with("dylib=") || value.starts_with("framework=") {
+    if value.starts_with("framework=") || value.starts_with("framework:") {
         "dynamic_native_library_search_evidence_unavailable"
     } else {
         "native_library_input_evidence_unavailable"
@@ -8788,16 +8975,19 @@ fn supported_library_search(value: &str) -> bool {
     native_search_path(value).is_ok_and(|path| path.is_some())
 }
 
+/// Static and dynamic libraries bind through what selects them: the compiler driver reports each search that
+/// rustc performs itself, and the linker witness binds the searches of a linked action. A dynamic library
+/// on an action that does not link is only named in its metadata. Frameworks and other kinds stay unmodeled.
 fn supported_native_library(value: &str) -> bool {
-    let Some((kind, name)) = value.split_once('=') else {
-        return false;
-    };
-    !name.is_empty()
-        && !name.as_bytes().contains(&0)
-        && (kind == "static"
+    let (kind, name) = value.split_once('=').unwrap_or(("dylib", value));
+    let kind_supported = |base: &str| {
+        kind == base
             || kind
-                .strip_prefix("static:")
-                .is_some_and(|modifiers| !modifiers.is_empty() && !modifiers.as_bytes().contains(&0)))
+                .strip_prefix(base)
+                .and_then(|modifiers| modifiers.strip_prefix(':'))
+                .is_some_and(|modifiers| !modifiers.is_empty() && !modifiers.as_bytes().contains(&0))
+    };
+    !name.is_empty() && !name.as_bytes().contains(&0) && (kind_supported("static") || kind_supported("dylib"))
 }
 
 fn supported_unstable_option(option: &str) -> bool {
@@ -9495,6 +9685,9 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
             .select_repository_inputs(source_root, &dynamic_selector.repository_paths)
             .and_then(|()| capture.select_rust_inputs(observation, source_root, &dynamic_selector.rust_inputs))
             .and_then(|()| capture.select_macro_inputs(source_root, &dynamic_selector.macro_paths))
+            .and_then(|()| {
+                capture.select_native_libraries(observation, source_root, &dynamic_selector.native_libraries)
+            })
     })
     .inspect_err(|error| report_native_action_diagnostic("compiler dynamic input selection", error))
     {
@@ -9786,6 +9979,7 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
                         .parent()
                         .is_some_and(|directory| candidate.has_dependency_input(&directory.join(path))),
                     rust_inputs::RustInputPath::HostToolchain(_) | rust_inputs::RustInputPath::TargetLibrary(_) => true,
+                    rust_inputs::RustInputPath::Host(_) => false,
                 })
             }) {
                 return crate::compiler::distributed::LocalAttemptDecision::Fallback(
@@ -10102,7 +10296,7 @@ fn root_portable_action_class(
     if capture.generated.is_some() {
         return Err("root_portability_generated_source_unmodeled");
     }
-    if !capture.native_searches.is_empty() || !capture.missing_native_searches.is_empty() {
+    if names_native_search_directory(&authority.compiler_arguments) || !capture.native_libraries.is_empty() {
         return Err("root_portability_native_search_unmodeled");
     }
     if !capture.pathless_extern_searches.is_empty() {
@@ -12917,10 +13111,32 @@ fn native_unix_nanos() -> u128 {
         .map_or(0, |duration| duration.as_nanos())
 }
 
+/// Why the current invocation did not reuse a result, kept for the cache report. One wrapper process serves
+/// one compiler invocation, so the outcome that the process records next takes it.
+static OUTCOME_DETAIL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn note_outcome_detail(detail: String) {
+    *OUTCOME_DETAIL.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(detail);
+}
+
+pub(crate) fn take_outcome_detail() -> Option<String> {
+    OUTCOME_DETAIL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
 fn report_native_action_diagnostic(operation: &str, error: &RailError) {
+    note_outcome_detail(format!("{operation}: {error}"));
     if BENCH_COVERAGE_DIRECTORY.get().is_some() {
         eprintln!("cargo-rail native coverage: {operation} unavailable: {error}");
     }
+}
+
+/// Keep the error behind a bypass that occurs before the cache context exists.
+fn early_bypass(operation: &str, error: &RailError, reason: &'static str) -> &'static str {
+    report_native_action_diagnostic(operation, error);
+    reason
 }
 
 fn validated_output_parent(outputs: &NativeOutputPaths, source_root: &Path) -> RailResult<PathBuf> {
@@ -16767,6 +16983,7 @@ impl NativeCompilerExecution {
         (
             RustInputCapture,
             Option<crate::compiler::native_input_protocol::NativeMacroObservation>,
+            Vec<crate::compiler::native_input_protocol::NativeLibrarySearch>,
         ),
         NativeInputFailure,
     > {
@@ -16828,7 +17045,7 @@ impl NativeCompilerExecution {
             ));
         }
         let inputs = self.inputs.complete(&observation).map_err(failure)?;
-        Ok((inputs, observation.macros))
+        Ok((inputs, observation.macros, observation.native_libraries))
     }
 }
 
@@ -16848,6 +17065,8 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
     };
     let source_root = &cache_context.source_root;
     let source_root_spelling = &cache_context.source_root_spelling;
+    // Inputs captured after the compiler exits must predate this mark.
+    let execution_mark = crate::utils::ChangeMark::now();
     let native_execution = bench_phase("native_execution_prepare", || {
         NativeCompilerExecution::prepare(
             &mut command,
@@ -16857,6 +17076,7 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
             cache_context,
         )
     });
+    execution_mark.separate();
     let compiler_started = Instant::now();
     let output = match run_compiler_with_live_streams(command) {
         Ok(output) => output,
@@ -16903,34 +17123,35 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
         ));
         return status.code().unwrap_or(1);
     }
-    let macro_observation = match native_execution.and_then(NativeCompilerExecution::complete) {
-        Ok((inputs, macros)) => {
-            capture.bytes_hashed = capture
-                .bytes_hashed
-                .saturating_sub(capture.rust_inputs.as_ref().map_or(0, RustInputCapture::bytes_hashed))
-                .saturating_add(inputs.bytes_hashed());
-            capture.rust_inputs = Some(inputs);
-            macros
-        }
-        Err(error) => {
-            report_native_action_diagnostic(
-                &format!(
-                    "compiler input witness for {}",
-                    raw.crate_name.as_deref().unwrap_or("unknown crate")
-                ),
-                &error.error,
-            );
-            drop(publish_and_record_cold_observation(
-                &mut raw,
-                error.reason,
-                None,
-                None,
-                capture.bytes_hashed,
-                cache_bytes_read,
-            ));
-            return status.code().unwrap_or(1);
-        }
-    };
+    let (macro_observation, native_library_searches) =
+        match native_execution.and_then(NativeCompilerExecution::complete) {
+            Ok((inputs, macros, native_libraries)) => {
+                capture.bytes_hashed = capture
+                    .bytes_hashed
+                    .saturating_sub(capture.rust_inputs.as_ref().map_or(0, RustInputCapture::bytes_hashed))
+                    .saturating_add(inputs.bytes_hashed());
+                capture.rust_inputs = Some(inputs);
+                (macros, native_libraries)
+            }
+            Err(error) => {
+                report_native_action_diagnostic(
+                    &format!(
+                        "compiler input witness for {}",
+                        raw.crate_name.as_deref().unwrap_or("unknown crate")
+                    ),
+                    &error.error,
+                );
+                drop(publish_and_record_cold_observation(
+                    &mut raw,
+                    error.reason,
+                    None,
+                    None,
+                    capture.bytes_hashed,
+                    cache_bytes_read,
+                ));
+                return status.code().unwrap_or(1);
+            }
+        };
     // Macro variable reads bind as compiler environment reads; macro path reads bind below.
     let mut macro_paths = Vec::new();
     if let Some(macros) = &macro_observation {
@@ -16939,7 +17160,10 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
             .chain(generated)
             .collect::<Vec<_>>();
         let selected = match macro_inputs::bypass_reason(macros) {
-            Some(reason) => Err(reason),
+            Some(reason) => {
+                note_outcome_detail(macro_inputs::bypass_detail(macros));
+                Err(reason)
+            }
             None => macro_inputs::path_selectors(macros, source_root, source_root_spelling, &captured),
         };
         match selected {
@@ -16995,6 +17219,32 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
         ));
         return status.code().unwrap_or(1);
     }
+    // Each native library that rustc searched for binds the candidates it tested, as they are now and as
+    // rustc found them.
+    let native_library_selectors = match std::env::current_dir()
+        .map_err(RailError::from)
+        .and_then(|current| native_search_paths(&raw.compiler_arguments, &current, source_root))
+        .and_then(|directories| native_libraries::selectors(&native_library_searches, &directories))
+        .and_then(|selectors| {
+            capture.select_native_libraries(&raw, source_root, &selectors)?;
+            native_libraries::verify_observed(&capture.native_libraries, &native_library_searches)?;
+            Ok(selectors)
+        }) {
+        Ok(selectors) => selectors,
+        Err(error) => {
+            report_native_action_diagnostic("native library capture", &error);
+            let bytes_hashed = cold_input_bytes(&raw, source_root, 0);
+            drop(publish_and_record_cold_observation(
+                &mut raw,
+                "native_library_capture_unavailable",
+                None,
+                None,
+                bytes_hashed,
+                cache_bytes_read,
+            ));
+            return status.code().unwrap_or(1);
+        }
+    };
     let mut dynamic_selector = match dynamic_input_selector_from_observation(&raw, &capture, source_root) {
         Ok(selector) => selector,
         Err(error) => {
@@ -17017,6 +17267,7 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
         .map(|inputs| inputs.witness().selector().clone())
         .unwrap_or_default();
     dynamic_selector.macro_paths = macro_paths;
+    dynamic_selector.native_libraries = native_library_selectors;
     capture = match capture
         .select_repository_inputs(source_root, &dynamic_selector.repository_paths)
         .and_then(|()| capture.select_macro_inputs(source_root, &dynamic_selector.macro_paths))
@@ -17167,6 +17418,44 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
             return status.code().unwrap_or(1);
         }
     };
+    let unchanged = post_execution_paths(&raw, &capture, &witness, source_root)
+        .and_then(|paths| verify_unchanged_since(execution_mark, cache_context.target_root.as_deref(), paths));
+    if let Err(error) = unchanged {
+        report_native_action_diagnostic("post-execution input", &error);
+        let bytes_hashed = cold_input_bytes(
+            &raw,
+            source_root,
+            selected_environment_bytes.saturating_add(link_witness_bytes),
+        );
+        drop(publish_and_record_cold_observation(
+            &mut raw,
+            "cold_input_changed_during_execution",
+            link_candidate,
+            None,
+            bytes_hashed,
+            cache_bytes_read,
+        ));
+        return status.code().unwrap_or(1);
+    }
+    let reported = linked_direct_inputs(&raw, witness.target_format, &cache_context.observation_directory)
+        .and_then(|inputs| verify_linked_native_libraries(inputs, &raw, &capture, source_root));
+    if let Err(error) = reported {
+        report_native_action_diagnostic("linked native library", &error);
+        let bytes_hashed = cold_input_bytes(
+            &raw,
+            source_root,
+            selected_environment_bytes.saturating_add(link_witness_bytes),
+        );
+        drop(publish_and_record_cold_observation(
+            &mut raw,
+            "native_library_search_unreported",
+            link_candidate,
+            None,
+            bytes_hashed,
+            cache_bytes_read,
+        ));
+        return status.code().unwrap_or(1);
+    }
     let selected_action = match link_candidate.as_ref() {
         Some(_) => witnessed_action_key(&pre_link_action, &witness),
         None => Ok(pre_link_action),
@@ -17264,11 +17553,16 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
                         }
                     }
                 })
-                .map_err(|_| admission_failure)?;
+                .map_err(|error| {
+                    report_native_action_diagnostic("cold admission", &error);
+                    admission_failure
+                })?;
             if let Some(candidate) = link_candidate.as_deref() {
-                admission_failure = "link_candidate_publication_failed";
                 cas.publish_native_link_candidate(candidate, validation.action_key())
-                    .map_err(|_| admission_failure)?;
+                    .map_err(|error| {
+                        report_native_action_diagnostic("link candidate publication", &error);
+                        "link_candidate_publication_failed"
+                    })?;
             }
             Ok((validation, final_capture_bytes))
         })()
@@ -17317,11 +17611,13 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
                 benchmark_outputs.as_deref(),
             );
         }
-        Err(failure_reason) => {
-            let reason = initial.as_ref().map(CompilerCacheWrapperMetadata::reason).map_or_else(
-                || failure_reason.to_string(),
-                |reason| format!("{reason};{failure_reason}"),
-            );
+        Err(reason) => {
+            // The failure is the bypass reason. The outer wrapper's reason explains why the
+            // action ran, so it qualifies the detail instead of the counted reason.
+            if let Some(initial) = initial.as_ref() {
+                let detail = take_outcome_detail().unwrap_or_else(|| reason.to_string());
+                note_outcome_detail(format!("{detail} (after {})", initial.reason()));
+            }
             let bytes_hashed = cold_input_bytes(
                 &raw,
                 source_root,
@@ -17329,7 +17625,7 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
             );
             raw.cache_wrapper = Some(CompilerCacheWrapperMetadata::native(
                 CompilerCacheWrapperStatus::Bypassed,
-                &reason,
+                reason,
                 initial
                     .as_ref()
                     .and_then(CompilerCacheWrapperMetadata::action_key)
@@ -17340,7 +17636,7 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
             ));
             write_cache_event(
                 CompilerCacheWrapperStatus::Bypassed,
-                &reason,
+                reason,
                 initial.as_ref().and_then(CompilerCacheWrapperMetadata::action_key),
                 None,
                 None,
@@ -17895,7 +18191,7 @@ fn native_publication_proof(
         return Err("cold_inputs_changed_before_admission");
     }
     Ok(NativePublicationProof {
-        version: 8,
+        version: 9,
         source_state: initial_capture.source_state.clone(),
         package_binding: initial_capture.package_binding.clone(),
         approved_environment,
@@ -17916,6 +18212,11 @@ fn native_publication_proof(
             .macro_inputs
             .iter()
             .map(|input| input.selector())
+            .collect(),
+        native_libraries: initial_capture
+            .native_libraries
+            .iter()
+            .map(|input| input.selector().clone())
             .collect(),
     })
 }
@@ -18289,9 +18590,11 @@ fn write_cache_event(
             .map_or_else(crate::remote_cache::RemoteTransferMetrics::default, |store| {
                 store.metrics()
             });
+        let detail = (outcome == b'B').then(take_outcome_detail).flatten();
         crate::cache::report::record(
             outcome,
             reason,
+            detail.as_deref(),
             metrics.cache_bytes_read,
             remote.payload_bytes_read,
             remote.payload_bytes_written,
@@ -18737,7 +19040,7 @@ fn validate_benchmark_coverage_directory(directory: &Path) -> RailResult<()> {
 
 /// Record an operational wrapper failure after an installed context was authenticated.
 pub(crate) fn record_active_failure() {
-    crate::cache::report::record(b'F', "wrapper_failure", 0, 0, 0);
+    crate::cache::report::record(b'F', "wrapper_failure", None, 0, 0, 0);
     if let Some(receipt) = active_context().and_then(|context| context.installation.as_ref()) {
         drop(crate::cache::installation::record_usage(receipt, b'F', None));
     }
@@ -18797,6 +19100,7 @@ pub(crate) mod tests {
             &selector.repository_paths,
         )?;
         capture.select_rust_inputs(observation, source_root, &selector.rust_inputs)?;
+        capture.select_native_libraries(observation, source_root, &selector.native_libraries)?;
         Ok(capture)
     }
 
@@ -20690,6 +20994,7 @@ pub(crate) mod tests {
                 source_root: workspace_root.clone(),
                 source_root_spelling: workspace_root.clone(),
                 output_parent_authority: None,
+                target_root: None,
                 observation_directory: observations.path().to_path_buf(),
                 local_cas: Some(cas.clone()),
                 remote: None,
@@ -21025,8 +21330,6 @@ pub(crate) mod tests {
                 ],
             },
             generated: None,
-            native_searches: Vec::new(),
-            missing_native_searches: Vec::new(),
             pathless_extern_searches: Vec::new(),
             approved_environment: ApprovedEnvState {
                 version: 4,
@@ -21046,6 +21349,7 @@ pub(crate) mod tests {
             diagnostic_width: None,
             clippy: None,
             macro_inputs: Vec::new(),
+            native_libraries: Vec::new(),
             guard: NativeCaptureGuard { entries: Vec::new() },
             capture_entries: 0,
             capture_path_bytes: 0,
@@ -21950,43 +22254,336 @@ pub(crate) mod tests {
         observation
     }
 
-    fn native_static_observation(root: &Path, native_root: &Path) -> RawCompilerInvocation {
+    fn native_static_observation(root: &Path, native_roots: &[&Path]) -> RawCompilerInvocation {
         let mut observation = fixture_source_observation(root);
-        observation.compiler_arguments.extend([
-            "-L".to_string(),
-            format!("native={}", native_root.display()),
-            "-l".to_string(),
-            "static=fixture_native".to_string(),
-        ]);
+        for native_root in native_roots {
+            observation
+                .compiler_arguments
+                .extend(["-L".to_string(), format!("native={}", native_root.display())]);
+        }
+        observation
+            .compiler_arguments
+            .extend(["-l".to_string(), "static=fixture_native".to_string()]);
         observation
     }
 
+    /// The selector for rustc's search of each directory for `libfixture_native.a`.
+    fn fixture_native_selector(directories: u32) -> NativeDynamicInputSelector {
+        let mut selector = NativeDynamicInputSelector::new(Vec::new(), Vec::new()).expect("empty selector");
+        selector.native_libraries = vec![native_libraries::NativeLibrarySelector {
+            name: "fixture_native".into(),
+            form: crate::compiler::native_input_protocol::NativeLibraryForm::Static,
+            verbatim: false,
+            candidates: (0..directories)
+                .map(|directory| native_libraries::NativeLibraryCandidate {
+                    directory,
+                    file: "libfixture_native.a".into(),
+                })
+                .collect(),
+        }];
+        selector
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn native_search_namespace_content_is_part_of_the_action() {
-        let root = tempfile::tempdir().expect("source root");
-        fs::create_dir(root.path().join("src")).expect("source directory");
-        fs::write(root.path().join("src/lib.rs"), b"pub const VALUE: u8 = 1;\n").expect("source");
-        let native_root = root.path().join("target/native");
-        fs::create_dir_all(&native_root).expect("native directory");
-        let archive = native_root.join("libfixture_native.a");
+    fn native_library_candidates_bind_the_action_but_search_directory_content_does_not() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("source root");
+        let root = crate::utils::canonicalize_existing(temporary.path()).expect("canonical root");
+        fs::create_dir(root.join("src")).expect("source directory");
+        fs::write(root.join("src/lib.rs"), b"pub const VALUE: u8 = 1;\n").expect("source");
+        let early = root.join("native/early");
+        let selected = root.join("native/selected");
+        for directory in [&early, &selected] {
+            fs::create_dir_all(directory).expect("native directory");
+        }
+        let archive = selected.join("libfixture_native.a");
         fs::write(&archive, b"archive-one").expect("native archive");
+        // A system library directory: versioned shared-library links, a subdirectory, and unrelated files.
+        fs::write(selected.join("libunrelated.so.1.2"), b"shared").expect("shared library");
+        symlink("libunrelated.so.1.2", selected.join("libunrelated.so.1")).expect("soname link");
+        symlink("libunrelated.so.1", selected.join("libunrelated.so")).expect("development link");
+        fs::create_dir(selected.join("pkgconfig")).expect("subdirectory");
+        fs::write(selected.join("README"), b"unrelated").expect("unrelated file");
 
-        let observation = native_static_observation(root.path(), &native_root);
-        let session = graduated_session(path_identity(root.path()).expect("root identity"));
-        let selector = NativeDynamicInputSelector::new(Vec::new(), Vec::new()).expect("empty Rust selection");
-        let initial = capture_selected_inputs(&observation, root.path(), &selector, None).expect("initial capture");
-        assert_eq!(initial.native_searches.len(), 1);
-        let initial_action =
-            action_key(&session.identity, &session.class, &observation, &initial).expect("initial action");
-        let witness = initial.witness(&observation, root.path()).expect("complete witness");
+        let observation = native_static_observation(&root, &[&early, &selected]);
+        let session = graduated_session(path_identity(&root).expect("root identity"));
+        let selector = fixture_native_selector(2);
+        let key = |selector: &NativeDynamicInputSelector| {
+            let capture = capture_selected_inputs(&observation, &root, selector, None).expect("capture");
+            action_key(&session.identity, &session.class, &observation, &capture).expect("action")
+        };
+        let initial = capture_selected_inputs(&observation, &root, &selector, None).expect("initial capture");
+        let initial_action = key(&selector);
+        let witness = initial.witness(&observation, &root).expect("complete witness");
         assert!(initial.validates_witness(&witness, &observation));
+        initial
+            .revalidate_before_restore_commit(&observation, &root, &root)
+            .expect("unchanged capture");
 
-        fs::write(&archive, b"archive-two").expect("same-size native archive mutation");
-        let changed = capture_selected_inputs(&observation, root.path(), &selector, None).expect("changed capture");
+        // An action whose search selects no library binds only the directory spellings.
+        let unselected = NativeDynamicInputSelector::new(Vec::new(), Vec::new()).expect("empty selector");
+        let unselected_action = key(&unselected);
+        fs::write(selected.join("README"), b"changed unrelated").expect("unrelated change");
+        fs::remove_file(selected.join("libunrelated.so")).expect("remove link");
+        symlink("libunrelated.so.1.2", selected.join("libunrelated.so")).expect("retarget unrelated link");
+        fs::write(selected.join("pkgconfig/fixture.pc"), b"pkg").expect("subdirectory content");
+        assert_eq!(key(&selector), initial_action, "unrelated entries are not inputs");
+        assert_eq!(key(&unselected), unselected_action, "unrelated entries are not inputs");
+        initial
+            .revalidate_before_restore_commit(&observation, &root, &root)
+            .expect("unrelated entries do not invalidate a restore");
+
+        fs::write(&archive, b"archive-two").expect("same-size archive change");
         assert_ne!(
-            action_key(&session.identity, &session.class, &observation, &changed).expect("changed action"),
-            initial_action
+            key(&selector),
+            initial_action,
+            "the selected archive's bytes are inputs"
         );
+        initial
+            .revalidate_before_restore_commit(&observation, &root, &root)
+            .expect_err("a changed archive invalidates a restore");
+        fs::write(&archive, b"archive-one").expect("restore archive");
+        assert_eq!(key(&selector), initial_action);
+
+        fs::write(early.join("libfixture_native.a"), b"archive-one").expect("shadowing archive");
+        assert_ne!(
+            key(&selector),
+            initial_action,
+            "an earlier candidate shadows the selected archive"
+        );
+        initial
+            .revalidate_before_restore_commit(&observation, &root, &root)
+            .expect_err("a shadowing candidate invalidates a restore");
+        fs::remove_file(early.join("libfixture_native.a")).expect("remove shadow");
+        assert_eq!(key(&selector), initial_action);
+
+        // The selected path keeps its canonical target: a retargeted link with the same bytes misses.
+        let versions = root.join("native/versions");
+        fs::create_dir(&versions).expect("versions directory");
+        for version in ["one", "two"] {
+            fs::write(versions.join(version), b"archive-one").expect("archive version");
+        }
+        fs::remove_file(&archive).expect("replace archive");
+        symlink(versions.join("one"), &archive).expect("archive link");
+        let linked_action = key(&selector);
+        assert_ne!(linked_action, initial_action, "the canonical target is an input");
+        fs::remove_file(&archive).expect("retarget archive link");
+        symlink(versions.join("two"), &archive).expect("retargeted archive link");
+        assert_ne!(key(&selector), linked_action, "a retargeted link selects another file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_library_search_through_a_linked_or_missing_directory_binds_each_candidate() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("source root");
+        let root = crate::utils::canonicalize_existing(temporary.path()).expect("canonical root");
+        fs::create_dir(root.join("src")).expect("source directory");
+        fs::write(root.join("src/lib.rs"), b"pub const VALUE: u8 = 1;\n").expect("source");
+        let missing = root.join("native/absent/early");
+        let real = root.join("native/real");
+        fs::create_dir_all(&real).expect("real directory");
+        fs::write(real.join("libfixture_native.a"), b"archive").expect("archive");
+        // The `-L` directory itself is a link, as a system library directory often is.
+        let linked = root.join("native/linked");
+        symlink(&real, &linked).expect("linked directory");
+
+        let observation = native_static_observation(&root, &[&missing, &linked]);
+        let session = graduated_session(path_identity(&root).expect("root identity"));
+        let selector = fixture_native_selector(2);
+        let capture = capture_selected_inputs(&observation, &root, &selector, None).expect("linked capture");
+        let action = action_key(&session.identity, &session.class, &observation, &capture).expect("action");
+        capture
+            .revalidate_before_restore_commit(&observation, &root, &root)
+            .expect("unchanged capture");
+
+        fs::create_dir_all(&missing).expect("missing directory appears empty");
+        let recaptured = capture_selected_inputs(&observation, &root, &selector, None).expect("recapture");
+        assert_eq!(
+            action_key(&session.identity, &session.class, &observation, &recaptured).expect("action"),
+            action,
+            "an empty directory selects nothing"
+        );
+        fs::write(missing.join("libfixture_native.a"), b"archive").expect("earlier candidate appears");
+        capture
+            .revalidate_before_restore_commit(&observation, &root, &root)
+            .expect_err("an earlier candidate invalidates a restore");
+        fs::remove_dir_all(root.join("native/absent")).expect("restore absence");
+
+        let other = root.join("native/other");
+        fs::create_dir(&other).expect("other directory");
+        fs::write(other.join("libfixture_native.a"), b"archive").expect("same archive bytes");
+        fs::remove_file(&linked).expect("retarget directory link");
+        symlink(&other, &linked).expect("retargeted directory link");
+        let retargeted = capture_selected_inputs(&observation, &root, &selector, None).expect("retargeted");
+        assert_ne!(
+            action_key(&session.identity, &session.class, &observation, &retargeted).expect("action"),
+            action,
+            "the match keeps its canonical target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_reported_native_library_searches_map_to_the_action_search_directories() {
+        use crate::compiler::native_input_protocol::{NativeLibraryForm, NativeLibraryProbe, NativeLibrarySearch};
+
+        let temporary = tempfile::tempdir().expect("roots");
+        let root = crate::utils::canonicalize_existing(temporary.path()).expect("canonical root");
+        let real = root.join("real");
+        fs::create_dir(&real).expect("real directory");
+        std::os::unix::fs::symlink(&real, root.join("alias")).expect("root alias");
+        let directories = [root.join("early"), root.join("alias")];
+        let search = |directory: &Path, present| NativeLibrarySearch {
+            name: "fixture_native".into(),
+            form: NativeLibraryForm::Static,
+            verbatim: false,
+            probes: vec![
+                NativeLibraryProbe {
+                    directory: root.join("early").to_str().unwrap().into(),
+                    file: "libfixture_native.a".into(),
+                    present: false,
+                },
+                NativeLibraryProbe {
+                    directory: directory.to_str().unwrap().into(),
+                    file: "libfixture_native.a".into(),
+                    present,
+                },
+            ],
+        };
+        // Rustc spells the second directory canonically; the recorded arguments name it through an alias.
+        let selectors = native_libraries::selectors(&[search(&real, true)], &directories).expect("mapped search");
+        assert_eq!(selectors, fixture_native_selector(2).native_libraries);
+        // The selector is the search, not its result: a store keeps one selector per base action.
+        assert_eq!(
+            native_libraries::selectors(&[search(&real, false)], &directories).expect("search without a match"),
+            selectors
+        );
+        native_libraries::selectors(&[search(&root.join("elsewhere"), true)], &directories)
+            .expect_err("a directory the action does not name");
+
+        fs::write(real.join("libfixture_native.a"), b"archive").expect("archive");
+        let (inputs, _) = native_libraries::capture(&selectors, &directories).expect("capture");
+        native_libraries::verify_observed(&inputs, &[search(&real, true)]).expect("as rustc found it");
+        native_libraries::verify_observed(&inputs, &[search(&real, false)])
+            .expect_err("a candidate that appeared while rustc searched");
+    }
+
+    #[test]
+    fn linked_files_from_native_search_directories_need_a_reported_search() {
+        let native = PathBuf::from("/native");
+        let directories = BTreeSet::from([native.clone()]);
+        let reported = native.join("libreported.a");
+        let argument = native.join("extra.o");
+        let unreported = native.join("libunreported.a");
+        let elsewhere = PathBuf::from("/deps/libdependency.rlib");
+        let selected = BTreeSet::from([reported.clone()]);
+        let named = BTreeSet::from([argument.clone()]);
+        let check = |inputs: &[PathBuf]| unselected_native_input(inputs, &directories, &selected, &named).cloned();
+
+        assert_eq!(
+            check(&[reported.clone(), argument, elsewhere.clone()]),
+            None,
+            "a reported library, a named link argument, and a file outside the native search directories"
+        );
+        assert_eq!(
+            check(&[reported, unreported.clone(), elsewhere]),
+            Some(unreported),
+            "rustc resolved a library that no reported search selected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inputs_bound_after_execution_must_predate_the_compiler() {
+        use crate::utils::ChangeMark;
+
+        let temporary = tempfile::tempdir().expect("root");
+        let root = crate::utils::canonicalize_existing(temporary.path()).expect("canonical root");
+        let library = root.join("libfixture.so.1");
+        fs::write(&library, b"original").expect("library");
+        let link = root.join("libfixture.so");
+        std::os::unix::fs::symlink("libfixture.so.1", &link).expect("link");
+        let search = root.join("search");
+        fs::create_dir(&search).expect("search directory");
+        // A candidate below a missing directory binds the nearest directory that exists.
+        let absent = search.join("missing/libabsent.a");
+        let inputs = || {
+            vec![
+                PostExecutionPath::Present(link.clone()),
+                PostExecutionPath::Absent(absent.clone()),
+            ]
+        };
+        let compiler_started = || {
+            let mark = ChangeMark::now();
+            mark.separate();
+            mark
+        };
+
+        verify_unchanged_since(compiler_started(), None, inputs()).expect("inputs that predate the compiler");
+
+        let started = compiler_started();
+        fs::write(&library, b"changed").expect("change");
+        fs::write(&library, b"original").expect("restore");
+        verify_unchanged_since(started, None, inputs()).expect_err("a library changed and restored through its link");
+
+        let started = compiler_started();
+        fs::remove_file(&link).expect("unlink");
+        std::os::unix::fs::symlink("elsewhere", &link).expect("retarget");
+        fs::remove_file(&link).expect("unlink again");
+        std::os::unix::fs::symlink("libfixture.so.1", &link).expect("restore link");
+        verify_unchanged_since(started, None, inputs()).expect_err("a link retargeted and restored");
+
+        let started = compiler_started();
+        fs::create_dir(search.join("missing")).expect("appear");
+        fs::remove_dir(search.join("missing")).expect("disappear");
+        verify_unchanged_since(started, None, inputs())
+            .expect_err("a candidate directory that appeared and disappeared");
+        // Cargo and rustc write in the target directory throughout a build; an absence there is not checked.
+        verify_unchanged_since(started, Some(&search), [PostExecutionPath::Absent(absent.clone())])
+            .expect("an absence inside the target directory");
+
+        verify_unchanged_since(compiler_started(), None, inputs()).expect("inputs unchanged since this start");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verbatim_native_library_paths_bind_the_candidate_rustc_joins() {
+        use crate::compiler::native_input_protocol::{NativeLibraryForm, NativeLibraryProbe, NativeLibrarySearch};
+
+        let temporary = tempfile::tempdir().expect("root");
+        let root = crate::utils::canonicalize_existing(temporary.path()).expect("canonical root");
+        let directories = [root.join("first"), root.join("second")];
+        let search = |name: &str, present: [bool; 2]| NativeLibrarySearch {
+            name: name.into(),
+            form: NativeLibraryForm::Static,
+            verbatim: true,
+            probes: directories
+                .iter()
+                .zip(present)
+                .map(|(directory, present)| NativeLibraryProbe {
+                    directory: directory.to_str().unwrap().into(),
+                    file: name.into(),
+                    present,
+                })
+                .collect(),
+        };
+        // An absolute name replaces each directory, as the MSVC linker directive `/defaultlib:msvcrt` does.
+        let directive = format!("{}/defaultlib:fixture", root.display());
+        let nested = "nested/libfixture.a";
+        fs::create_dir_all(directories[1].join("nested")).expect("nested directory");
+        fs::write(directories[1].join(nested), b"archive").expect("nested archive");
+        let searches = [search(&directive, [false, false]), search(nested, [false, true])];
+        let selectors = native_libraries::selectors(&searches, &directories).expect("selectors");
+        let (inputs, _) = native_libraries::capture(&selectors, &directories).expect("capture");
+        native_libraries::verify_observed(&inputs, &searches).expect("as rustc found them");
+
+        fs::write(&directive, b"directive").expect("a file at the absolute candidate");
+        let (changed, _) = native_libraries::capture(&selectors, &directories).expect("recapture");
+        assert_ne!(changed, inputs, "the absolute candidate decides the search");
     }
 
     #[test]
@@ -22281,71 +22878,35 @@ pub(crate) mod tests {
         );
     }
 
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn missing_native_search_binds_absence_and_rejects_create_remove_drift() {
-        let temporary = tempfile::tempdir().expect("workspace");
-        let root = crate::utils::canonicalize_existing(temporary.path()).expect("canonical workspace");
-        fs::create_dir(root.join("src")).expect("source directory");
-        fs::write(root.join("src/lib.rs"), b"pub const VALUE: u8 = 1;\n").expect("source");
-        let parent = root.join("native");
-        fs::create_dir(&parent).expect("stable native parent");
-        let missing = parent.join("absent/early");
-        let observation = native_static_observation(&root, &missing);
-        let session = graduated_session(path_identity(&root).expect("root identity"));
-        let selector = NativeDynamicInputSelector::new(Vec::new(), Vec::new()).expect("selector");
-        let initial = capture_selected_inputs(&observation, &root, &selector, None).expect("missing capture");
-        assert!(initial.native_searches.is_empty());
-        assert_eq!(initial.missing_native_searches.len(), 1);
-        let key = action_key(&session.identity, &session.class, &observation, &initial).expect("missing action");
-        initial
-            .revalidate_before_restore_commit(&observation, &root, &root)
-            .expect("unchanged absence");
-
-        fs::create_dir_all(&missing).expect("search directory appeared");
-        let present = capture_selected_inputs(&observation, &root, &selector, None).expect("present capture");
-        assert!(present.missing_native_searches.is_empty());
-        assert_ne!(
-            action_key(&session.identity, &session.class, &observation, &present).expect("present action"),
-            key
-        );
-        initial
-            .revalidate_before_restore_commit(&observation, &root, &root)
-            .expect_err("a new empty search directory invalidates absence");
-        fs::remove_dir_all(parent.join("absent")).expect("restore absence");
-        mutate_until_native_guard_changes(&parent, &initial.missing_native_searches[0].guard, || {
-            fs::create_dir_all(&missing).expect("search appeared during compile");
-            fs::remove_dir_all(parent.join("absent")).expect("search removed during compile");
-        });
-        initial
-            .revalidate_before_restore_commit(&observation, &root, &root)
-            .expect_err("restored absence cannot erase parent generation drift");
-        let recaptured = capture_selected_inputs(&observation, &root, &selector, None).expect("recaptured absence");
-        assert_eq!(
-            action_key(&session.identity, &session.class, &observation, &recaptured).expect("recaptured action"),
-            key
-        );
-        recaptured
-            .revalidate_before_restore_commit(&observation, &root, &root)
-            .expect("new capture owns the current generation");
-    }
-
     #[cfg(unix)]
     #[test]
-    fn missing_native_search_rejects_aliased_ancestors() {
-        let temporary = tempfile::tempdir().expect("workspace");
-        let root = crate::utils::canonicalize_existing(temporary.path()).expect("canonical workspace");
-        fs::create_dir_all(root.join("real/nested")).expect("real ancestor");
-        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).expect("ancestor alias");
-        for missing in [root.join("alias/absent"), root.join("alias/nested/absent")] {
-            let error = capture_missing_native_search(&missing).expect_err("alias selection is not observed");
-            assert!(error.to_string().contains("canonical real directory"), "{error}");
-        }
+    fn capture_failures_name_the_input_shape_that_stopped_them() {
+        let temporary = tempfile::tempdir().expect("source root");
+        let root = crate::utils::canonicalize_existing(temporary.path()).expect("canonical root");
+        fs::create_dir(root.join("src")).expect("source directory");
+        fs::write(root.join("src/lib.rs"), b"pub const VALUE: u8 = 1;\n").expect("source");
+        std::os::unix::fs::symlink("lib.rs", root.join("src/alias.rs")).expect("source link");
+        let failure = NativeActionCapture::capture(&fixture_source_observation(&root), &root)
+            .expect_err("a linked source entry stops the capture");
+        assert_eq!(failure.reason, SOURCE_NAMESPACE_ENTRY_UNSUPPORTED);
+        assert!(failure.to_string().contains("src/alias.rs"), "{failure}");
+
+        // A typed failure keeps its reason through operation context and repeated conversion.
+        let wrapped = RailError::Context {
+            context: "capturing the action".into(),
+            source: Box::new(NativeInputFailure::raise(ACTION_CAPTURE_BOUND_EXCEEDED, "bound")),
+        };
+        let recovered = NativeInputFailure::from(RailError::from(NativeInputFailure::from(wrapped)));
+        assert_eq!(recovered.reason, ACTION_CAPTURE_BOUND_EXCEEDED);
+        assert_eq!(
+            NativeInputFailure::from(RailError::message("unexpected")).reason,
+            "complete_action_capture_unavailable"
+        );
     }
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn native_search_restore_revalidation_rejects_a_same_size_x_to_y_to_x_mutation() {
+    fn native_library_restore_revalidation_rejects_a_changed_candidate() {
         let root = tempfile::tempdir().expect("source root");
         fs::create_dir(root.path().join("src")).expect("source directory");
         fs::write(root.path().join("src/lib.rs"), b"pub const VALUE: u8 = 1;\n").expect("source");
@@ -22354,65 +22915,26 @@ pub(crate) mod tests {
         let archive = native_root.join("libfixture_native.a");
         let original = b"archive-one";
         fs::write(&archive, original).expect("native archive");
-        let original_modified = fs::metadata(&archive)
-            .and_then(|metadata| metadata.modified())
-            .expect("archive mtime");
 
-        let observation = native_static_observation(root.path(), &native_root);
-        let capture = NativeActionCapture::capture(&observation, root.path()).expect("native capture");
+        let observation = native_static_observation(root.path(), &[&native_root]);
+        let capture = capture_selected_inputs(&observation, root.path(), &fixture_native_selector(1), None)
+            .expect("native capture");
         capture
             .revalidate_before_restore_commit(&observation, root.path(), root.path())
             .expect("unchanged native capture");
 
-        let initial_guard = native_metadata_guard(&archive, &fs::symlink_metadata(&archive).expect("archive metadata"))
-            .expect("archive guard");
-        mutate_until_native_guard_changes(&archive, &initial_guard, || {
-            fs::write(&archive, b"archive-two").expect("same-size native mutation");
-            fs::write(&archive, original).expect("restored archive bytes");
-            File::options()
-                .write(true)
-                .open(&archive)
-                .and_then(|file| file.set_times(fs::FileTimes::new().set_modified(original_modified)))
-                .expect("restore archive mtime");
-        });
-
+        fs::write(&archive, b"archive-two").expect("same-size native mutation");
         let error = capture
             .revalidate_before_restore_commit(&observation, root.path(), root.path())
-            .expect_err("a restored native size, digest, and mtime must not erase the generation change");
+            .expect_err("a changed archive must not restore");
         assert!(
-            error.to_string().contains("native library search input changed"),
+            error.to_string().contains("native library candidate changed"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn native_search_capture_deduplicates_the_generated_namespace() {
-        let root = tempfile::tempdir().expect("source root");
-        let generated_root = root.path().join("target/out");
-        fs::create_dir_all(&generated_root).expect("generated directory");
-        fs::write(generated_root.join("libfixture_native.a"), b"archive").expect("native archive");
-        let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
-        let generated = capture_native_generated_namespace_from(
-            Some(generated_root.as_os_str().to_os_string()),
-            &[],
-            root.path(),
-            Instant::now(),
-            &mut budget,
-        )
-        .expect("generated capture")
-        .expect("generated namespace");
-        let bytes_after_generated = budget.bytes_hashed;
-        let (searches, missing) = capture_native_search_namespaces(
-            &["-L".to_string(), format!("native={}", generated_root.display())],
-            Some(&generated),
-            root.path(),
-            Instant::now(),
-            &mut budget,
-        )
-        .expect("native search capture");
-        assert!(searches.is_empty());
-        assert!(missing.is_empty());
-        assert_eq!(budget.bytes_hashed, bytes_after_generated);
+        fs::write(&archive, original).expect("restored archive bytes");
+        capture
+            .revalidate_before_restore_commit(&observation, root.path(), root.path())
+            .expect("the captured bytes are current again");
     }
 
     #[test]
@@ -22437,28 +22959,6 @@ pub(crate) mod tests {
             root,
         )
         .unwrap_err();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn native_search_capture_rejects_a_symlinked_namespace() {
-        use std::os::unix::fs::symlink;
-
-        let root = tempfile::tempdir().expect("source root");
-        let native_root = root.path().join("real-native");
-        fs::create_dir(&native_root).expect("native directory");
-        let selected = root.path().join("selected-native");
-        symlink(&native_root, &selected).expect("native symlink");
-        let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
-        let error = capture_native_search_namespaces(
-            &["-L".to_string(), format!("native={}", selected.display())],
-            None,
-            root.path(),
-            Instant::now(),
-            &mut budget,
-        )
-        .expect_err("a symlinked native search namespace must fail closed");
-        assert!(error.to_string().contains("not a real directory"), "{error}");
     }
 
     #[cfg(any(unix, windows))]
@@ -23022,10 +23522,29 @@ pub(crate) mod tests {
             None,
             "the exact compiler arguments bind rustc's dynamic-link preference"
         );
+        for library in [
+            ["-l", "fixture"],
+            ["-l", "dylib=fixture"],
+            ["-l", "dylib:+verbatim=libfixture.so"],
+            ["-l", "static:-bundle,+whole-archive=fixture"],
+        ] {
+            let mut linked = baseline.clone();
+            linked.compiler_arguments.extend(library.map(str::to_string));
+            assert_eq!(
+                invocation_bypass_reason(&linked, true, &session.class.host_target),
+                None,
+                "the driver and the linker witness bind {library:?}"
+            );
+        }
         assert_bypass("dynamic_native_library_search_evidence_unavailable", |value| {
             value
                 .compiler_arguments
-                .extend(["-l".to_string(), "dylib=fixture".to_string()]);
+                .extend(["-l".to_string(), "framework=Fixture".to_string()]);
+        });
+        assert_bypass("native_library_input_evidence_unavailable", |value| {
+            value
+                .compiler_arguments
+                .extend(["-l".to_string(), "link-arg=-lfixture".to_string()]);
         });
         let mut explicit_linker = baseline.clone();
         explicit_linker

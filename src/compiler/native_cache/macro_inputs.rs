@@ -168,6 +168,30 @@ pub(super) fn bypass_reason(observation: &NativeMacroObservation) -> Option<&'st
     None
 }
 
+/// What a bypassed macro did, for the cache report: the imports that no table classifies, or the effects.
+pub(super) fn bypass_detail(observation: &NativeMacroObservation) -> String {
+    if !observation.unobservable_imports.is_empty() {
+        return format!(
+            "procedural-macro imports without a classification: {}",
+            observation.unobservable_imports.join(", ")
+        );
+    }
+    if observation.unobservable.is_empty() {
+        let secret = observation.environment.iter().filter(|name| is_secret_name(name));
+        return format!(
+            "procedural macro read secret-named variables: {}",
+            secret.map(String::as_str).collect::<Vec<_>>().join(", ")
+        );
+    }
+    let effects = observation.unobservable.iter().map(|effect| {
+        serde_json::to_value(effect)
+            .ok()
+            .and_then(|name| name.as_str().map(str::to_owned))
+            .unwrap_or_else(|| format!("{effect:?}"))
+    });
+    format!("procedural-macro effects: {}", effects.collect::<Vec<_>>().join(", "))
+}
+
 /// The variables a macro read, as compiler environment reads with their current values.
 ///
 /// The compiler process inherits this process's environment, less private capabilities that the selector
@@ -320,6 +344,21 @@ fn capture_cargo_query(
     relative: &Path,
     budget: &mut NativeCaptureBudget,
 ) -> RailResult<MacroPathState> {
+    cargo_query_state(&cargo_query_inputs(workspace_root, root, relative, budget)?)
+}
+
+fn cargo_query_state(inputs: &CargoInputs) -> RailResult<MacroPathState> {
+    Ok(MacroPathState::CargoQuery {
+        inputs_digest: format!("sha256:{}", ContentDigest::sha256(&serde_json::to_vec(inputs)?)),
+    })
+}
+
+fn cargo_query_inputs(
+    workspace_root: &Path,
+    root: CargoQueryRoot,
+    relative: &Path,
+    budget: &mut NativeCaptureBudget,
+) -> RailResult<CargoInputs> {
     let current_directory = std::env::current_dir()?;
     let base = match root {
         CargoQueryRoot::Repository => workspace_root.to_path_buf(),
@@ -331,10 +370,7 @@ fn capture_cargo_query(
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .ok_or_else(|| RailError::message("the compiler's cargo executable is not an absolute CARGO path"))?;
-    let inputs = CargoInputs::capture(&base.join(relative), &current_directory, &cargo, None, budget)?;
-    Ok(MacroPathState::CargoQuery {
-        inputs_digest: format!("sha256:{}", ContentDigest::sha256(&serde_json::to_vec(&inputs)?)),
-    })
+    CargoInputs::capture(&base.join(relative), &current_directory, &cargo, None, budget)
 }
 
 /// Resolve `.` and `..` lexically below `root`, which is valid only while every traversed component is a
@@ -480,6 +516,33 @@ fn capture_state(
         listing_digest: format!("sha256:{}", ContentDigest::sha256(&encoded)),
         entries: entries.len() as u64,
     })
+}
+
+/// Every bound path. A Cargo query binds what Cargo reads, so it is recaptured, and it must still match.
+pub(super) fn post_execution_paths(
+    workspace_root: &Path,
+    inputs: &[MacroPathInput],
+) -> RailResult<Vec<super::PostExecutionPath>> {
+    let canonical_root = crate::utils::canonicalize_existing(workspace_root)?;
+    let mut paths = Vec::new();
+    for input in inputs {
+        let relative = Path::new(&input.path);
+        match (&input.state, input.cargo_query) {
+            (MacroPathState::CargoQuery { .. }, Some(root)) => {
+                let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
+                let query = cargo_query_inputs(&canonical_root, root, relative, &mut budget)?;
+                if cargo_query_state(&query)? != input.state {
+                    return Err(RailError::message(
+                        "a procedural macro's Cargo query inputs changed after the capture",
+                    ));
+                }
+                paths.extend(query.post_execution_paths());
+            }
+            (MacroPathState::Absent, _) => paths.push(super::PostExecutionPath::Absent(canonical_root.join(relative))),
+            _ => paths.push(super::PostExecutionPath::Present(canonical_root.join(relative))),
+        }
+    }
+    Ok(paths)
 }
 
 /// Recapture every input and fail if any state changed since the action was captured.

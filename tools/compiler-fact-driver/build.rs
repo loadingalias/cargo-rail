@@ -17,6 +17,8 @@ const RUSTC_API_CHANGES: &[(&str, u64, &str)] = &[
     ("rail_incremental_session", 99, "2026-08-05"),
     // rust-lang/rust#161458: `CrateType` moved to `rustc_structures`.
     ("rail_structures_crate_type", 100, "2026-08-21"),
+    // rust-lang/rust#161458: `NativeLibKind` moved to `rustc_structures`.
+    ("rail_structures_native_lib_kind", 100, "2026-08-21"),
     // rust-lang/rust#161772: `DefPathData::TestBinderConstraints`.
     ("rail_test_binder_constraints", 100, "2026-08-25"),
     // rust-lang/rust#161432: `CodegenBackend::init` returns the backend's settings from an `EarlySession`.

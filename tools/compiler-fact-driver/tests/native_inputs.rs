@@ -476,6 +476,10 @@ fn linked_proc_macro_retains_complete_native_inputs() {
     let observation = observation.expect("complete linked proc-macro inputs");
     assert!(observation.crates.iter().any(|source| source.name == "proc_macro"));
     assert_eq!(observation.assembly, NativeAssemblyObservation::Absent);
+    assert!(
+        !observation.metadata_only,
+        "a linked proc macro reads the object code of its crates"
+    );
 }
 
 #[test]
@@ -1110,4 +1114,212 @@ pub fn effect(input: TokenStream) -> TokenStream {
             macros.unobservable_imports
         );
     }
+}
+
+/// A macro library that links an asynchronous runtime imports its event-queue, fork-handler, and socket
+/// functions whether or not expansion starts the runtime. Linking alone must not make the macro's
+/// consumers bypass reuse; calling a function whose effect no key binds still must.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn procedural_macro_runtime_imports_bind_only_the_calls_made() {
+    use native_input_protocol::NativeMacroUnobservable;
+
+    let driver = Driver::new();
+    let macro_library = compile_procedural_macro(
+        &driver,
+        "runtime_macro",
+        r#"
+extern crate proc_macro;
+use proc_macro::TokenStream;
+use std::ffi::{c_int, c_void};
+
+type ForkHandler = Option<unsafe extern "C" fn()>;
+
+unsafe extern "C" {
+    fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
+    fn bind(socket: c_int, address: *const c_void, length: u32) -> c_int;
+    fn listen(socket: c_int, backlog: c_int) -> c_int;
+    fn accept(socket: c_int, address: *mut c_void, length: *mut u32) -> c_int;
+    fn close(descriptor: c_int) -> c_int;
+    // glibc links this from a static stub that imports `__register_atfork`.
+    fn pthread_atfork(prepare: ForkHandler, parent: ForkHandler, child: ForkHandler) -> c_int;
+    #[cfg(target_os = "linux")]
+    fn epoll_create1(flags: c_int) -> c_int;
+    #[cfg(target_os = "linux")]
+    fn epoll_ctl(queue: c_int, operation: c_int, descriptor: c_int, event: *mut c_void) -> c_int;
+    #[cfg(target_os = "linux")]
+    fn epoll_wait(queue: c_int, events: *mut c_void, capacity: c_int, timeout: c_int) -> c_int;
+    #[cfg(target_os = "linux")]
+    fn eventfd(initial: u32, flags: c_int) -> c_int;
+    #[cfg(target_os = "macos")]
+    fn kqueue() -> c_int;
+    #[cfg(target_os = "macos")]
+    fn kevent(
+        queue: c_int,
+        changes: *const c_void,
+        change_count: c_int,
+        events: *mut c_void,
+        capacity: c_int,
+        timeout: *const c_void,
+    ) -> c_int;
+    #[cfg(target_os = "macos")]
+    fn pthread_cond_timedwait_relative_np(condition: *mut c_void, mutex: *mut c_void, wait: *const c_void) -> c_int;
+}
+
+/// Reference every runtime import; call one only when the input names it.
+#[proc_macro]
+pub fn runtime(input: TokenStream) -> TokenStream {
+    let call = input.to_string();
+    // The linker keeps each import because the compiler cannot prove this branch dead.
+    if std::hint::black_box(call == "everything") {
+        unsafe {
+            bind(-1, std::ptr::null(), 0);
+            listen(-1, 0);
+            accept(-1, std::ptr::null_mut(), std::ptr::null_mut());
+            pthread_atfork(None, None, None);
+            #[cfg(target_os = "linux")]
+            {
+                epoll_create1(0);
+                epoll_ctl(-1, 0, -1, std::ptr::null_mut());
+                epoll_wait(-1, std::ptr::null_mut(), 0, 0);
+                eventfd(0, 0);
+            }
+            #[cfg(target_os = "macos")]
+            {
+                kqueue();
+                kevent(-1, std::ptr::null(), 0, std::ptr::null_mut(), 0, std::ptr::null());
+                pthread_cond_timedwait_relative_np(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null());
+            }
+        }
+    }
+    if call == "socket" {
+        // An IPv4 stream socket.
+        unsafe { close(socket(2, 1, 0)) };
+    }
+    TokenStream::new()
+}
+"#,
+    );
+    for (call, expected) in [
+        ("linked", Vec::new()),
+        ("socket", vec![NativeMacroUnobservable::Network]),
+    ] {
+        fs::write(
+            driver.root.join("consumer.rs"),
+            format!("runtime_macro::runtime!({call});\n"),
+        )
+        .unwrap();
+        let mut args = arguments("consumer.rs", "consumer.rmeta", "--emit=metadata");
+        args.extend(["--extern".into(), format!("runtime_macro={}", macro_library.display())]);
+        let (observed, observation) = driver.run(&format!("macro-runtime-{call}"), &args);
+        assert_success(&observed);
+        let macros = observation
+            .expect("native observation")
+            .macros
+            .expect("macro observation");
+        assert_eq!(
+            macros.unobservable, expected,
+            "{call}: unclassified imports {:?}",
+            macros.unobservable_imports
+        );
+        assert_eq!(macros.unobservable_imports, Vec::<String>::new(), "{call}");
+    }
+}
+
+/// Rustc searches for a static library itself to bundle it into an rlib. The observation names every
+/// candidate it can test, in its order, and which exist, whether `#[link]` comes from source, macro
+/// expansion, or `-l`. A dynamic library on an action that does not link is never searched.
+#[cfg(unix)]
+#[test]
+fn native_library_searches_report_every_candidate_in_rustc_order() {
+    use native_input_protocol::{NativeLibraryForm, NativeLibraryProbe, NativeLibrarySearch};
+
+    let driver = Driver::new();
+    for directory in ["early", "selected", "other"] {
+        fs::create_dir(driver.root.join(directory)).unwrap();
+    }
+    // A dangling link is absent, as `Path::exists` reports it to rustc.
+    std::os::unix::fs::symlink("missing.a", driver.root.join("early/libbar.a")).unwrap();
+    fs::write(driver.root.join("selected/libbar.a.1"), b"!<arch>\n").unwrap();
+    std::os::unix::fs::symlink("libbar.a.1", driver.root.join("selected/libbar.a")).unwrap();
+    fs::write(driver.root.join("selected/unrelated.so"), b"").unwrap();
+    // A verbatim name is the path rustc joins to each directory, even one with a separator.
+    fs::create_dir(driver.root.join("selected/nested")).unwrap();
+    fs::write(driver.root.join("selected/nested/libquux.a"), b"!<arch>\n").unwrap();
+    fs::write(
+        driver.root.join("consumer.rs"),
+        r#"
+#[link(name = "bar", kind = "static")]
+unsafe extern "C" {
+    pub fn bar();
+}
+macro_rules! linked {
+    ($name:literal) => {
+        #[link(name = $name, kind = "static")]
+        unsafe extern "C" {
+            pub fn baz();
+        }
+    };
+}
+linked!("baz");
+#[link(name = "nested/libquux.a", kind = "static", modifiers = "+verbatim")]
+unsafe extern "C" {
+    pub fn quux();
+}
+"#,
+    )
+    .unwrap();
+    let mut args = arguments("consumer.rs", "consumer.rmeta", "--emit=metadata");
+    for directory in ["early", "selected", "other"] {
+        args.extend(["-L".into(), format!("native={}", driver.root.join(directory).display())]);
+    }
+    args.extend(["-l".into(), "dylib=qux".into()]);
+    let (observed, observation) = driver.run("native-libraries", &args);
+    assert_success(&observed);
+    let root = driver.root.display().to_string();
+    let probe = |directory: &str, file: &str, present| NativeLibraryProbe {
+        directory: format!("{root}/{directory}"),
+        file: file.into(),
+        present,
+    };
+    let observation = observation.expect("native observation");
+    assert!(
+        observation.metadata_only,
+        "an rlib reads only the metadata of its crates"
+    );
+    assert_eq!(
+        observation.native_libraries,
+        [
+            NativeLibrarySearch {
+                name: "bar".into(),
+                form: NativeLibraryForm::Static,
+                verbatim: false,
+                probes: vec![
+                    probe("early", "libbar.a", false),
+                    probe("selected", "libbar.a", true),
+                    probe("other", "libbar.a", false),
+                ],
+            },
+            NativeLibrarySearch {
+                name: "baz".into(),
+                form: NativeLibraryForm::Static,
+                verbatim: false,
+                probes: vec![
+                    probe("early", "libbaz.a", false),
+                    probe("selected", "libbaz.a", false),
+                    probe("other", "libbaz.a", false),
+                ],
+            },
+            NativeLibrarySearch {
+                name: "nested/libquux.a".into(),
+                form: NativeLibraryForm::Static,
+                verbatim: true,
+                probes: vec![
+                    probe("early", "nested/libquux.a", false),
+                    probe("selected", "nested/libquux.a", true),
+                    probe("other", "nested/libquux.a", false),
+                ],
+            },
+        ]
+    );
 }

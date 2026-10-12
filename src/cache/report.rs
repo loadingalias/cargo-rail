@@ -13,6 +13,10 @@ use crate::error::{RailError, RailResult};
 pub(crate) const REPORT_ENV: &str = "CARGO_RAIL_CACHE_REPORT";
 const MAX_BYTES: u64 = 32 * 1024;
 const MAX_REASONS: usize = 128;
+const MAX_DETAILS: usize = 8;
+const MAX_DETAIL_BYTES: usize = 512;
+/// Details never take bytes that the measurements could need.
+const MAX_DETAILED_RECORDING_BYTES: usize = 24 * 1024;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +33,16 @@ pub(crate) struct Measurements {
     pub(crate) incomplete: bool,
 }
 
+/// The first recorded example of one bypass reason, naming the input or effect that caused it.
+///
+/// A detail can name host paths. It stays beside the measurements, which never carry it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BypassDetail {
+    pub(crate) reason: String,
+    pub(crate) detail: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Recording {
@@ -36,6 +50,8 @@ struct Recording {
     kind: String,
     finished: bool,
     measurements: Measurements,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    details: Vec<BypassDetail>,
 }
 
 pub(crate) fn start(path: &Path) -> RailResult<()> {
@@ -59,27 +75,41 @@ pub(crate) fn start(path: &Path) -> RailResult<()> {
             kind: "cargo-rail-cache-recording".to_string(),
             finished: false,
             measurements: Measurements::default(),
+            details: Vec::new(),
         },
     )
 }
 
 pub(crate) fn finish(path: &Path) -> RailResult<Measurements> {
+    finish_with_details(path).map(|(measurements, _)| measurements)
+}
+
+/// Finish the interval and return its measurements with one detail for each of the first bypass reasons.
+pub(crate) fn finish_with_details(path: &Path) -> RailResult<(Measurements, Vec<BypassDetail>)> {
     let mut file = open(path)?;
     let mut recording = read(&mut file)?;
     recording.finished = true;
     recording.measurements.incomplete |= path.with_extension("incomplete").try_exists()?;
     validate_file(&file, path)?;
     write(&mut file, &recording)?;
-    Ok(recording.measurements)
+    Ok((recording.measurements, recording.details))
 }
 
 /// Ordinary compiler execution remains independent of diagnostic storage availability.
-pub(crate) fn record(outcome: u8, reason: &str, local_read: u64, remote_read: u64, remote_written: u64) {
+pub(crate) fn record(
+    outcome: u8,
+    reason: &str,
+    detail: Option<&str>,
+    local_read: u64,
+    remote_read: u64,
+    remote_written: u64,
+) {
     let Some(path) = std::env::var_os(REPORT_ENV) else {
         return;
     };
     let path = Path::new(&path);
-    if record_at(path, outcome, reason, local_read, remote_read, remote_written).is_err() && path.is_absolute() {
+    if record_at(path, outcome, reason, detail, local_read, remote_read, remote_written).is_err() && path.is_absolute()
+    {
         // A separate create-only marker survives a failed update of the main file.
         // If the whole directory is unavailable, collection itself also fails.
         drop(
@@ -95,6 +125,7 @@ fn record_at(
     path: &Path,
     outcome: u8,
     reason: &str,
+    detail: Option<&str>,
     local_read: u64,
     remote_read: u64,
     remote_written: u64,
@@ -122,8 +153,41 @@ fn record_at(
     if outcome == b'F' || super::installation::NativeCacheFailureReason::from_reason(reason).is_some() {
         add_reason(&mut counts.failure_reasons, reason, &mut counts.incomplete);
     }
+    if outcome == b'B'
+        && let Some(detail) = detail
+    {
+        add_detail(&mut recording, reason, detail)?;
+    }
+    // Measurements own the byte bound; details yield it to them.
+    if !recording.details.is_empty() && serde_json::to_vec(&recording)?.len() as u64 > MAX_BYTES {
+        recording.details.clear();
+    }
     validate_file(&file, path)?;
     write(&mut file, &recording)
+}
+
+/// Keep the first detail of each reason, within a count and byte budget that leaves the measurements
+/// their room. A detail that does not fit is dropped; the measurements stay complete.
+fn add_detail(recording: &mut Recording, reason: &str, detail: &str) -> RailResult<()> {
+    if recording.details.len() >= MAX_DETAILS
+        || recording.details.iter().any(|existing| existing.reason == reason)
+        || !recording.measurements.bypass_reasons.contains_key(reason)
+    {
+        return Ok(());
+    }
+    recording.details.push(BypassDetail {
+        reason: reason.to_string(),
+        detail: detail
+            .char_indices()
+            .take_while(|(index, character)| index + character.len_utf8() <= MAX_DETAIL_BYTES)
+            .map(|(_, character)| character)
+            .filter(|character| !character.is_control())
+            .collect(),
+    });
+    if serde_json::to_vec(recording)?.len() > MAX_DETAILED_RECORDING_BYTES {
+        recording.details.pop();
+    }
+    Ok(())
 }
 
 fn add(counter: &mut u64, value: u64, incomplete: &mut bool) {
@@ -185,6 +249,11 @@ fn read(file: &mut File) -> RailResult<Recording> {
         || recording.kind != "cargo-rail-cache-recording"
         || recording.measurements.bypass_reasons.len() > MAX_REASONS
         || recording.measurements.failure_reasons.len() > MAX_REASONS
+        || recording.details.len() > MAX_DETAILS
+        || recording
+            .details
+            .iter()
+            .any(|detail| detail.detail.len() > MAX_DETAIL_BYTES)
     {
         return Err(RailError::message("unsupported cache recording contract"));
     }
@@ -218,12 +287,12 @@ mod tests {
                 let first = &first;
                 scope.spawn(move || {
                     for _ in 0..10 {
-                        record_at(first, b'H', "local_hit", 10, 20, 30).unwrap();
+                        record_at(first, b'H', "local_hit", None, 10, 20, 30).unwrap();
                     }
                 });
             }
         });
-        record_at(&first, b'B', "unsupported_invocation", 0, 0, 0).unwrap();
+        record_at(&first, b'B', "unsupported_invocation", None, 0, 0, 0).unwrap();
         let measurements = finish(&first).unwrap();
         assert_eq!(
             (
@@ -237,8 +306,45 @@ mod tests {
         assert!(!measurements.incomplete);
         assert_eq!(finish(&first).unwrap().hits, 40);
         assert_eq!(finish(&second).unwrap().hits, 0);
-        assert!(record_at(&first, b'H', "local_hit", 0, 0, 0).is_err());
+        assert!(record_at(&first, b'H', "local_hit", None, 0, 0, 0).is_err());
         assert!(start(&first).is_err());
+    }
+
+    #[test]
+    fn bypass_details_keep_the_first_example_of_each_reason_within_their_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("report.json");
+        start(&path).unwrap();
+        record_at(&path, b'B', "first_reason", Some("first example"), 0, 0, 0).unwrap();
+        record_at(&path, b'B', "first_reason", Some("second example"), 0, 0, 0).unwrap();
+        record_at(&path, b'H', "local_hit", Some("not a bypass"), 0, 0, 0).unwrap();
+        record_at(
+            &path,
+            b'B',
+            "long_reason",
+            Some(&format!("{}\n", "é".repeat(MAX_DETAIL_BYTES))),
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        for index in 0..2 * MAX_DETAILS {
+            record_at(&path, b'B', &format!("reason_{index}"), Some("example"), 0, 0, 0).unwrap();
+        }
+        let (measurements, details) = finish_with_details(&path).unwrap();
+        assert!(!measurements.incomplete);
+        assert_eq!(measurements.bypass_reasons["first_reason"], 2);
+        assert_eq!(details.len(), MAX_DETAILS);
+        assert_eq!(
+            details[0],
+            BypassDetail {
+                reason: "first_reason".into(),
+                detail: "first example".into()
+            }
+        );
+        assert_eq!(details[1].reason, "long_reason");
+        assert!(details[1].detail.len() <= MAX_DETAIL_BYTES);
+        assert!(details[1].detail.chars().all(|character| character == 'é'));
     }
 
     #[test]

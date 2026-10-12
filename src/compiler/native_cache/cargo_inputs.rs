@@ -44,6 +44,19 @@ pub(super) struct CargoInputs {
 }
 
 impl CargoInputs {
+    /// Every bound file and directory, spelled as the host names it; valid only for a capture without
+    /// portable roots.
+    ///
+    /// Absences are omitted. Cargo probes for configuration in every ancestor directory and in its home,
+    /// such as the system temporary directory, which other processes change at any time. Those absences
+    /// keep the binding that the capture and every revalidation check.
+    pub(super) fn post_execution_paths(&self) -> impl Iterator<Item = super::PostExecutionPath> + '_ {
+        std::iter::once(&self.executable)
+            .chain(&self.inputs)
+            .filter(|input| input.state != PathKind::Absent)
+            .map(|input| super::PostExecutionPath::Present(PathBuf::from(&input.path)))
+    }
+
     /// Capture what `cargo` reads for a query about the package in `manifest_directory`, run from
     /// `current_directory` with this process's environment.
     /// `roots` selects portable spelling; without it every path is spelled as the host names it.

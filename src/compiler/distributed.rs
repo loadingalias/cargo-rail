@@ -794,6 +794,10 @@ impl WorkerNativeInvocation {
             // Units that load a procedural macro stay local, where the driver observes what the macro reads.
             return Err(RailError::message("distributed compiler loaded a procedural macro"));
         }
+        if !observation.native_libraries.is_empty() {
+            // Units whose native search directories select a library stay local, where the action binds them.
+            return Err(RailError::message("distributed compiler searched for a native library"));
+        }
         let host_library_directory = captured
             .sysroot
             .join("lib/rustlib")
@@ -1106,6 +1110,9 @@ impl StagedExecutionResult {
         validate_native_assembly(&record.observation, &self.operation)?;
         if record.observation.macros.is_some() {
             return Err(RailError::message("distributed compiler loaded a procedural macro"));
+        }
+        if !record.observation.native_libraries.is_empty() {
+            return Err(RailError::message("distributed compiler searched for a native library"));
         }
         map_native_inputs(&mut record.observation, |path, directory| {
             let path = Path::new(path);
@@ -7912,6 +7919,8 @@ pub(crate) mod tests {
                     files: vec![format!("{VIRTUAL_HOST_LIBRARIES}/libcore-exact.rlib")],
                 }],
                 searches: Vec::new(),
+                metadata_only: false,
+                native_libraries: Vec::new(),
                 macros: None,
             };
             let mut record = WorkerNativeInputs {

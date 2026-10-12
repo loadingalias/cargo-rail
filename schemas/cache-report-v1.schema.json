@@ -44,6 +44,15 @@
           "$ref": "#/$defs/measurements"
         }
       ]
+    },
+    "details": {
+      "description": "One example of each of the first bypass reasons, naming the input or effect involved. Present only when an interval recorded one. Examples can name host paths and never enter the measurements.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "$ref": "#/$defs/detail"
+      }
     }
   },
   "$defs": {
@@ -126,6 +135,24 @@
           "type": "boolean"
         }
       }
+    },
+    "detail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason",
+        "detail"
+      ],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "pattern": "^[a-z0-9_]{1,96}$"
+        },
+        "detail": {
+          "type": "string",
+          "maxLength": 512
+        }
+      }
     }
   },
   "allOf": [
@@ -142,6 +169,11 @@
           "measurements": {
             "type": "null"
           }
+        },
+        "not": {
+          "required": [
+            "details"
+          ]
         }
       },
       "else": {

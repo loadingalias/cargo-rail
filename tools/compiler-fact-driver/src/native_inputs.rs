@@ -8,17 +8,23 @@ use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::prelude::*;
 
+#[cfg(not(rail_structures_native_lib_kind))]
+use rustc_hir::attrs::NativeLibKind;
 use rustc_middle::{mir::TerminatorKind, mono::MonoItem, ty::TyCtxt};
 use rustc_session::config::LtoCli;
 use rustc_session::filesearch::FileSearch;
 use rustc_session::search_paths::{PathKind, SearchPath};
+use rustc_span::def_id::LOCAL_CRATE;
 use rustc_span::source_map::{FileLoader, FilePathMapping, RealFileLoader};
+#[cfg(rail_structures_native_lib_kind)]
+use rustc_structures::NativeLibKind;
 
 use crate::CrateType;
 use crate::native_input_protocol::{
     MAX_NATIVE_INPUT_INVOCATION_BYTES, NATIVE_INPUT_PROTOCOL_VERSION, NativeAssemblyObservation,
     NativeCodegenObservation, NativeCratePattern, NativeCrateSearch, NativeCrateSource, NativeInputInvocation,
-    NativeInputObservation, NativeInputPhase, native_invocation_digest,
+    NativeInputObservation, NativeInputPhase, NativeLibraryForm, NativeLibraryProbe, NativeLibrarySearch,
+    native_invocation_digest,
 };
 
 pub(crate) fn configure_source_directory(
@@ -141,6 +147,13 @@ pub(crate) fn collect(
         request_identity: invocation.identity()?,
         crates,
         searches,
+        // Rustc's own rule for which crate flavors its locator reads.
+        metadata_only: tcx
+            .crate_types()
+            .iter()
+            .all(|crate_type| *crate_type == CrateType::Rlib)
+            || !tcx.sess.opts.output_types.should_codegen(),
+        native_libraries: native_library_searches(tcx, &current_directory)?,
         assembly,
         codegen: NativeCodegenObservation::NotRun,
         // Expansion is complete, so no macro code runs again.
@@ -257,6 +270,95 @@ fn search_observations(
             directory,
             patterns: patterns.into_iter().collect(),
             files: files.into_iter().collect(),
+        })
+        .collect())
+}
+
+/// The native-library searches that rustc performs itself in this compilation, each with every candidate it
+/// can test and whether that candidate exists. Rustc selects the first that exists.
+///
+/// Rustc searches the `-L native=` and `-L all=` directories in argument order and tests each candidate with
+/// `Path::exists`. It searches to bundle a local static library into an rlib or staticlib, and, when it
+/// links, to name a library to the linker by path: an Apple or AIX whole-archive static library, a static
+/// library whose symbols a cdylib exports, and every MSVC library. The linker performs every other search,
+/// and its witness binds those. A library that this compilation may not search is reported anyway; binding
+/// its candidates costs reuse only when they change.
+fn native_library_searches(tcx: TyCtxt<'_>, current_directory: &Path) -> Result<Vec<NativeLibrarySearch>, String> {
+    let sess = tcx.sess;
+    let crate_types = tcx.crate_types();
+    let bundles = crate_types
+        .iter()
+        .any(|crate_type| matches!(crate_type, CrateType::Rlib | CrateType::StaticLib));
+    let links = sess.opts.output_types.should_link()
+        && crate_types
+            .iter()
+            .any(|crate_type| !matches!(crate_type, CrateType::Rlib | CrateType::StaticLib));
+    let msvc = sess.target.is_like_msvc;
+    let mut libraries = BTreeSet::new();
+    for (crate_num, local) in
+        std::iter::once((LOCAL_CRATE, true)).chain(tcx.crates(()).iter().map(|&crate_num| (crate_num, false)))
+    {
+        for library in tcx.native_libraries(crate_num) {
+            let name = library.name.as_str().to_owned();
+            let verbatim = library.verbatim.unwrap_or(false);
+            match library.kind {
+                // An upstream rlib already holds every bundled library; rustc names the others to the linker.
+                NativeLibKind::Static { bundle, .. }
+                    if local && (links || bundles && bundle != Some(false))
+                        || !local && links && bundle == Some(false) =>
+                {
+                    libraries.insert((name, NativeLibraryForm::Static, verbatim));
+                }
+                NativeLibKind::Unspecified if links && msvc => {
+                    libraries.insert((name.clone(), NativeLibraryForm::Static, verbatim));
+                    libraries.insert((name, NativeLibraryForm::Import, verbatim));
+                }
+                NativeLibKind::Dylib { .. } if links && msvc => {
+                    libraries.insert((name, NativeLibraryForm::Import, verbatim));
+                }
+                _ => {}
+            }
+        }
+    }
+    let directories = sess
+        .target_filesearch()
+        .cli_search_paths(PathKind::Native)
+        .map(|search| absolute_spelling(&search.dir, current_directory))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(libraries
+        .into_iter()
+        .map(|(name, form, verbatim)| {
+            let default = sess.staticlib_components(verbatim);
+            let unix = ("lib", ".a");
+            let formats = match form {
+                _ if verbatim => vec![default],
+                NativeLibraryForm::Static if default == unix => vec![default],
+                NativeLibraryForm::Static => vec![default, unix],
+                // Meson names import libraries `libfoo.dll.a`, and MinGW names them `libfoo.a`.
+                NativeLibraryForm::Import => vec![default, ("lib", ".dll.a"), unix],
+            };
+            // Every candidate, not only those through the match, so the search is the same in every execution.
+            let mut probes = Vec::new();
+            let mut tested = BTreeSet::new();
+            for directory in &directories {
+                for (prefix, suffix) in &formats {
+                    let file = format!("{prefix}{name}{suffix}");
+                    if tested.insert((directory.as_str(), file.clone())) {
+                        let present = Path::new(directory).join(&file).exists();
+                        probes.push(NativeLibraryProbe {
+                            directory: directory.clone(),
+                            file,
+                            present,
+                        });
+                    }
+                }
+            }
+            NativeLibrarySearch {
+                name,
+                form,
+                verbatim,
+                probes,
+            }
         })
         .collect())
 }

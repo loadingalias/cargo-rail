@@ -10,7 +10,7 @@ use std::path::{Component, Path};
 use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
 
-pub(crate) const NATIVE_INPUT_PROTOCOL_VERSION: u32 = 4;
+pub(crate) const NATIVE_INPUT_PROTOCOL_VERSION: u32 = 5;
 pub(crate) const NATIVE_INPUT_PROTOCOL_VERSION_ARGUMENT: &str = "--cargo-rail-native-input-protocol-version";
 pub(crate) const NATIVE_INPUT_INVOCATION_ENV: &str = "CARGO_RAIL_NATIVE_INPUT_INVOCATION";
 pub(crate) const NATIVE_INPUT_INVOCATION_ARGUMENT: &str = "--cargo-rail-native-input-invocation";
@@ -290,6 +290,88 @@ impl NativeMacroObservation {
     }
 }
 
+pub(crate) const MAX_NATIVE_LIBRARY_SEARCHES: usize = 4096;
+pub(crate) const MAX_NATIVE_LIBRARY_PROBES: usize = 4096;
+const MAX_NATIVE_LIBRARY_NAME_BYTES: usize = 1024;
+
+/// The file forms rustc tests when it searches for a native library by name itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeLibraryForm {
+    /// A static archive, which rustc bundles into an rlib or staticlib, or passes to the linker by path.
+    Static,
+    /// An MSVC import library, which rustc passes to the linker by path.
+    Import,
+}
+
+/// One candidate file of a native-library search, and whether it existed when the driver tested it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeLibraryProbe {
+    /// The `-L` directory, spelled as rustc received it and made absolute.
+    pub(crate) directory: String,
+    pub(crate) file: String,
+    pub(crate) present: bool,
+}
+
+/// One native-library search that rustc performs itself: every candidate it can test, in its order. Rustc
+/// selects the first candidate that exists. The candidates depend only on the library, the `-L` arguments,
+/// and the target, so they are the same in every execution of one action; which one exists can change.
+/// The linker's own library searches are not reported; the linker witness binds them.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeLibrarySearch {
+    pub(crate) name: String,
+    pub(crate) form: NativeLibraryForm,
+    pub(crate) verbatim: bool,
+    pub(crate) probes: Vec<NativeLibraryProbe>,
+}
+
+/// Whether `name` can name a native library or one of its candidate files.
+///
+/// A name can hold path separators: rustc tests `directory.join(file)`, so a verbatim name such as the
+/// MSVC linker directive `/defaultlib:msvcrt` names one absolute candidate in every directory.
+pub(crate) fn native_library_name_valid(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_NATIVE_LIBRARY_NAME_BYTES
+        && !name.contains('\0')
+        && name != "."
+        && name != ".."
+}
+
+/// Whether rustc can test `file` when it searches for library `name`: the name itself when verbatim,
+/// otherwise the name with a target prefix and suffix, neither of which holds a path separator.
+pub(crate) fn native_library_candidate_valid(name: &str, verbatim: bool, file: &str) -> bool {
+    native_library_name_valid(file)
+        && if verbatim {
+            file == name
+        } else {
+            file.match_indices(name).any(|(start, _)| {
+                file.get(..start)
+                    .zip(file.get(start + name.len()..))
+                    .is_some_and(|(prefix, suffix)| !prefix.contains(['/', '\\']) && !suffix.contains(['/', '\\']))
+            })
+        }
+}
+
+impl NativeLibrarySearch {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let mut paths = std::collections::BTreeSet::new();
+        let valid = native_library_name_valid(&self.name)
+            && self.probes.len() <= MAX_NATIVE_LIBRARY_PROBES
+            && self.probes.iter().all(|probe| {
+                absolute_input_path(&probe.directory)
+                    && native_library_candidate_valid(&self.name, self.verbatim, &probe.file)
+                    && paths.insert((probe.directory.as_str(), probe.file.as_str()))
+            });
+        if valid {
+            Ok(())
+        } else {
+            Err("native library search has incompatible authority".into())
+        }
+    }
+}
+
 /// Complete selected crate sources and assembly coverage from one compiler run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -298,6 +380,12 @@ pub(crate) struct NativeInputObservation {
     pub(crate) request_identity: String,
     pub(crate) crates: Vec<NativeCrateSource>,
     pub(crate) searches: Vec<NativeCrateSearch>,
+    /// Whether rustc needs only the metadata of the crates it loads: every crate type is an rlib, or the
+    /// compilation produces no object code. Rustc then skips a crate's `.rlib` once the `.rmeta` with the
+    /// same filename hash supplies its metadata.
+    pub(crate) metadata_only: bool,
+    /// Native-library searches that rustc performs itself, sorted by library.
+    pub(crate) native_libraries: Vec<NativeLibrarySearch>,
     pub(crate) assembly: NativeAssemblyObservation,
     pub(crate) codegen: NativeCodegenObservation,
     /// `None` when the compiler loaded no procedural macro.
@@ -355,6 +443,16 @@ impl NativeInputObservation {
         {
             return Err("native input observation has incompatible authority".into());
         }
+        if self.native_libraries.len() > MAX_NATIVE_LIBRARY_SEARCHES
+            || self.native_libraries.windows(2).any(|pair| {
+                (&pair[0].name, pair[0].form, pair[0].verbatim) >= (&pair[1].name, pair[1].form, pair[1].verbatim)
+            })
+        {
+            return Err("native input observation has incompatible authority".into());
+        }
+        self.native_libraries
+            .iter()
+            .try_for_each(NativeLibrarySearch::validate)?;
         if let Some(macros) = &self.macros {
             macros.validate()?;
         }
@@ -444,6 +542,8 @@ mod tests {
             request_identity: invocation.identity().unwrap(),
             crates: vec![],
             searches: vec![],
+            metadata_only: false,
+            native_libraries: vec![],
             assembly: NativeAssemblyObservation::NoCodegen,
             codegen: NativeCodegenObservation::NotRun,
             macros: None,
@@ -467,6 +567,72 @@ mod tests {
             duplicated.encode(&invocation).unwrap_err(),
             "native input observation has incompatible authority"
         );
+    }
+
+    #[test]
+    fn native_library_search_admits_only_rustc_ordered_candidates() {
+        let invocation = invocation();
+        let directory = std::env::temp_dir().to_str().unwrap().to_string();
+        let probe = |file: &str, present| NativeLibraryProbe {
+            directory: directory.clone(),
+            file: file.into(),
+            present,
+        };
+        let search = |name: &str, verbatim, probes| NativeLibrarySearch {
+            name: name.into(),
+            form: NativeLibraryForm::Static,
+            verbatim,
+            probes,
+        };
+        let observation = |native_libraries| NativeInputObservation {
+            version: NATIVE_INPUT_PROTOCOL_VERSION,
+            request_identity: invocation.identity().unwrap(),
+            crates: vec![],
+            searches: vec![],
+            metadata_only: false,
+            native_libraries,
+            assembly: NativeAssemblyObservation::NoCodegen,
+            codegen: NativeCodegenObservation::NotRun,
+            macros: None,
+        };
+        // Every candidate is reported, including those after the one rustc selects. A verbatim name is the
+        // path that rustc joins to each directory, such as an MSVC linker directive.
+        let valid = observation(vec![
+            search("/defaultlib:msvcrt", true, vec![probe("/defaultlib:msvcrt", false)]),
+            search("bar", false, vec![probe("libbar.a", true), probe("bar.lib", true)]),
+            search("foo", true, vec![probe("foo", false)]),
+            search("nested/libqux.a", true, vec![probe("nested/libqux.a", false)]),
+        ]);
+        let bytes = valid.encode(&invocation).unwrap();
+        assert_eq!(NativeInputObservation::decode(&bytes, &invocation).unwrap(), valid);
+        for (case, invalid) in [
+            (
+                "a candidate for another library",
+                vec![search("bar", false, vec![probe("libbaz.a", false)])],
+            ),
+            (
+                "a verbatim candidate with another name",
+                vec![search("bar", true, vec![probe("libbar.a", false)])],
+            ),
+            (
+                "a repeated candidate",
+                vec![search(
+                    "bar",
+                    false,
+                    vec![probe("libbar.a", false), probe("libbar.a", false)],
+                )],
+            ),
+            (
+                "a candidate path",
+                vec![search("bar", false, vec![probe("lib/libbar.a", false)])],
+            ),
+            (
+                "unsorted libraries",
+                vec![search("foo", false, vec![]), search("bar", false, vec![])],
+            ),
+        ] {
+            assert!(observation(invalid).encode(&invocation).is_err(), "{case}");
+        }
     }
 
     #[test]

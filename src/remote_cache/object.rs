@@ -110,7 +110,8 @@ pub(super) enum EntryState {
     },
     Conflict {
         first: EntryIdentity,
-        second: EntryIdentity,
+        // Boxed to keep the record near the size of a unique entry; the encoding is unchanged.
+        second: Box<EntryIdentity>,
     },
 }
 
@@ -574,7 +575,10 @@ impl ObjectStore {
                     let conflict = EntryRecord {
                         version: 2,
                         base_action_key: base_action_key.to_string(),
-                        state: EntryState::Conflict { first, second },
+                        state: EntryState::Conflict {
+                            first,
+                            second: Box::new(second),
+                        },
                     };
                     let (body, bytes) = encode_entry(&conflict, None)?;
                     if matches!(
@@ -643,8 +647,8 @@ fn validate_entry_record(record: &EntryRecord, base_action_key: &str) -> RemoteS
             }
         }
         EntryState::Conflict { first, second } => {
-            let canonical = canonical_entry_pair(first.clone(), second.clone())?;
-            if canonical != (first.clone(), second.clone()) {
+            let canonical = canonical_entry_pair(first.clone(), (**second).clone())?;
+            if canonical != (first.clone(), (**second).clone()) {
                 return Err(RemoteStoreError::integrity("remote entry conflict is not canonical"));
             }
         }
@@ -935,7 +939,10 @@ mod tests {
         let record = EntryRecord {
             version: 2,
             base_action_key: base(2),
-            state: EntryState::Conflict { first, second },
+            state: EntryState::Conflict {
+                first,
+                second: Box::new(second),
+            },
         };
         let (mut encoded, bytes) = encode_entry(&record, None).expect("encode conflict");
         assert_eq!(bytes, encoded.metadata().expect("metadata").len());

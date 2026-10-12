@@ -19,25 +19,29 @@ hooks! {
         getdirentriesattr = "getdirentriesattr" => |a| observe_listing_descriptor(descriptor(a[0]));
         realpath_darwin = "realpath$DARWIN_EXTSN" => |a| observe(libc::AT_FDCWD, path(a[0]), Access::Resolution);
         fopen_darwin = "fopen$DARWIN_EXTSN" => |a| observe_fopen(path(a[0]), path(a[1]));
-        renamex_np = "renamex_np" => |_a| record_unobservable(Unobservable::FileWrite);
-        renameatx_np = "renameatx_np" => |_a| record_unobservable(Unobservable::FileWrite);
-        clonefile = "clonefile" => |_a| record_unobservable(Unobservable::FileWrite);
-        clonefileat = "clonefileat" => |_a| record_unobservable(Unobservable::FileWrite);
-        fclonefileat = "fclonefileat" => |_a| record_unobservable(Unobservable::FileWrite);
-        copyfile = "copyfile" => |_a| record_unobservable(Unobservable::FileWrite);
-        fcopyfile = "fcopyfile" => |_a| record_unobservable(Unobservable::FileWrite);
-        lchmod = "lchmod" => |_a| record_unobservable(Unobservable::FileWrite);
-        dlopen_preflight = "dlopen_preflight" => |_a| record_unobservable(Unobservable::DynamicLoad);
-        jit_write_protect = "pthread_jit_write_protect_np"
-            => |_a| record_unobservable(Unobservable::ExecutableMemory);
-        sysctl = "sysctl" => |_a| record_unobservable(Unobservable::HostState);
-        sysctlbyname = "sysctlbyname" => |_a| record_unobservable(Unobservable::HostState);
-        sysctlnametomib = "sysctlnametomib" => |_a| record_unobservable(Unobservable::HostState);
-        statfs_inode64 = "statfs$INODE64" => |_a| record_unobservable(Unobservable::HostState);
-        fstatfs_inode64 = "fstatfs$INODE64" => |_a| record_unobservable(Unobservable::HostState);
-        getmntinfo = "getmntinfo" => |_a| record_unobservable(Unobservable::HostState);
-        getfsstat = "getfsstat" => |_a| record_unobservable(Unobservable::HostState);
-        executable_path = "_NSGetExecutablePath" => |_a| record_unobservable(Unobservable::HostState);
+    }
+    effects {
+        renamex_np = "renamex_np" => FileWrite;
+        renameatx_np = "renameatx_np" => FileWrite;
+        clonefile = "clonefile" => FileWrite;
+        clonefileat = "clonefileat" => FileWrite;
+        fclonefileat = "fclonefileat" => FileWrite;
+        copyfile = "copyfile" => FileWrite;
+        fcopyfile = "fcopyfile" => FileWrite;
+        lchmod = "lchmod" => FileWrite;
+        setattrlist = "setattrlist" => FileWrite;
+        fsetattrlist = "fsetattrlist" => FileWrite;
+        getpeereid = "getpeereid" => Network;
+        dlopen_preflight = "dlopen_preflight" => DynamicLoad;
+        jit_write_protect = "pthread_jit_write_protect_np" => ExecutableMemory;
+        sysctl = "sysctl" => HostState;
+        sysctlbyname = "sysctlbyname" => HostState;
+        sysctlnametomib = "sysctlnametomib" => HostState;
+        statfs_inode64 = "statfs$INODE64" => HostState;
+        fstatfs_inode64 = "fstatfs$INODE64" => HostState;
+        getmntinfo = "getmntinfo" => HostState;
+        getfsstat = "getfsstat" => HostState;
+        executable_path = "_NSGetExecutablePath" => HostState;
     }
     explicit {
         ns_get_environ = "_NSGetEnviron";
@@ -127,20 +131,30 @@ pub(in super::super) const PLATFORM_PURE: &[&str] = &[
     "arc4random",
     "arc4random_buf",
     "arc4random_uniform",
+    "copyfile_state_alloc",
+    "copyfile_state_free",
+    "copyfile_state_get",
     "dispatch_release",
     "dispatch_semaphore_create",
     "dispatch_semaphore_signal",
     "dispatch_semaphore_wait",
+    "dispatch_time",
     "dyld_stub_binder",
     "fstat$INODE64",
+    "kevent",
+    "kevent64",
+    "kqueue",
     "mach_absolute_time",
     "mach_timebase_info",
+    "mach_wait_until",
     "os_unfair_lock_lock",
     "os_unfair_lock_trylock",
     "os_unfair_lock_unlock",
+    "pthread_cond_timedwait_relative_np",
     "pthread_get_stackaddr_np",
     "pthread_get_stacksize_np",
     "pthread_threadid_np",
     "readdir$INODE64",
     "readdir_r$INODE64",
+    "sendfile",
 ];

@@ -527,7 +527,8 @@ fn run_direct_cache() -> i32 {
 }
 
 fn record_early_cache_bypass(invocation: &CompilerInvocation, reason: &'static str) {
-    crate::cache::report::record(b'B', reason, 0, 0, 0);
+    let detail = crate::compiler::native_cache::take_outcome_detail();
+    crate::cache::report::record(b'B', reason, detail.as_deref(), 0, 0, 0);
     let trace = std::env::var_os("CARGO_RAIL_CACHE_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"));
     let result =
         crate::compiler::native_cache::NativeCacheContext::direct_invocation_source_root(&invocation.arguments)

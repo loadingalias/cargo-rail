@@ -26,7 +26,7 @@ CASES = {
         'compiler::native_cache::tests::restore_commit_rejects_a_destination_created_after_authorization',
         'compiler::native_cache::tests::restore_recovery_discards_partial_private_records_before_authority',
         'compiler::native_cache::tests::session_identity_changes_with_exact_compiler_authority',
-        'compiler::native_cache::tests::native_search_restore_revalidation_rejects_a_same_size_x_to_y_to_x_mutation',
+        'compiler::native_cache::tests::native_library_restore_revalidation_rejects_a_changed_candidate',
         'compiler::native_cache::tests::restore_revalidation_rejects_a_same_size_x_to_y_to_x_mutation',
         'remote_cache::object::tests::unique_entry_round_trips_one_compressed_pack',
         'remote_cache::object::tests::malformed_compressed_payload_is_rejected_as_integrity_failure',

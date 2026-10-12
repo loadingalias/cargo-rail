@@ -411,11 +411,13 @@ const MEMORY_PROTECTION: [c_long; 2] = [libc::SYS_mmap, libc::SYS_mprotect];
 
 /// Record what one system call from macro code reads, or why it cannot be bound.
 pub(super) fn observe_system_call(number: c_long, a: [u64; 6]) {
-    use Unobservable::{
-        ExecutableMemory, FileWrite, HostState, Network, ProcessControl, RawSystemCall, WorkingDirectory,
-    };
+    use Unobservable::{ExecutableMemory, ProcessControl, RawSystemCall};
 
     if PURE_SYSTEM_CALLS.contains(&number) {
+        return;
+    }
+    if let Some(&(_, effect)) = EFFECT_SYSTEM_CALLS.iter().find(|(effect, _)| *effect == number) {
+        record_unobservable(effect);
         return;
     }
     match number {
@@ -455,46 +457,11 @@ pub(super) fn observe_system_call(number: c_long, a: [u64; 6]) {
                 record_unobservable(ProcessControl);
             }
         }
-        libc::SYS_chdir | libc::SYS_fchdir => record_unobservable(WorkingDirectory),
-        libc::SYS_chroot | libc::SYS_execve | libc::SYS_execveat | libc::SYS_clone3 => {
-            record_unobservable(ProcessControl);
-        }
-        libc::SYS_socket
-        | libc::SYS_socketpair
-        | libc::SYS_connect
-        | libc::SYS_bind
-        | libc::SYS_listen
-        | libc::SYS_accept4
-        | libc::SYS_sendto
-        | libc::SYS_sendmsg
-        | libc::SYS_recvfrom
-        | libc::SYS_recvmsg => record_unobservable(Network),
-        #[cfg(not(target_arch = "s390x"))]
-        libc::SYS_accept => record_unobservable(Network),
-        #[cfg(not(target_arch = "riscv64"))]
-        libc::SYS_renameat => record_unobservable(FileWrite),
-        libc::SYS_unlinkat
-        | libc::SYS_copy_file_range
-        | libc::SYS_renameat2
-        | libc::SYS_mkdirat
-        | libc::SYS_mknodat
-        | libc::SYS_linkat
-        | libc::SYS_symlinkat
-        | libc::SYS_fchmodat
-        | libc::SYS_fchownat
-        | libc::SYS_utimensat
-        | libc::SYS_truncate
-        | libc::SYS_ftruncate
-        | libc::SYS_fallocate
-        | libc::SYS_memfd_create
-        | libc::SYS_fchmod
-        | libc::SYS_fchown => record_unobservable(FileWrite),
-        libc::SYS_uname | libc::SYS_sysinfo | libc::SYS_statfs | libc::SYS_fstatfs => record_unobservable(HostState),
         _ => observe_legacy_system_call(number, a).unwrap_or_else(|| record_unobservable(RawSystemCall)),
     }
 }
 
-/// System calls that newer architectures replaced with their `*at` forms.
+/// Path reads through system calls that newer architectures replaced with their `*at` forms.
 #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
 fn observe_legacy_system_call(number: c_long, a: [u64; 6]) -> Option<()> {
     match number {
@@ -503,20 +470,6 @@ fn observe_legacy_system_call(number: c_long, a: [u64; 6]) -> Option<()> {
             observe_path(AT_FDCWD, a[0], Access::Entry);
         }
         libc::SYS_getdents => observe_listing(a[0]),
-        libc::SYS_creat
-        | libc::SYS_unlink
-        | libc::SYS_rename
-        | libc::SYS_mkdir
-        | libc::SYS_rmdir
-        | libc::SYS_link
-        | libc::SYS_symlink
-        | libc::SYS_chmod
-        | libc::SYS_chown
-        | libc::SYS_lchown
-        | libc::SYS_utime
-        | libc::SYS_utimes
-        | libc::SYS_mknod => record_unobservable(Unobservable::FileWrite),
-        libc::SYS_fork | libc::SYS_vfork => record_unobservable(Unobservable::ProcessControl),
         _ => return None,
     }
     Some(())
@@ -528,7 +481,11 @@ fn observe_legacy_system_call(_number: c_long, _a: [u64; 6]) -> Option<()> {
 }
 
 /// System calls with no effect a result could depend on. File metadata and reads here operate on
-/// descriptors, which the macro could only have opened through an observed path.
+/// descriptors, which the macro could only have opened through an observed path. Event queues create
+/// descriptors without a path and report only on descriptors the macro holds.
+///
+/// The import tables in `hooks.rs` classify each C library function as this table classifies its system
+/// call; a test enforces it.
 const PURE_SYSTEM_CALLS: &[c_long] = &[
     libc::SYS_read,
     libc::SYS_write,
@@ -587,14 +544,401 @@ const PURE_SYSTEM_CALLS: &[c_long] = &[
     libc::SYS_tkill,
     libc::SYS_restart_syscall,
     libc::SYS_getcwd,
+    libc::SYS_getrusage,
+    libc::SYS_fsync,
+    libc::SYS_fdatasync,
+    libc::SYS_flock,
+    libc::SYS_sendfile,
+    libc::SYS_splice,
+    libc::SYS_pidfd_open,
+    libc::SYS_pidfd_send_signal,
     libc::SYS_eventfd2,
     libc::SYS_epoll_create1,
     libc::SYS_epoll_ctl,
     libc::SYS_epoll_pwait,
+    libc::SYS_epoll_pwait2,
     #[cfg(target_arch = "x86_64")]
     libc::SYS_arch_prctl,
     #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
     libc::SYS_poll,
     #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
     libc::SYS_dup2,
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    libc::SYS_pipe,
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    libc::SYS_pause,
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    libc::SYS_eventfd,
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    libc::SYS_epoll_create,
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    libc::SYS_epoll_wait,
 ];
+
+/// System calls whose every use is an effect that no key can bind, and the effect each one records.
+const EFFECT_SYSTEM_CALLS: &[(c_long, Unobservable)] = &[
+    (libc::SYS_chdir, Unobservable::WorkingDirectory),
+    (libc::SYS_fchdir, Unobservable::WorkingDirectory),
+    (libc::SYS_chroot, Unobservable::ProcessControl),
+    (libc::SYS_execve, Unobservable::ProcessControl),
+    (libc::SYS_execveat, Unobservable::ProcessControl),
+    (libc::SYS_clone3, Unobservable::ProcessControl),
+    (libc::SYS_setuid, Unobservable::ProcessControl),
+    (libc::SYS_setgid, Unobservable::ProcessControl),
+    (libc::SYS_setgroups, Unobservable::ProcessControl),
+    (libc::SYS_setpgid, Unobservable::ProcessControl),
+    (libc::SYS_setsid, Unobservable::ProcessControl),
+    // A socket can carry data from any peer, and `recvmsg` can receive another process's descriptors.
+    (libc::SYS_socket, Unobservable::Network),
+    (libc::SYS_socketpair, Unobservable::Network),
+    (libc::SYS_connect, Unobservable::Network),
+    (libc::SYS_bind, Unobservable::Network),
+    (libc::SYS_listen, Unobservable::Network),
+    #[cfg(not(target_arch = "s390x"))]
+    (libc::SYS_accept, Unobservable::Network),
+    (libc::SYS_accept4, Unobservable::Network),
+    (libc::SYS_sendto, Unobservable::Network),
+    (libc::SYS_sendmsg, Unobservable::Network),
+    (libc::SYS_sendmmsg, Unobservable::Network),
+    (libc::SYS_recvfrom, Unobservable::Network),
+    (libc::SYS_recvmsg, Unobservable::Network),
+    (libc::SYS_recvmmsg, Unobservable::Network),
+    (libc::SYS_getsockopt, Unobservable::Network),
+    (libc::SYS_setsockopt, Unobservable::Network),
+    (libc::SYS_getsockname, Unobservable::Network),
+    (libc::SYS_getpeername, Unobservable::Network),
+    (libc::SYS_shutdown, Unobservable::Network),
+    #[cfg(not(target_arch = "riscv64"))]
+    (libc::SYS_renameat, Unobservable::FileWrite),
+    (libc::SYS_unlinkat, Unobservable::FileWrite),
+    (libc::SYS_copy_file_range, Unobservable::FileWrite),
+    (libc::SYS_renameat2, Unobservable::FileWrite),
+    (libc::SYS_mkdirat, Unobservable::FileWrite),
+    (libc::SYS_mknodat, Unobservable::FileWrite),
+    (libc::SYS_linkat, Unobservable::FileWrite),
+    (libc::SYS_symlinkat, Unobservable::FileWrite),
+    (libc::SYS_fchmodat, Unobservable::FileWrite),
+    (libc::SYS_fchownat, Unobservable::FileWrite),
+    (libc::SYS_utimensat, Unobservable::FileWrite),
+    (libc::SYS_truncate, Unobservable::FileWrite),
+    (libc::SYS_ftruncate, Unobservable::FileWrite),
+    (libc::SYS_fallocate, Unobservable::FileWrite),
+    (libc::SYS_memfd_create, Unobservable::FileWrite),
+    (libc::SYS_fchmod, Unobservable::FileWrite),
+    (libc::SYS_fchown, Unobservable::FileWrite),
+    (libc::SYS_uname, Unobservable::HostState),
+    (libc::SYS_sysinfo, Unobservable::HostState),
+    (libc::SYS_statfs, Unobservable::HostState),
+    (libc::SYS_fstatfs, Unobservable::HostState),
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    (libc::SYS_fork, Unobservable::ProcessControl),
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    (libc::SYS_vfork, Unobservable::ProcessControl),
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    (libc::SYS_creat, Unobservable::FileWrite),
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    (libc::SYS_unlink, Unobservable::FileWrite),
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    (libc::SYS_rename, Unobservable::FileWrite),
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    (libc::SYS_mkdir, Unobservable::FileWrite),
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    (libc::SYS_rmdir, Unobservable::FileWrite),
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    (libc::SYS_link, Unobservable::FileWrite),
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    (libc::SYS_symlink, Unobservable::FileWrite),
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    (libc::SYS_chmod, Unobservable::FileWrite),
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    (libc::SYS_chown, Unobservable::FileWrite),
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    (libc::SYS_lchown, Unobservable::FileWrite),
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    (libc::SYS_utime, Unobservable::FileWrite),
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    (libc::SYS_utimes, Unobservable::FileWrite),
+    #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+    (libc::SYS_mknod, Unobservable::FileWrite),
+];
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use crate::macro_observation::hooks::tests::{ImportClass, import_class};
+
+    /// The GNU C library functions that perform each classified system call's operation.
+    const WRAPPERS: &[(c_long, &[&str])] = &[
+        (libc::SYS_read, &["eventfd_read", "read"]),
+        (libc::SYS_write, &["eventfd_write", "write"]),
+        (libc::SYS_readv, &["readv"]),
+        (libc::SYS_writev, &["writev"]),
+        (libc::SYS_pread64, &["pread", "pread64"]),
+        (libc::SYS_pwrite64, &["pwrite", "pwrite64"]),
+        (libc::SYS_preadv, &["preadv", "preadv64"]),
+        (libc::SYS_pwritev, &["pwritev", "pwritev64"]),
+        (libc::SYS_close, &["close"]),
+        (libc::SYS_fstat, &["__fxstat", "__fxstat64", "fstat", "fstat64"]),
+        (libc::SYS_lseek, &["lseek", "lseek64"]),
+        (libc::SYS_munmap, &["munmap"]),
+        (libc::SYS_mremap, &["mremap"]),
+        (libc::SYS_madvise, &["madvise"]),
+        (libc::SYS_brk, &[]),
+        (libc::SYS_rt_sigaction, &["sigaction", "signal"]),
+        (libc::SYS_rt_sigprocmask, &["pthread_sigmask", "sigprocmask"]),
+        (libc::SYS_rt_sigreturn, &[]),
+        (libc::SYS_sigaltstack, &["sigaltstack"]),
+        (libc::SYS_futex, &[]),
+        (libc::SYS_sched_yield, &["sched_yield"]),
+        (libc::SYS_sched_getaffinity, &["sched_getaffinity"]),
+        (libc::SYS_nanosleep, &["nanosleep", "sleep", "usleep"]),
+        (libc::SYS_clock_nanosleep, &["clock_nanosleep"]),
+        (libc::SYS_clock_gettime, &["clock_gettime", "time"]),
+        (libc::SYS_clock_getres, &["clock_getres"]),
+        (libc::SYS_gettimeofday, &["gettimeofday"]),
+        (libc::SYS_getpid, &["getpid"]),
+        (libc::SYS_gettid, &["gettid"]),
+        (libc::SYS_getppid, &["getppid"]),
+        (libc::SYS_getuid, &["getuid"]),
+        (libc::SYS_geteuid, &["geteuid"]),
+        (libc::SYS_getgid, &["getgid"]),
+        (libc::SYS_getegid, &["getegid"]),
+        (libc::SYS_exit, &[]),
+        (libc::SYS_exit_group, &["_Exit", "_exit"]),
+        (libc::SYS_set_robust_list, &[]),
+        (libc::SYS_get_robust_list, &[]),
+        (libc::SYS_rseq, &[]),
+        (libc::SYS_set_tid_address, &[]),
+        (libc::SYS_getrandom, &["getentropy", "getrandom"]),
+        (libc::SYS_membarrier, &[]),
+        (libc::SYS_prlimit64, &["getrlimit", "getrlimit64"]),
+        (libc::SYS_dup, &["dup"]),
+        (libc::SYS_dup3, &["dup2", "dup3"]),
+        (libc::SYS_pipe2, &["pipe", "pipe2"]),
+        (libc::SYS_fcntl, &["fcntl"]),
+        (libc::SYS_ioctl, &["ioctl", "isatty"]),
+        (libc::SYS_ppoll, &["poll", "ppoll"]),
+        (libc::SYS_pselect6, &["pselect", "select"]),
+        (libc::SYS_wait4, &["wait", "wait4", "waitpid"]),
+        (libc::SYS_waitid, &["waitid"]),
+        (libc::SYS_kill, &["kill", "killpg"]),
+        (libc::SYS_tgkill, &["pthread_kill", "raise", "tgkill"]),
+        (libc::SYS_tkill, &[]),
+        (libc::SYS_restart_syscall, &[]),
+        (libc::SYS_getcwd, &["getcwd"]),
+        (libc::SYS_getrusage, &["getrusage"]),
+        (libc::SYS_fsync, &["fsync"]),
+        (libc::SYS_fdatasync, &["fdatasync"]),
+        (libc::SYS_flock, &["flock"]),
+        (libc::SYS_sendfile, &["sendfile", "sendfile64"]),
+        (libc::SYS_splice, &["splice"]),
+        (libc::SYS_pidfd_open, &["pidfd_open"]),
+        (libc::SYS_pidfd_send_signal, &["pidfd_send_signal"]),
+        (libc::SYS_eventfd2, &["eventfd"]),
+        (libc::SYS_epoll_create1, &["epoll_create", "epoll_create1"]),
+        (libc::SYS_epoll_ctl, &["epoll_ctl"]),
+        (libc::SYS_epoll_pwait, &["epoll_pwait", "epoll_wait"]),
+        (libc::SYS_epoll_pwait2, &["epoll_pwait2"]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_arch_prctl, &[]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_poll, &["poll"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_dup2, &["dup2"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_pipe, &["pipe"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_pause, &["pause"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_eventfd, &[]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_epoll_create, &["epoll_create"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_epoll_wait, &["epoll_wait"]),
+        (libc::SYS_chdir, &["chdir"]),
+        (libc::SYS_fchdir, &["fchdir"]),
+        (libc::SYS_chroot, &["chroot"]),
+        (libc::SYS_execve, &["execv", "execve", "execvp", "execvpe"]),
+        (libc::SYS_execveat, &["fexecve"]),
+        (libc::SYS_clone3, &[]),
+        (libc::SYS_setuid, &["setuid"]),
+        (libc::SYS_setgid, &["setgid"]),
+        (libc::SYS_setgroups, &["setgroups"]),
+        (libc::SYS_setpgid, &["setpgid"]),
+        (libc::SYS_setsid, &["setsid"]),
+        (libc::SYS_socket, &["socket"]),
+        (libc::SYS_socketpair, &["socketpair"]),
+        (libc::SYS_connect, &["connect"]),
+        (libc::SYS_bind, &["bind"]),
+        (libc::SYS_listen, &["listen"]),
+        #[cfg(not(target_arch = "s390x"))]
+        (libc::SYS_accept, &["accept"]),
+        (libc::SYS_accept4, &["accept", "accept4"]),
+        (libc::SYS_sendto, &["send", "sendto"]),
+        (libc::SYS_sendmsg, &["sendmsg"]),
+        (libc::SYS_sendmmsg, &[]),
+        (libc::SYS_recvfrom, &["recv", "recvfrom"]),
+        (libc::SYS_recvmsg, &["recvmsg"]),
+        (libc::SYS_recvmmsg, &[]),
+        (libc::SYS_getsockopt, &["getsockopt"]),
+        (libc::SYS_setsockopt, &["setsockopt"]),
+        (libc::SYS_getsockname, &["getsockname"]),
+        (libc::SYS_getpeername, &["getpeername"]),
+        (libc::SYS_shutdown, &["shutdown"]),
+        #[cfg(not(target_arch = "riscv64"))]
+        (libc::SYS_renameat, &["renameat"]),
+        (libc::SYS_unlinkat, &["unlinkat"]),
+        (libc::SYS_copy_file_range, &["copy_file_range"]),
+        (libc::SYS_renameat2, &["renameat2"]),
+        (libc::SYS_mkdirat, &["mkdirat"]),
+        (libc::SYS_mknodat, &["mkfifoat", "mknodat"]),
+        (libc::SYS_linkat, &["linkat"]),
+        (libc::SYS_symlinkat, &["symlinkat"]),
+        (libc::SYS_fchmodat, &["fchmodat"]),
+        (libc::SYS_fchownat, &["fchownat"]),
+        (libc::SYS_utimensat, &["futimens", "futimesat", "lutimes", "utimensat"]),
+        (libc::SYS_truncate, &["truncate", "truncate64"]),
+        (libc::SYS_ftruncate, &["ftruncate", "ftruncate64"]),
+        (
+            libc::SYS_fallocate,
+            &["fallocate", "fallocate64", "posix_fallocate", "posix_fallocate64"],
+        ),
+        (libc::SYS_memfd_create, &["memfd_create"]),
+        (libc::SYS_fchmod, &["fchmod"]),
+        (libc::SYS_fchown, &["fchown"]),
+        (libc::SYS_uname, &["uname"]),
+        (libc::SYS_sysinfo, &["sysinfo"]),
+        (libc::SYS_statfs, &["statfs", "statfs64", "statvfs", "statvfs64"]),
+        (libc::SYS_fstatfs, &["fstatfs", "fstatfs64", "fstatvfs", "fstatvfs64"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_fork, &["fork"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_vfork, &["vfork"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_creat, &["creat", "creat64"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_unlink, &["unlink"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_rename, &["rename"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_mkdir, &["mkdir"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_rmdir, &["rmdir"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_link, &["link"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_symlink, &["symlink"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_chmod, &["chmod"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_chown, &["chown"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_lchown, &["lchown"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_utime, &["utime"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_utimes, &["utimes"]),
+        #[cfg(any(target_arch = "x86_64", target_arch = "s390x", target_arch = "powerpc64"))]
+        (libc::SYS_mknod, &["mkfifo", "mknod"]),
+    ];
+
+    /// System calls whose arguments decide what they read or which effect they have, and the functions
+    /// that perform them. Each function needs a hook; a pure classification would skip the observation.
+    const OBSERVED: &[(c_long, &[&str])] = &[
+        (
+            libc::SYS_openat,
+            &[
+                "__open64_2",
+                "__open_2",
+                "__openat64_2",
+                "__openat_2",
+                "fopen",
+                "fopen64",
+                "freopen",
+                "freopen64",
+                "open",
+                "open64",
+                "openat",
+                "openat64",
+            ],
+        ),
+        (
+            libc::SYS_newfstatat,
+            &[
+                "__fxstatat",
+                "__fxstatat64",
+                "__lxstat",
+                "__lxstat64",
+                "__xstat",
+                "__xstat64",
+                "fstatat",
+                "fstatat64",
+                "lstat",
+                "lstat64",
+                "stat",
+                "stat64",
+            ],
+        ),
+        (libc::SYS_statx, &["statx"]),
+        (libc::SYS_faccessat, &["access", "eaccess", "euidaccess", "faccessat"]),
+        (libc::SYS_readlinkat, &["readlink", "readlinkat"]),
+        (libc::SYS_getdents64, &["getdents64"]),
+        (libc::SYS_mmap, &["mmap", "mmap64"]),
+        (libc::SYS_mprotect, &["mprotect"]),
+        #[cfg(not(any(target_arch = "s390x", target_arch = "powerpc64")))]
+        (libc::SYS_pkey_mprotect, &["pkey_mprotect"]),
+        (libc::SYS_clone, &["_Fork", "clone", "fork", "vfork"]),
+    ];
+
+    fn system_call_class(number: c_long) -> Option<ImportClass> {
+        if PURE_SYSTEM_CALLS.contains(&number) {
+            return Some(ImportClass::Pure);
+        }
+        EFFECT_SYSTEM_CALLS
+            .iter()
+            .find(|(effect, _)| *effect == number)
+            .map(|(_, effect)| ImportClass::Effect(*effect))
+    }
+
+    #[test]
+    fn import_and_system_call_tables_classify_each_operation_alike() {
+        let effects = EFFECT_SYSTEM_CALLS
+            .iter()
+            .map(|(number, _)| *number)
+            .collect::<Vec<_>>();
+        let mapped = WRAPPERS.iter().map(|(number, _)| *number).collect::<BTreeSet<_>>();
+        assert_eq!(mapped.len(), WRAPPERS.len(), "a system call is mapped twice");
+        for number in PURE_SYSTEM_CALLS.iter().chain(&effects) {
+            assert!(
+                !PURE_SYSTEM_CALLS.contains(number) || !effects.contains(number),
+                "system call {number} is both pure and an effect"
+            );
+            assert!(
+                mapped.contains(number),
+                "system call {number} names no C library functions"
+            );
+        }
+        for &(number, wrappers) in WRAPPERS {
+            let expected = system_call_class(number)
+                .unwrap_or_else(|| panic!("system call {number} names functions but has no classification"));
+            for wrapper in wrappers {
+                assert_eq!(
+                    import_class(wrapper),
+                    expected,
+                    "{wrapper} performs system call {number}"
+                );
+            }
+        }
+        for &(number, wrappers) in OBSERVED {
+            assert_eq!(system_call_class(number), None, "system call {number} is observed");
+            for wrapper in wrappers {
+                assert!(
+                    matches!(import_class(wrapper), ImportClass::Observed | ImportClass::Effect(_)),
+                    "{wrapper} performs observed system call {number} without a hook"
+                );
+            }
+        }
+    }
+}

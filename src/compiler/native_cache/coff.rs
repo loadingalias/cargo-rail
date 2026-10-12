@@ -653,6 +653,17 @@ fn reproduced_path(relative: &str) -> RailResult<PathBuf> {
     Ok(path)
 }
 
+/// The files that the linker received by path.
+pub(super) fn direct_inputs(evidence_path: &Path) -> RailResult<Vec<PathBuf>> {
+    let evidence = read_evidence(evidence_path)?;
+    let current_directory = Path::new(&evidence.current_directory);
+    Ok(evidence
+        .arguments
+        .iter()
+        .map(|argument| absolute_link_argument_path(argument, current_directory))
+        .collect())
+}
+
 pub(super) fn capture(
     observation: &RawCompilerInvocation,
     output_paths: &NativeOutputPaths,
@@ -857,6 +868,15 @@ fn option_value<'a>(argument: &'a str, expected: &str) -> Option<&'a str> {
 pub(super) struct CoffLinkerWitness {
     pub(super) files: FileLinkerWitness,
     search_directories: Vec<SearchDirectory>,
+}
+
+impl CoffLinkerWitness {
+    /// The library directories whose listings the witness binds.
+    pub(super) fn search_directories(&self) -> impl Iterator<Item = PostExecutionPath> + '_ {
+        self.search_directories
+            .iter()
+            .map(|directory| PostExecutionPath::Present(PathBuf::from(&directory.path)))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

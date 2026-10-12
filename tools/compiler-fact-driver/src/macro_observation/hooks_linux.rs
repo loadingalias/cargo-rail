@@ -10,8 +10,6 @@ hooks! {
         open64_2 = "__open64_2" => |a| observe_open(libc::AT_FDCWD, path(a[0]), a[1] as c_int);
         openat_2 = "__openat_2" => |a| observe_open(descriptor(a[0]), path(a[1]), a[2] as c_int);
         openat64_2 = "__openat64_2" => |a| observe_open(descriptor(a[0]), path(a[1]), a[2] as c_int);
-        creat = "creat" => |_a| record_unobservable(Unobservable::FileWrite);
-        creat64 = "creat64" => |_a| record_unobservable(Unobservable::FileWrite);
         fopen64 = "fopen64" => |a| observe_fopen(path(a[0]), path(a[1]));
         freopen64 = "freopen64" => |a| observe_fopen(path(a[0]), path(a[1]));
         stat64 = "stat64" => |a| observe(libc::AT_FDCWD, path(a[0]), Access::Entry);
@@ -34,43 +32,48 @@ hooks! {
         getdents64 = "getdents64" => |a| observe_listing_descriptor(descriptor(a[0]));
         secure_getenv = "secure_getenv" => |a| observe_environment(a[0]);
         secure_getenv_internal = "__secure_getenv" => |a| observe_environment(a[0]);
-        clearenv = "clearenv" => |_a| record_unobservable(Unobservable::EnvironmentWrite);
-        fork_internal = "_Fork" => |_a| record_unobservable(Unobservable::ProcessControl);
-        clone = "clone" => |_a| record_unobservable(Unobservable::ProcessControl);
-        execvpe = "execvpe" => |_a| record_unobservable(Unobservable::ProcessControl);
-        pidfd_spawn = "pidfd_spawn" => |_a| record_unobservable(Unobservable::ProcessControl);
-        pidfd_spawnp = "pidfd_spawnp" => |_a| record_unobservable(Unobservable::ProcessControl);
-        dlmopen = "dlmopen" => |_a| record_unobservable(Unobservable::DynamicLoad);
         mmap64 = "mmap64" => |a| observe_executable_memory(a[2]);
         pkey_mprotect = "pkey_mprotect" => |a| observe_executable_memory(a[2]);
-        memfd_create = "memfd_create" => |_a| record_unobservable(Unobservable::FileWrite);
-        renameat2 = "renameat2" => |_a| record_unobservable(Unobservable::FileWrite);
-        truncate64 = "truncate64" => |_a| record_unobservable(Unobservable::FileWrite);
-        ftruncate64 = "ftruncate64" => |_a| record_unobservable(Unobservable::FileWrite);
-        utime = "utime" => |_a| record_unobservable(Unobservable::FileWrite);
-        lutimes = "lutimes" => |_a| record_unobservable(Unobservable::FileWrite);
-        futimesat = "futimesat" => |_a| record_unobservable(Unobservable::FileWrite);
-        mkstemp64 = "mkstemp64" => |_a| record_unobservable(Unobservable::FileWrite);
-        mkostemp64 = "mkostemp64" => |_a| record_unobservable(Unobservable::FileWrite);
-        mkostemps = "mkostemps" => |_a| record_unobservable(Unobservable::FileWrite);
-        tmpfile64 = "tmpfile64" => |_a| record_unobservable(Unobservable::FileWrite);
-        mkfifoat = "mkfifoat" => |_a| record_unobservable(Unobservable::FileWrite);
-        mknodat = "mknodat" => |_a| record_unobservable(Unobservable::FileWrite);
-        fallocate = "fallocate" => |_a| record_unobservable(Unobservable::FileWrite);
-        fallocate64 = "fallocate64" => |_a| record_unobservable(Unobservable::FileWrite);
-        posix_fallocate = "posix_fallocate" => |_a| record_unobservable(Unobservable::FileWrite);
-        posix_fallocate64 = "posix_fallocate64" => |_a| record_unobservable(Unobservable::FileWrite);
-        gethostbyname_r = "gethostbyname_r" => |_a| record_unobservable(Unobservable::Network);
-        res_init = "res_init" => |_a| record_unobservable(Unobservable::Network);
-        res_init_internal = "__res_init" => |_a| record_unobservable(Unobservable::Network);
-        gethostbyname2_r = "gethostbyname2_r" => |_a| record_unobservable(Unobservable::Network);
+    }
+    effects {
+        creat = "creat" => FileWrite;
+        creat64 = "creat64" => FileWrite;
+        clearenv = "clearenv" => EnvironmentWrite;
+        fork_internal = "_Fork" => ProcessControl;
+        clone = "clone" => ProcessControl;
+        execvpe = "execvpe" => ProcessControl;
+        pidfd_spawn = "pidfd_spawn" => ProcessControl;
+        pidfd_spawnp = "pidfd_spawnp" => ProcessControl;
+        dlmopen = "dlmopen" => DynamicLoad;
+        memfd_create = "memfd_create" => FileWrite;
+        renameat2 = "renameat2" => FileWrite;
+        truncate64 = "truncate64" => FileWrite;
+        ftruncate64 = "ftruncate64" => FileWrite;
+        utime = "utime" => FileWrite;
+        lutimes = "lutimes" => FileWrite;
+        futimesat = "futimesat" => FileWrite;
+        mkstemp64 = "mkstemp64" => FileWrite;
+        mkostemp64 = "mkostemp64" => FileWrite;
+        mkostemps = "mkostemps" => FileWrite;
+        tmpfile64 = "tmpfile64" => FileWrite;
+        mkfifoat = "mkfifoat" => FileWrite;
+        mknodat = "mknodat" => FileWrite;
+        fallocate = "fallocate" => FileWrite;
+        fallocate64 = "fallocate64" => FileWrite;
+        posix_fallocate = "posix_fallocate" => FileWrite;
+        posix_fallocate64 = "posix_fallocate64" => FileWrite;
+        accept4 = "accept4" => Network;
+        gethostbyname_r = "gethostbyname_r" => Network;
+        res_init = "res_init" => Network;
+        res_init_internal = "__res_init" => Network;
+        gethostbyname2_r = "gethostbyname2_r" => Network;
         // Its output must be a regular file open for writing.
-        copy_file_range = "copy_file_range" => |_a| record_unobservable(Unobservable::FileWrite);
-        sysinfo = "sysinfo" => |_a| record_unobservable(Unobservable::HostState);
-        statvfs64 = "statvfs64" => |_a| record_unobservable(Unobservable::HostState);
-        fstatvfs64 = "fstatvfs64" => |_a| record_unobservable(Unobservable::HostState);
-        statfs64 = "statfs64" => |_a| record_unobservable(Unobservable::HostState);
-        fstatfs64 = "fstatfs64" => |_a| record_unobservable(Unobservable::HostState);
+        copy_file_range = "copy_file_range" => FileWrite;
+        sysinfo = "sysinfo" => HostState;
+        statvfs64 = "statvfs64" => HostState;
+        fstatvfs64 = "fstatvfs64" => HostState;
+        statfs64 = "statfs64" => HostState;
+        fstatfs64 = "fstatfs64" => HostState;
     }
     explicit {
         open64 = "open64";
@@ -188,11 +191,14 @@ pub(in super::super) const PLATFORM_PURE: &[&str] = &[
     "__fxstat",
     "__fxstat64",
     "__gmon_start__",
+    "__libc_current_sigrtmax",
+    "__libc_current_sigrtmin",
     "__libc_single_threaded",
     "__memcpy_chk",
     "__memmove_chk",
     "__memset_chk",
     "__pthread_get_minstack",
+    "__register_atfork",
     "__stack_chk_fail",
     "__tls_get_addr",
     // s390x resolves thread-local storage through this entry point.
@@ -200,9 +206,20 @@ pub(in super::super) const PLATFORM_PURE: &[&str] = &[
     "__tls_get_offset",
     "__xpg_strerror_r",
     "dl_iterate_phdr",
+    "dup3",
+    "epoll_create",
+    "epoll_create1",
+    "epoll_ctl",
+    "epoll_pwait",
+    "epoll_pwait2",
+    "epoll_wait",
+    "eventfd",
+    "eventfd_read",
+    "eventfd_write",
     "fstat64",
     "getauxval",
     "getrandom",
+    "getrlimit64",
     "gettid",
     "gnu_get_libc_version",
     "lseek64",
@@ -211,12 +228,20 @@ pub(in super::super) const PLATFORM_PURE: &[&str] = &[
     "pidfd_open",
     "pidfd_send_signal",
     "pipe2",
+    "ppoll",
     "pread64",
+    "preadv",
+    "preadv64",
     "pthread_getattr_np",
     "pthread_getname_np",
-    "pwrite",
     "pwrite64",
+    "pwritev",
+    "pwritev64",
     "readdir64",
     "readdir64_r",
     "sched_getaffinity",
+    "sendfile",
+    "sendfile64",
+    "splice",
+    "tgkill",
 ];

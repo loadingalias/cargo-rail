@@ -220,6 +220,38 @@ pub(crate) fn settle_change_time(metadata: &fs::Metadata) {
     let _ = metadata;
 }
 
+/// A moment that orders file changes: every change before it stamps an earlier change time, and, once
+/// `separate` returns, every later change stamps this time or later.
+///
+/// The kernel stamps a change no later than it happens, from a clock at most one tick behind the
+/// real-time clock. `separate` waits two ticks past the mark, so a change after it cannot stamp an
+/// earlier time.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChangeMark(std::time::SystemTime);
+
+impl ChangeMark {
+    pub(crate) fn now() -> Self {
+        Self(std::time::SystemTime::now())
+    }
+
+    /// Wait until a change from now on stamps a time at or after the mark; at most two ticks.
+    pub(crate) fn separate(self) {
+        #[cfg(unix)]
+        {
+            let bound = 2 * change_time_tick();
+            if let Ok(remaining) = (self.0 + bound).duration_since(std::time::SystemTime::now()) {
+                // A clock set back meanwhile waits no longer than the bound.
+                std::thread::sleep(remaining.min(bound));
+            }
+        }
+    }
+
+    /// Whether the entry changed at or after the mark. An entry without a change time counts as changed.
+    pub(crate) fn changed_since(self, metadata: &fs::Metadata) -> bool {
+        change_time(metadata).is_none_or(|changed| changed >= self.0)
+    }
+}
+
 /// A file's generation once its last change is settled, for a site that binds the generation.
 ///
 /// A change within one tick of the coarse change clock can keep a just-changed file's generation, so a binding

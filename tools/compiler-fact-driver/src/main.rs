@@ -22,7 +22,7 @@ extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
-#[cfg(rail_structures_crate_type)]
+#[cfg(any(rail_structures_crate_type, rail_structures_native_lib_kind))]
 extern crate rustc_structures;
 extern crate tracing;
 extern crate tracing_subscriber;

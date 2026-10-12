@@ -168,14 +168,18 @@ fn region_protection(address: usize) -> Option<c_int> {
 // in its own register or stack slot. Variadic functions have explicit hooks below.
 type Forwarder = unsafe extern "C" fn(usize, usize, usize, usize, usize, usize) -> usize;
 
+// `forwarding` hooks observe their arguments. `effects` hooks record one effect that no key binds, whatever
+// the arguments; the system-call table names the same effect for the kernel operation.
 macro_rules! hooks {
     (
         forwarding { $($forward:ident = $forward_symbol:literal => |$arguments:ident| $observe:expr;)* }
+        effects { $($effect:ident = $effect_symbol:literal => $reason:ident;)* }
         explicit { $($explicit:ident = $explicit_symbol:literal;)* }
     ) => {
         mod originals {
             use std::sync::atomic::AtomicUsize;
             $(#[allow(non_upper_case_globals)] pub(super) static $forward: AtomicUsize = AtomicUsize::new(0);)*
+            $(#[allow(non_upper_case_globals)] pub(super) static $effect: AtomicUsize = AtomicUsize::new(0);)*
             $(#[allow(non_upper_case_globals)] pub(super) static $explicit: AtomicUsize = AtomicUsize::new(0);)*
         }
 
@@ -199,6 +203,23 @@ macro_rules! hooks {
                     unsafe { function(a0, a1, a2, a3, a4, a5) }
                 }
             )*
+            $(
+                #[allow(non_snake_case)]
+                /// # Safety
+                ///
+                /// Call only through an import slot that `rebind` pointed at this hook, with arguments that are valid for the original C function.
+                pub(super) unsafe extern "C" fn $effect(
+                    a0: usize, a1: usize, a2: usize, a3: usize, a4: usize, a5: usize,
+                ) -> usize {
+                    if observed_process() {
+                        record_unobservable(Unobservable::$reason);
+                    }
+                    // SAFETY: resolve_originals stored this symbol's address, and rebind only installs the
+                    // hook in a slot that held it.
+                    let function: Forwarder = unsafe { std::mem::transmute(original(&originals::$effect)) };
+                    unsafe { function(a0, a1, a2, a3, a4, a5) }
+                }
+            )*
         }
 
         fn hooks() -> &'static [Hook] {
@@ -210,11 +231,22 @@ macro_rules! hooks {
                     original: &originals::$forward,
                 },)*
                 $(Hook {
+                    symbol: $effect_symbol,
+                    function: forwarding::$effect as *const () as usize,
+                    original: &originals::$effect,
+                },)*
+                $(Hook {
                     symbol: $explicit_symbol,
                     function: explicit::$explicit as *const () as usize,
                     original: &originals::$explicit,
                 },)*
             ])
+        }
+
+        /// The effect that each `effects` hook records.
+        #[cfg(test)]
+        pub(super) fn effect_hooks() -> &'static [(&'static str, Unobservable)] {
+            &[$(($effect_symbol, Unobservable::$reason),)*]
         }
     };
 }
@@ -316,93 +348,115 @@ hooks! {
         realpath = "realpath" => |a| observe(libc::AT_FDCWD, path(a[0]), Access::Resolution);
         // Environment.
         getenv = "getenv" => |a| observe_environment(a[0]);
-        setenv = "setenv" => |_a| record_unobservable(Unobservable::EnvironmentWrite);
-        unsetenv = "unsetenv" => |_a| record_unobservable(Unobservable::EnvironmentWrite);
-        putenv = "putenv" => |_a| record_unobservable(Unobservable::EnvironmentWrite);
-        // Working directory and process control.
-        chdir = "chdir" => |_a| record_unobservable(Unobservable::WorkingDirectory);
-        fchdir = "fchdir" => |_a| record_unobservable(Unobservable::WorkingDirectory);
-        chroot = "chroot" => |_a| record_unobservable(Unobservable::ProcessControl);
-        fork = "fork" => |_a| record_unobservable(Unobservable::ProcessControl);
-        vfork = "vfork" => |_a| record_unobservable(Unobservable::ProcessControl);
-        execve = "execve" => |_a| record_unobservable(Unobservable::ProcessControl);
-        execv = "execv" => |_a| record_unobservable(Unobservable::ProcessControl);
-        execvp = "execvp" => |_a| record_unobservable(Unobservable::ProcessControl);
-        fexecve = "fexecve" => |_a| record_unobservable(Unobservable::ProcessControl);
-        system = "system" => |_a| record_unobservable(Unobservable::ProcessControl);
-        popen = "popen" => |_a| record_unobservable(Unobservable::ProcessControl);
-        posix_spawn_file_actions_addchdir_np = "posix_spawn_file_actions_addchdir_np"
-            => |_a| record_unobservable(Unobservable::ProcessControl);
-        posix_spawn_file_actions_addchdir = "posix_spawn_file_actions_addchdir"
-            => |_a| record_unobservable(Unobservable::ProcessControl);
-        posix_spawn_file_actions_addfchdir_np = "posix_spawn_file_actions_addfchdir_np"
-            => |_a| record_unobservable(Unobservable::ProcessControl);
-        posix_spawn_file_actions_addopen = "posix_spawn_file_actions_addopen"
-            => |_a| record_unobservable(Unobservable::ProcessControl);
-        // Network.
-        socket = "socket" => |_a| record_unobservable(Unobservable::Network);
-        socketpair = "socketpair" => |_a| record_unobservable(Unobservable::Network);
-        connect = "connect" => |_a| record_unobservable(Unobservable::Network);
-        getaddrinfo = "getaddrinfo" => |_a| record_unobservable(Unobservable::Network);
-        getnameinfo = "getnameinfo" => |_a| record_unobservable(Unobservable::Network);
-        gethostbyname = "gethostbyname" => |_a| record_unobservable(Unobservable::Network);
-        gethostbyname2 = "gethostbyname2" => |_a| record_unobservable(Unobservable::Network);
-        gethostbyaddr = "gethostbyaddr" => |_a| record_unobservable(Unobservable::Network);
         // Loading code.
-        dlopen = "dlopen" => |_a| record_unobservable(Unobservable::DynamicLoad);
         mmap = "mmap" => |a| observe_executable_memory(a[2]);
         mprotect = "mprotect" => |a| observe_executable_memory(a[2]);
+    }
+    effects {
+        setenv = "setenv" => EnvironmentWrite;
+        unsetenv = "unsetenv" => EnvironmentWrite;
+        putenv = "putenv" => EnvironmentWrite;
+        // Working directory and process control.
+        chdir = "chdir" => WorkingDirectory;
+        fchdir = "fchdir" => WorkingDirectory;
+        chroot = "chroot" => ProcessControl;
+        fork = "fork" => ProcessControl;
+        vfork = "vfork" => ProcessControl;
+        execve = "execve" => ProcessControl;
+        execv = "execv" => ProcessControl;
+        execvp = "execvp" => ProcessControl;
+        fexecve = "fexecve" => ProcessControl;
+        system = "system" => ProcessControl;
+        popen = "popen" => ProcessControl;
+        posix_spawn_file_actions_addchdir_np = "posix_spawn_file_actions_addchdir_np" => ProcessControl;
+        posix_spawn_file_actions_addchdir = "posix_spawn_file_actions_addchdir" => ProcessControl;
+        posix_spawn_file_actions_addfchdir_np = "posix_spawn_file_actions_addfchdir_np" => ProcessControl;
+        posix_spawn_file_actions_addopen = "posix_spawn_file_actions_addopen" => ProcessControl;
+        // A forked child sets its identity before it executes another program; hooks record nothing there.
+        setuid = "setuid" => ProcessControl;
+        setgid = "setgid" => ProcessControl;
+        setgroups = "setgroups" => ProcessControl;
+        setpgid = "setpgid" => ProcessControl;
+        setsid = "setsid" => ProcessControl;
+        // Network. A socket can carry data from any peer, and `recvmsg` can receive another process's
+        // descriptors, so every socket operation is a network effect, not only opening one.
+        socket = "socket" => Network;
+        socketpair = "socketpair" => Network;
+        connect = "connect" => Network;
+        bind = "bind" => Network;
+        listen = "listen" => Network;
+        accept = "accept" => Network;
+        send = "send" => Network;
+        sendto = "sendto" => Network;
+        sendmsg = "sendmsg" => Network;
+        recv = "recv" => Network;
+        recvfrom = "recvfrom" => Network;
+        recvmsg = "recvmsg" => Network;
+        getsockopt = "getsockopt" => Network;
+        setsockopt = "setsockopt" => Network;
+        getsockname = "getsockname" => Network;
+        getpeername = "getpeername" => Network;
+        shutdown = "shutdown" => Network;
+        getaddrinfo = "getaddrinfo" => Network;
+        getnameinfo = "getnameinfo" => Network;
+        gethostbyname = "gethostbyname" => Network;
+        gethostbyname2 = "gethostbyname2" => Network;
+        gethostbyaddr = "gethostbyaddr" => Network;
+        // Loading code.
+        dlopen = "dlopen" => DynamicLoad;
         // Writes.
-        unlink = "unlink" => |_a| record_unobservable(Unobservable::FileWrite);
-        unlinkat = "unlinkat" => |_a| record_unobservable(Unobservable::FileWrite);
-        rename = "rename" => |_a| record_unobservable(Unobservable::FileWrite);
-        renameat = "renameat" => |_a| record_unobservable(Unobservable::FileWrite);
-        mkdir = "mkdir" => |_a| record_unobservable(Unobservable::FileWrite);
-        mkdirat = "mkdirat" => |_a| record_unobservable(Unobservable::FileWrite);
-        rmdir = "rmdir" => |_a| record_unobservable(Unobservable::FileWrite);
-        link = "link" => |_a| record_unobservable(Unobservable::FileWrite);
-        linkat = "linkat" => |_a| record_unobservable(Unobservable::FileWrite);
-        symlink = "symlink" => |_a| record_unobservable(Unobservable::FileWrite);
-        symlinkat = "symlinkat" => |_a| record_unobservable(Unobservable::FileWrite);
-        chmod = "chmod" => |_a| record_unobservable(Unobservable::FileWrite);
-        fchmod = "fchmod" => |_a| record_unobservable(Unobservable::FileWrite);
-        fchmodat = "fchmodat" => |_a| record_unobservable(Unobservable::FileWrite);
-        chown = "chown" => |_a| record_unobservable(Unobservable::FileWrite);
-        fchown = "fchown" => |_a| record_unobservable(Unobservable::FileWrite);
-        lchown = "lchown" => |_a| record_unobservable(Unobservable::FileWrite);
-        fchownat = "fchownat" => |_a| record_unobservable(Unobservable::FileWrite);
-        truncate = "truncate" => |_a| record_unobservable(Unobservable::FileWrite);
-        ftruncate = "ftruncate" => |_a| record_unobservable(Unobservable::FileWrite);
-        utimes = "utimes" => |_a| record_unobservable(Unobservable::FileWrite);
-        futimes = "futimes" => |_a| record_unobservable(Unobservable::FileWrite);
-        utimensat = "utimensat" => |_a| record_unobservable(Unobservable::FileWrite);
-        futimens = "futimens" => |_a| record_unobservable(Unobservable::FileWrite);
-        mkstemp = "mkstemp" => |_a| record_unobservable(Unobservable::FileWrite);
-        mkostemp = "mkostemp" => |_a| record_unobservable(Unobservable::FileWrite);
-        mkstemps = "mkstemps" => |_a| record_unobservable(Unobservable::FileWrite);
-        mkdtemp = "mkdtemp" => |_a| record_unobservable(Unobservable::FileWrite);
-        tmpfile = "tmpfile" => |_a| record_unobservable(Unobservable::FileWrite);
-        mkfifo = "mkfifo" => |_a| record_unobservable(Unobservable::FileWrite);
-        mknod = "mknod" => |_a| record_unobservable(Unobservable::FileWrite);
+        unlink = "unlink" => FileWrite;
+        unlinkat = "unlinkat" => FileWrite;
+        rename = "rename" => FileWrite;
+        renameat = "renameat" => FileWrite;
+        mkdir = "mkdir" => FileWrite;
+        mkdirat = "mkdirat" => FileWrite;
+        rmdir = "rmdir" => FileWrite;
+        link = "link" => FileWrite;
+        linkat = "linkat" => FileWrite;
+        symlink = "symlink" => FileWrite;
+        symlinkat = "symlinkat" => FileWrite;
+        chmod = "chmod" => FileWrite;
+        fchmod = "fchmod" => FileWrite;
+        fchmodat = "fchmodat" => FileWrite;
+        chown = "chown" => FileWrite;
+        fchown = "fchown" => FileWrite;
+        lchown = "lchown" => FileWrite;
+        fchownat = "fchownat" => FileWrite;
+        truncate = "truncate" => FileWrite;
+        ftruncate = "ftruncate" => FileWrite;
+        utimes = "utimes" => FileWrite;
+        futimes = "futimes" => FileWrite;
+        utimensat = "utimensat" => FileWrite;
+        futimens = "futimens" => FileWrite;
+        mkstemp = "mkstemp" => FileWrite;
+        mkostemp = "mkostemp" => FileWrite;
+        mkstemps = "mkstemps" => FileWrite;
+        mkdtemp = "mkdtemp" => FileWrite;
+        tmpfile = "tmpfile" => FileWrite;
+        mkfifo = "mkfifo" => FileWrite;
+        mknod = "mknod" => FileWrite;
         // Host identity.
-        uname = "uname" => |_a| record_unobservable(Unobservable::HostState);
-        gethostname = "gethostname" => |_a| record_unobservable(Unobservable::HostState);
-        getpwuid = "getpwuid" => |_a| record_unobservable(Unobservable::HostState);
-        getpwuid_r = "getpwuid_r" => |_a| record_unobservable(Unobservable::HostState);
-        getpwnam = "getpwnam" => |_a| record_unobservable(Unobservable::HostState);
-        getpwnam_r = "getpwnam_r" => |_a| record_unobservable(Unobservable::HostState);
-        getgrgid = "getgrgid" => |_a| record_unobservable(Unobservable::HostState);
-        getgrgid_r = "getgrgid_r" => |_a| record_unobservable(Unobservable::HostState);
-        getgrnam = "getgrnam" => |_a| record_unobservable(Unobservable::HostState);
-        getgrnam_r = "getgrnam_r" => |_a| record_unobservable(Unobservable::HostState);
-        getlogin = "getlogin" => |_a| record_unobservable(Unobservable::HostState);
-        getlogin_r = "getlogin_r" => |_a| record_unobservable(Unobservable::HostState);
-        getloadavg = "getloadavg" => |_a| record_unobservable(Unobservable::HostState);
-        getifaddrs = "getifaddrs" => |_a| record_unobservable(Unobservable::HostState);
-        statvfs = "statvfs" => |_a| record_unobservable(Unobservable::HostState);
-        fstatvfs = "fstatvfs" => |_a| record_unobservable(Unobservable::HostState);
-        statfs = "statfs" => |_a| record_unobservable(Unobservable::HostState);
-        fstatfs = "fstatfs" => |_a| record_unobservable(Unobservable::HostState);
+        uname = "uname" => HostState;
+        gethostname = "gethostname" => HostState;
+        getpwuid = "getpwuid" => HostState;
+        getpwuid_r = "getpwuid_r" => HostState;
+        getpwnam = "getpwnam" => HostState;
+        getpwnam_r = "getpwnam_r" => HostState;
+        getgrgid = "getgrgid" => HostState;
+        getgrgid_r = "getgrgid_r" => HostState;
+        getgrnam = "getgrnam" => HostState;
+        getgrnam_r = "getgrnam_r" => HostState;
+        getlogin = "getlogin" => HostState;
+        getlogin_r = "getlogin_r" => HostState;
+        getloadavg = "getloadavg" => HostState;
+        getifaddrs = "getifaddrs" => HostState;
+        // System configuration strings, such as the per-user temporary directory.
+        confstr = "confstr" => HostState;
+        statvfs = "statvfs" => HostState;
+        fstatvfs = "fstatvfs" => HostState;
+        statfs = "statfs" => HostState;
+        fstatfs = "fstatfs" => HostState;
     }
     explicit {
         open = "open";
@@ -631,8 +685,15 @@ mod platform {
 /// Functions with no effect a result could depend on, shared by both platforms.
 ///
 /// Memory, strings, threads, locks, signals, time, randomness, unwinding, and operations on descriptors the
-/// macro already opened through an observed path belong here. Keep the list sorted.
+/// macro already opened through an observed path belong here. Event queues, such as epoll, eventfd, and
+/// kqueue, also belong here: they create descriptors without a path and report only on descriptors the macro
+/// already holds. Socket operations do not; they are network effects. A runtime that a macro links but never
+/// starts therefore imports only pure or hooked functions.
+///
+/// The system-call table in `seccomp.rs` classifies each kernel operation as these tables classify its C
+/// library functions; a test enforces it. Keep the list sorted.
 const PURE: &[&str] = &[
+    "_Exit",
     "_Unwind_Backtrace",
     "_Unwind_DeleteException",
     "_Unwind_FindEnclosingFunction",
@@ -695,6 +756,7 @@ const PURE: &[&str] = &[
     "fabsf",
     "fclose",
     "fcntl",
+    "fdatasync",
     "fdim",
     "fdimf",
     "feof",
@@ -702,6 +764,7 @@ const PURE: &[&str] = &[
     "fflush",
     "fgets",
     "fileno",
+    "flock",
     "floor",
     "floorf",
     "fma",
@@ -735,13 +798,10 @@ const PURE: &[&str] = &[
     "geteuid",
     "getgid",
     "getpagesize",
-    "getpeername",
     "getpid",
     "getppid",
     "getrlimit",
     "getrusage",
-    "getsockname",
-    "getsockopt",
     "gettimeofday",
     "getuid",
     "hypot",
@@ -749,6 +809,7 @@ const PURE: &[&str] = &[
     "ioctl",
     "isatty",
     "kill",
+    "killpg",
     "ldexp",
     "ldexpf",
     "lgamma",
@@ -795,6 +856,7 @@ const PURE: &[&str] = &[
     "powf",
     "pread",
     "printf",
+    "pselect",
     "pthread_atfork",
     "pthread_attr_destroy",
     "pthread_attr_getguardsize",
@@ -837,31 +899,20 @@ const PURE: &[&str] = &[
     "pthread_sigmask",
     "putc",
     "puts",
+    "pwrite",
     "raise",
     "read",
     "readdir",
     "readdir_r",
     "readv",
     "realloc",
-    "recv",
-    "recvfrom",
-    "recvmsg",
     "remainder",
     "remainderf",
     "rewinddir",
     "round",
     "roundf",
     "sched_yield",
-    "send",
-    "sendmsg",
-    "sendto",
-    "setgid",
-    "setgroups",
-    "setpgid",
-    "setsid",
-    "setsockopt",
-    "setuid",
-    "shutdown",
+    "select",
     "sigaction",
     "sigaddset",
     "sigaltstack",
@@ -873,6 +924,7 @@ const PURE: &[&str] = &[
     "sinf",
     "sinh",
     "sinhf",
+    "sleep",
     "snprintf",
     "sprintf",
     "sqrt",
@@ -898,6 +950,8 @@ const PURE: &[&str] = &[
     "usleep",
     "vfprintf",
     "vsnprintf",
+    "wait",
+    "wait4",
     "waitid",
     "waitpid",
     "write",
@@ -907,4 +961,111 @@ const PURE: &[&str] = &[
 /// The address the macro would load from its own `environ` slot or from `_NSGetEnviron`.
 pub(super) fn guarded_environment_variable() -> usize {
     std::ptr::addr_of!(ENVIRONMENT_GUARD.variable) as usize
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(super) mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    /// How the import tables treat one symbol.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(in super::super) enum ImportClass {
+        Pure,
+        /// Every call records this effect.
+        Effect(Unobservable),
+        /// A hook observes each call's arguments.
+        Observed,
+        Unclassified,
+    }
+
+    pub(in super::super) fn import_class(name: &str) -> ImportClass {
+        match classify(name) {
+            Class::Pure => ImportClass::Pure,
+            Class::Unclassified => ImportClass::Unclassified,
+            Class::Hooked(_) => effect_hooks()
+                .iter()
+                .chain(platform::effect_hooks())
+                .find(|(symbol, _)| *symbol == name)
+                .map_or(ImportClass::Observed, |(_, effect)| ImportClass::Effect(*effect)),
+        }
+    }
+
+    #[test]
+    fn classification_tables_are_sorted_and_name_each_symbol_once() {
+        for table in [PURE, PLATFORM_PURE] {
+            if let Some(pair) = table.windows(2).find(|pair| pair[0] >= pair[1]) {
+                panic!("pure table is not strictly sorted at {pair:?}");
+            }
+        }
+        let mut classified = BTreeSet::new();
+        for symbol in PURE
+            .iter()
+            .chain(PLATFORM_PURE)
+            .copied()
+            .chain(all_hooks().map(|hook| hook.symbol))
+        {
+            assert!(classified.insert(symbol), "{symbol} is classified twice");
+        }
+    }
+
+    /// Imports that the standard library and common asynchronous runtimes (tokio, mio, socket2) put into a
+    /// procedural-macro library whether or not the macro calls them. Before each was classified, linking the
+    /// code that imports it made every crate that loads the macro bypass reuse.
+    #[test]
+    fn linked_runtime_imports_are_classified() {
+        use ImportClass::{Effect, Pure};
+        #[cfg(target_os = "macos")]
+        use Unobservable::FileWrite;
+        use Unobservable::{HostState, Network};
+
+        let mut expected = vec![
+            ("accept", Effect(Network)),
+            ("bind", Effect(Network)),
+            ("listen", Effect(Network)),
+            ("recv", Effect(Network)),
+            ("send", Effect(Network)),
+            ("shutdown", Effect(Network)),
+            ("confstr", Effect(HostState)),
+            ("fdatasync", Pure),
+            ("flock", Pure),
+            ("killpg", Pure),
+            ("pwrite", Pure),
+        ];
+        #[cfg(target_os = "linux")]
+        expected.extend([
+            ("accept4", Effect(Network)),
+            ("__libc_current_sigrtmax", Pure),
+            // glibc's `pthread_atfork` is a static stub that imports `__register_atfork`.
+            ("__register_atfork", Pure),
+            ("epoll_create1", Pure),
+            ("epoll_ctl", Pure),
+            ("epoll_wait", Pure),
+            ("eventfd", Pure),
+            ("preadv", Pure),
+            ("pwritev", Pure),
+            ("sendfile", Pure),
+            ("sendfile64", Pure),
+            ("splice", Pure),
+        ]);
+        #[cfg(target_os = "macos")]
+        expected.extend([
+            ("getpeereid", Effect(Network)),
+            ("setattrlist", Effect(FileWrite)),
+            ("fsetattrlist", Effect(FileWrite)),
+            ("copyfile_state_alloc", Pure),
+            ("copyfile_state_free", Pure),
+            ("copyfile_state_get", Pure),
+            ("dispatch_time", Pure),
+            ("kevent", Pure),
+            ("kqueue", Pure),
+            ("mach_wait_until", Pure),
+            ("pthread_cond_timedwait_relative_np", Pure),
+            ("sendfile", Pure),
+        ]);
+        for (symbol, class) in expected {
+            assert_eq!(import_class(symbol), class, "{symbol}");
+        }
+    }
 }

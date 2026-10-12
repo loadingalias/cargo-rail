@@ -15,7 +15,7 @@ use crate::source::ContentDigest;
 use super::{
     NATIVE_CAPTURE_LIMITS, NativeCaptureBudget, NativeMetadataGuard, capture_guarded_file,
     compiler_library_search_values, compiler_rust_search_path, native_metadata_guard, native_relative_path,
-    resolve_portable_compiler_path, semantic_mode, validate_sha256,
+    native_search_path, resolve_portable_compiler_path, semantic_mode, validate_sha256,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -25,6 +25,9 @@ pub(super) enum RustInputPath {
     OutputDirectory(String),
     HostToolchain(String),
     TargetLibrary(String),
+    /// An absolute host path in a `-L all=` or bare `-L` directory outside every other root. Such a
+    /// directory is also a native search directory, so the action already reuses only on this host's paths.
+    Host(String),
 }
 
 impl RustInputPath {
@@ -33,7 +36,8 @@ impl RustInputPath {
             Self::Repository(path)
             | Self::OutputDirectory(path)
             | Self::HostToolchain(path)
-            | Self::TargetLibrary(path) => path,
+            | Self::TargetLibrary(path)
+            | Self::Host(path) => path,
         }
     }
 
@@ -43,6 +47,7 @@ impl RustInputPath {
             Self::OutputDirectory(_) => Self::OutputDirectory(relative),
             Self::HostToolchain(_) => Self::HostToolchain(relative),
             Self::TargetLibrary(_) => Self::TargetLibrary(relative),
+            Self::Host(_) => Self::Host(relative),
         }
     }
 
@@ -54,7 +59,15 @@ impl RustInputPath {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| RailError::message("Rust input path names no directory entry"))?;
-        let parent = native_relative_path(relative.parent().unwrap_or_else(|| Path::new("")))?;
+        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        let parent = if matches!(self, Self::Host(_)) {
+            parent
+                .to_str()
+                .ok_or_else(|| RailError::message("Rust host input path is not UTF-8"))?
+                .to_string()
+        } else {
+            native_relative_path(parent)?
+        };
         Ok((self.with_relative(parent), name))
     }
 
@@ -62,6 +75,8 @@ impl RustInputPath {
         let relative = self.relative();
         self.with_relative(if relative.is_empty() {
             name.to_string()
+        } else if matches!(self, Self::Host(_)) {
+            Path::new(relative).join(name).to_string_lossy().into_owned()
         } else {
             format!("{relative}/{name}")
         })
@@ -69,6 +84,19 @@ impl RustInputPath {
 
     fn validate(&self) -> RailResult<()> {
         let path = self.relative();
+        if let Self::Host(path) = self {
+            let mut components = Path::new(path).components();
+            if path.len() > super::MAX_DYNAMIC_REPOSITORY_PATH_BYTES
+                || path.contains(['\0', '\\'])
+                || !matches!(components.next(), Some(Component::RootDir))
+                || !components.all(|component| matches!(component, Component::Normal(_)))
+            {
+                return Err(RailError::message(
+                    "Rust host input path is not a normalized absolute path",
+                ));
+            }
+            return Ok(());
+        }
         if path.len() > super::MAX_DYNAMIC_REPOSITORY_PATH_BYTES
             || path.contains(['\0', '\\'])
             || Path::new(path)
@@ -105,9 +133,39 @@ pub(super) struct RustSearchSelector {
 pub(super) struct RustInputSelector {
     pub(super) crates: Vec<RustCrateSelector>,
     pub(super) searches: Vec<RustSearchSelector>,
+    /// Whether the compilation reads only crate metadata; see `NativeInputObservation::metadata_only`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) metadata_only: bool,
 }
 
 impl RustInputSelector {
+    /// The rlibs that rustc never reads.
+    ///
+    /// Rustc groups a crate's candidates by filename hash and reads the `.rmeta` first. In a metadata-only
+    /// compilation it then skips the `.rlib` with the same hash. Cargo writes that rlib after the rmeta,
+    /// possibly while a pipelined dependent compiles, so binding it would make the search depend on timing.
+    fn unread_rlibs(&self) -> BTreeSet<String> {
+        if !self.metadata_only {
+            return BTreeSet::new();
+        }
+        self.crates
+            .iter()
+            .flat_map(|source| {
+                let names = source
+                    .selected
+                    .iter()
+                    .filter_map(|path| Path::new(path.relative()).file_name().and_then(|name| name.to_str()))
+                    .collect::<BTreeSet<_>>();
+                names
+                    .iter()
+                    .filter_map(|name| name.strip_suffix(".rmeta"))
+                    .map(|stem| format!("{stem}.rlib"))
+                    .filter(|rlib| !names.contains(rlib.as_str()))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     pub(super) fn validate(&self) -> RailResult<()> {
         if self.crates.len() > 4096
             || self.searches.len() > 512
@@ -230,7 +288,7 @@ impl RustInputWitness {
             file.path.validate()?;
             match (&file.path, &file.content) {
                 (
-                    RustInputPath::Repository(_) | RustInputPath::OutputDirectory(_),
+                    RustInputPath::Repository(_) | RustInputPath::OutputDirectory(_) | RustInputPath::Host(_),
                     RustInputContent::Repository {
                         content_digest, bytes, ..
                     },
@@ -262,6 +320,8 @@ struct Roots {
     target_spelling: Option<PathBuf>,
     output: Option<PathBuf>,
     output_spelling: Option<PathBuf>,
+    /// `-L all=` and bare `-L` directories outside every other root: spelling to canonical directory.
+    host_searches: BTreeMap<PathBuf, PathBuf>,
 }
 
 impl Roots {
@@ -276,7 +336,30 @@ impl Roots {
             target_spelling: target.map(Path::to_path_buf),
             output: None,
             output_spelling: None,
+            host_searches: BTreeMap::new(),
         })
+    }
+
+    /// Admit a crate search directory that is also a native search directory and lies outside every other
+    /// root. Its candidates bind by absolute host path.
+    fn capture_host_search(&mut self, path: &Path) -> RailResult<()> {
+        let canonical = crate::utils::canonicalize_allow_missing(path)?;
+        let rooted = [
+            Some(&self.repository),
+            Some(&self.host),
+            self.target.as_ref(),
+            self.output.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|root| canonical.starts_with(root));
+        if !rooted {
+            self.host_searches.insert(path.to_path_buf(), canonical);
+            if self.host_searches.len() > 512 {
+                return Err(RailError::message("Rust host search directory bound exceeded"));
+            }
+        }
+        Ok(())
     }
 
     fn capture_repository_spelling(&mut self, path: &Path) -> RailResult<()> {
@@ -327,6 +410,7 @@ impl Roots {
                     .iter()
                     .map(|spelling| (spelling, &self.repository)),
             )
+            .chain(&self.host_searches)
             .find_map(|(spelling, root)| path.strip_prefix(spelling).ok().map(|relative| root.join(relative)))
             .unwrap_or_else(|| path.to_path_buf());
         if canonical != mapped {
@@ -343,6 +427,16 @@ impl Roots {
             RustInputPath::OutputDirectory(native_relative_path(relative)?)
         } else if let Ok(relative) = path.strip_prefix(&self.repository) {
             RustInputPath::Repository(native_relative_path(relative)?)
+        } else if self
+            .host_searches
+            .values()
+            .any(|directory| path == directory || path.parent() == Some(directory.as_path()))
+        {
+            RustInputPath::Host(
+                path.to_str()
+                    .ok_or_else(|| RailError::message("Rust host input path is not UTF-8"))?
+                    .to_string(),
+            )
         } else {
             return Err(RailError::message(
                 "Rust input is outside the repository and captured toolchain libraries",
@@ -365,6 +459,14 @@ impl Roots {
                 .target
                 .as_ref()
                 .ok_or_else(|| RailError::message("Rust target library authority is unavailable"))?,
+            RustInputPath::Host(path) => {
+                let resolved = PathBuf::from(path);
+                return if self.encode(&resolved)? == RustInputPath::Host(path.clone()) {
+                    Ok(resolved)
+                } else {
+                    Err(RailError::message("Rust input path authority changed"))
+                };
+            }
         };
         let resolved = root.join(path.relative());
         if self.encode(&resolved)? != *path {
@@ -386,6 +488,7 @@ impl Roots {
                     .iter()
                     .map(|spelling| (spelling, &self.repository)),
             )
+            .chain(&self.host_searches)
         {
             if crate::utils::canonicalize_allow_missing(spelling)? != *expected {
                 return Err(RailError::message(
@@ -522,6 +625,9 @@ impl ColdRustInputGuard {
                 if let Some(path) = compiler_rust_search_path(value, "all")? {
                     let path = resolve_portable_compiler_path(path, &current_directory, workspace_root)?;
                     roots.capture_repository_spelling(&path)?;
+                    if native_search_path(value)?.is_some() {
+                        roots.capture_host_search(&path)?;
+                    }
                     search_paths.push(path);
                 }
             }
@@ -656,8 +762,13 @@ impl ColdRustInputGuard {
             })
             .collect::<RailResult<Vec<_>>>()?;
         searches.sort_unstable();
-        let selector = RustInputSelector { crates, searches };
+        let selector = RustInputSelector {
+            crates,
+            searches,
+            metadata_only: observation.metadata_only,
+        };
         selector.validate()?;
+        let unread = selector.unread_rlibs();
         for search in &observation.searches {
             let directory = self.roots.encode(Path::new(&search.directory))?;
             let before = self
@@ -668,10 +779,12 @@ impl ColdRustInputGuard {
             let names = before
                 .files
                 .keys()
-                .filter(|name| patterns.matches(name))
-                .cloned()
+                .filter(|name| patterns.matches(name) && !unread.contains(*name))
                 .collect::<Vec<_>>();
-            if names != search.files {
+            if names
+                .into_iter()
+                .ne(search.files.iter().filter(|name| !unread.contains(*name)))
+            {
                 return Err(RailError::message(
                     "Rust library search changed before compiler selection",
                 ));
@@ -690,40 +803,43 @@ impl ColdRustInputGuard {
             .collect::<BTreeSet<_>>();
         let mut searches = Vec::new();
         let mut resolver = DirectoryResolver::new(&self.roots);
+        let unread = selector.unread_rlibs();
         for search in &selector.searches {
             let before = self
                 .directories
                 .get(&search.directory)
                 .ok_or_else(|| RailError::message("Rust search selector names an uncaptured directory"))?;
             let patterns = PatternIndex::new(&search.patterns);
-            let current = snapshot_directory(
+            let snapshot = snapshot_directory(
                 &resolver.directory(&search.directory)?,
                 Some(&patterns),
                 None,
                 started,
                 &mut budget,
             )?;
+            let current = snapshot
+                .files
+                .keys()
+                .filter(|name| !unread.contains(*name))
+                .collect::<Vec<_>>();
             let expected = before
                 .files
                 .keys()
-                .filter(|name| patterns.matches(name))
+                .filter(|name| patterns.matches(name) && !unread.contains(*name))
                 .collect::<Vec<_>>();
-            if current.present != before.present || current.files.keys().ne(expected.iter().copied()) {
-                let changed = current.files.keys().find(|name| !expected.contains(name)).or_else(|| {
-                    expected
-                        .iter()
-                        .find(|name| !current.files.contains_key(name.as_str()))
-                        .copied()
-                });
+            if snapshot.present != before.present || current != expected {
+                let changed = current
+                    .iter()
+                    .find(|name| !expected.contains(name))
+                    .or_else(|| expected.iter().find(|name| !current.contains(name)));
                 return Err(RailError::message(format!(
                     "Rust library search candidates changed during compilation in '{}': {}",
                     resolver.directory(&search.directory)?.display(),
-                    changed.map_or("directory presence changed", String::as_str),
+                    changed.map_or("directory presence changed", |name| name.as_str()),
                 )));
             }
             let candidates = current
-                .files
-                .keys()
+                .iter()
                 .map(|name| search.directory.child(name))
                 .collect::<Vec<_>>();
             paths.extend(candidates.iter().cloned());
@@ -764,7 +880,10 @@ impl ColdRustInputGuard {
             {
                 return Err(RailError::message("Rust library input changed during compilation"));
             }
-            let content = if matches!(path, RustInputPath::Repository(_) | RustInputPath::OutputDirectory(_)) {
+            let content = if matches!(
+                path,
+                RustInputPath::Repository(_) | RustInputPath::OutputDirectory(_) | RustInputPath::Host(_)
+            ) {
                 let (content_digest, guard, bytes) = capture_guarded_file(&physical, started, &mut budget)?;
                 if guard != *expected {
                     return Err(RailError::message(
@@ -847,6 +966,7 @@ impl RustInputCapture {
         let started = Instant::now();
         let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
         let mut resolver = DirectoryResolver::new(&self.roots);
+        let unread = self.witness.selector.unread_rlibs();
         for (search, selector) in self.witness.searches.iter().zip(&self.witness.selector.searches) {
             let patterns = PatternIndex::new(&selector.patterns);
             let current = snapshot_directory(
@@ -860,6 +980,7 @@ impl RustInputCapture {
                 || current
                     .files
                     .keys()
+                    .filter(|name| !unread.contains(*name))
                     .map(String::as_str)
                     .ne(search.candidates.iter().map(|path| {
                         Path::new(path.relative())
@@ -1019,6 +1140,10 @@ fn capture_bindings(
         .collect()
 }
 
+fn directory_path_is(search: &Path, directory: &RustInputPath) -> bool {
+    Path::new(directory.relative()) == search
+}
+
 fn binding_paths(roots: &Roots, directories: &BTreeSet<RustInputPath>) -> RailResult<BTreeMap<PathBuf, bool>> {
     let mut bindings = BTreeMap::new();
     if directories.is_empty() {
@@ -1030,6 +1155,7 @@ fn binding_paths(roots: &Roots, directories: &BTreeSet<RustInputPath>) -> RailRe
     pending.push(roots.host_spelling.clone());
     pending.extend(roots.target_spelling.iter().cloned());
     pending.extend(roots.output_spelling.iter().cloned());
+    pending.extend(roots.host_searches.keys().cloned());
     let mut selected_links = BTreeSet::new();
     while let Some(selected) = pending.pop() {
         for component in selected.ancestors() {
@@ -1084,6 +1210,11 @@ fn binding_paths(roots: &Roots, directories: &BTreeSet<RustInputPath>) -> RailRe
                 .target
                 .as_ref()
                 .ok_or_else(|| RailError::message("Rust target library authority is unavailable"))?,
+            RustInputPath::Host(_) => roots
+                .host_searches
+                .values()
+                .find(|search| directory_path_is(search, directory))
+                .ok_or_else(|| RailError::message("Rust host input is outside its search directory"))?,
         };
         while let Some(path) = parent.filter(|path| path.starts_with(boundary)) {
             match fs::symlink_metadata(&path) {
@@ -1260,6 +1391,11 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_extern("libdependency-a.rlib")
+        }
+
+        /// A consumer of `dependency` through `extern_file`, which Cargo names an `.rmeta` when it pipelines.
+        fn with_extern(extern_file: &str) -> Self {
             let temporary = tempfile::tempdir().unwrap();
             let root = temporary.path().canonicalize().unwrap();
             let workspace = root.join("workspace");
@@ -1273,6 +1409,9 @@ mod tests {
             fs::write(dependencies.join("libdependency-a.rlib"), b"AAAA").unwrap();
             fs::write(dependencies.join("libdependency-b.rlib"), b"BBBB").unwrap();
             fs::write(dependencies.join("libunrelated.rlib"), b"unrelated bytes").unwrap();
+            if extern_file.ends_with(".rmeta") {
+                fs::write(dependencies.join(extern_file), b"AAAA metadata").unwrap();
+            }
             let arguments = vec![
                 workspace.join("source.rs").into_os_string(),
                 "--crate-type=rlib".into(),
@@ -1282,7 +1421,7 @@ mod tests {
                 dependencies.clone().into_os_string(),
                 format!("-Ldependency={}", dependencies.display()).into(),
                 "--extern".into(),
-                format!("dependency={}", dependencies.join("libdependency-a.rlib").display()).into(),
+                format!("dependency={}", dependencies.join(extern_file).display()).into(),
             ];
             let recorder = crate::compiler::observation::begin_invocation_in(
                 &observations,
@@ -1298,7 +1437,7 @@ mod tests {
                 request_identity: "1".repeat(64),
                 crates: vec![NativeCrateSource {
                     name: "dependency".into(),
-                    files: vec![dependencies.join("libdependency-a.rlib").to_str().unwrap().into()],
+                    files: vec![dependencies.join(extern_file).to_str().unwrap().into()],
                 }],
                 searches: vec![NativeCrateSearch {
                     directory: dependencies.to_str().unwrap().into(),
@@ -1308,6 +1447,8 @@ mod tests {
                     }],
                     files: vec!["libdependency-a.rlib".into(), "libdependency-b.rlib".into()],
                 }],
+                metadata_only: true,
+                native_libraries: Vec::new(),
                 assembly: NativeAssemblyObservation::NoCodegen,
                 codegen: crate::compiler::native_input_protocol::NativeCodegenObservation::NotRun,
                 macros: None,
@@ -1325,6 +1466,95 @@ mod tests {
         fn cold(&self) -> ColdRustInputGuard {
             ColdRustInputGuard::capture(&self.raw, &self.workspace, &self.host, None).unwrap()
         }
+    }
+
+    #[test]
+    fn bare_search_outside_every_root_binds_its_host_candidates() {
+        let mut fixture = Fixture::new();
+        let system = fixture.workspace.parent().unwrap().join("system");
+        fs::create_dir(&system).unwrap();
+        fs::write(system.join("libsystem.so"), b"a native library").unwrap();
+        let search = |kind: &str| format!("-L{kind}{}", system.display());
+        fixture.raw.compiler_arguments.push(search(""));
+        fixture.observed.searches.push(NativeCrateSearch {
+            directory: system.to_str().unwrap().into(),
+            patterns: fixture.observed.searches[0].patterns.clone(),
+            files: Vec::new(),
+        });
+        let captured = fixture
+            .cold()
+            .complete(&fixture.observed)
+            .expect("a bare search outside every root");
+        let host = RustInputPath::Host(system.to_str().unwrap().into());
+        assert!(
+            captured
+                .witness()
+                .searches
+                .iter()
+                .any(|search| search.directory == host)
+        );
+        let warm = RustInputCapture::capture(
+            captured.witness().selector(),
+            &fixture.raw,
+            &fixture.workspace,
+            &fixture.host,
+            None,
+        )
+        .expect("warm capture of the host search");
+        assert_eq!(warm.witness(), captured.witness());
+        fs::write(system.join("libdependency-c.rlib"), b"CCCC").unwrap();
+        captured
+            .revalidate()
+            .expect_err("a crate that appears in the host search changes it");
+
+        // A crate-only search is not a native search directory, so it may reach distributed reuse.
+        let last = fixture.raw.compiler_arguments.len() - 1;
+        fixture.raw.compiler_arguments[last] = search("dependency=");
+        assert!(
+            ColdRustInputGuard::capture(&fixture.raw, &fixture.workspace, &fixture.host, None).is_err(),
+            "a dependency search outside every root"
+        );
+    }
+
+    #[test]
+    fn pipelined_rlib_beside_selected_metadata_is_not_an_input_of_a_metadata_only_compilation() {
+        let mut fixture = Fixture::with_extern("libdependency-a.rmeta");
+        let rlib = fixture.dependencies.join("libdependency-a.rlib");
+        let search = &mut fixture.observed.searches[0];
+        search.patterns.push(NativeCratePattern {
+            prefix: "libdependency".into(),
+            suffix: ".rmeta".into(),
+        });
+        // Cargo starts the consumer from the rmeta; the producer writes its rlib while the consumer compiles.
+        search.files = vec!["libdependency-a.rmeta".into(), "libdependency-b.rlib".into()];
+        let pipelined = |fixture: &Fixture| {
+            fs::remove_file(&rlib).unwrap();
+            let cold = fixture.cold();
+            fs::write(&rlib, b"AAAA written later").unwrap();
+            cold.complete(&fixture.observed)
+        };
+        let captured = pipelined(&fixture).expect("rustc skips the rlib once the rmeta supplies its metadata");
+        assert!(
+            captured
+                .witness()
+                .files
+                .iter()
+                .all(|file| !file.path.relative().ends_with("libdependency-a.rlib"))
+        );
+        let warm = RustInputCapture::capture(
+            captured.witness().selector(),
+            &fixture.raw,
+            &fixture.workspace,
+            &fixture.host,
+            None,
+        )
+        .expect("warm capture beside the finished rlib");
+        assert_eq!(warm.witness(), captured.witness(), "cold and warm bind the same search");
+        captured.revalidate().expect("the skipped rlib is not revalidated");
+
+        // A compilation that needs object code reads every rlib, so one appearing mid-search still fails.
+        fixture.observed.metadata_only = false;
+        pipelined(&fixture).expect_err("an rlib that rustc may read appeared during compilation");
     }
 
     #[test]
