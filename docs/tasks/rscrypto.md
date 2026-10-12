@@ -2,8 +2,10 @@
 
 ## Release status and undeclared independent lockfiles
 
-Status: fixed and validated locally on 2026-10-11; pre-release CI, release,
-and consumer adoption remain gated.
+Status: released and authenticated on 2026-10-11 in
+[Cargo-Rail 0.31.1](https://github.com/loadingalias/cargo-rail/releases/tag/v0.31.1)
+and [Cargo-Rail-Action 11.0.1](https://github.com/loadingalias/cargo-rail-action/releases/tag/v11.0.1).
+Permanent rscrypto adoption and shared-cache qualification remain separate gates.
 Cargo-Rail 0.31.0 reproduces both defects despite the earlier consumer task's administrative
 closure.
 
@@ -37,27 +39,49 @@ and all seven ignored CLI contract tests against the final candidate,
 including independent release-record validation.
 The new source-bound evidence is retained in rscrypto's `benchmark_results/cargo-rail-release-repair-20261011T175442Z/REPORT.md` and its verified sibling archive.
 
-The patch release intent is `.changes/release-status-lockfile-discovery.md`.
-The owner authorized source commits and pushes on 2026-10-11.
-Wait for CI and a new owner instruction before starting either release.
-Remaining gates:
+The fixes are pushed in `3b5a72800973d1356c7eba7b37b5a98af545595f`.
+A test-only Windows diagnostic-path correction is pushed in
+`371affd0a45c1a62c26a739f69212989a70aa856`;
+[source CI](https://github.com/loadingalias/cargo-rail/actions/runs/38169338124) passed all 13 jobs.
+The owner then authorized both releases through Cargo-Rail's transaction engine.
+Cargo-Rail 0.31.1 released commit `ec6d396738b8ad9204236c088c3e3ffea9440adf`:
+its [executor](https://github.com/loadingalias/cargo-rail/actions/runs/38177591767),
+[prepared-source CI](https://github.com/loadingalias/cargo-rail/actions/runs/38177971615),
+and [packaging](https://github.com/loadingalias/cargo-rail/actions/runs/38177977323) succeeded.
+The crates.io package matches that commit.
+All declared assets passed immutable-release verification;
+the four native archives and host manifest passed source-bound provenance verification.
+The authenticated native release passed all 15 installation checks, both defect probes,
+and six unpublished-dependent/tag-format regression cases.
 
-1. Verify CI for the pushed source,
-   then obtain the owner's instruction to release Cargo-Rail 0.31.1.
-1. Refresh the companion Action's exact CLI/tooling lock and planner/cache/release defaults after
-   that release exists, qualify its published archive, and release the matching Action 11.0.1 patch.
-   Its independent reader consumes the unchanged contracts;
-   this refresh preserves the documented supported version pair.
-1. rscrypto Track 1 authenticates the released CLI, updates its existing version,
-   platform asset pins, and immutable Action pins, then reruns both defect probes,
-   the unpublished-dependent/tag-format regression, and clean `just release-check`.
-   The check must exit 0 or 1, plan only rscrypto, and select `v0.10.0` → `v0.11.0`.
+Cargo-Rail-Action 11.0.1 released commit `2104429578cfeef1a6a5beb379c2202e0310df78`.
+Its CLI/tooling lock and all four public defaults select Cargo-Rail 0.31.1.
+The stored plan v9, release-plan v10, and release-record v11 contracts remain unchanged.
+Its [source CI](https://github.com/loadingalias/cargo-rail-action/actions/runs/38182970178),
+[executor](https://github.com/loadingalias/cargo-rail-action/actions/runs/38185569613),
+and [prepared-source packaging](https://github.com/loadingalias/cargo-rail-action/actions/runs/38185653741) succeeded.
+All six declared assets passed immutable-release and source-bound provenance verification.
+The published native Action runtime independently validates both terminal release records.
+The `v11` alias and immutable `v11.0.1` tag resolve to the same released commit.
 
-The fixes remain unpublished.
-The companion Action has no pending production change because the stored contracts are unchanged.
-Keep its existing released CLI lock and defaults until Cargo-Rail 0.31.1 exists.
-The installed CLI, consumer tracked source, earlier sealed bundle,
-and Track 2 ownership remain unchanged.
+On clean rscrypto at `cbf72d905c8ff5f88ed43fec4b65251161ee541a`, a per-process PATH override
+selected the authenticated published CLI.
+`just release-check` exited 0; its direct JSON check exited 1 for pending preparation.
+Both planned only rscrypto and selected `v0.10.0` → `v0.11.0` without warnings.
+Tracked source, index state, tooling pins, and the global CLI were unchanged by this preview.
+The new evidence and read-only CI release audit are retained in
+rscrypto's `benchmark_results/cargo-rail-coordinated-release-20261011T214119Z/REPORT.md`
+and its verified sibling archive.
+The earlier sealed bundles remain unchanged.
+
+Remaining gate: rscrypto Track 1 permanently adopts the authenticated CLI,
+updates its existing version and platform asset URLs/checksums,
+and pins the Action to `2104429578cfeef1a6a5beb379c2202e0310df78`.
+It then repeats the defect probes, unpublished-dependent/tag-format regression,
+and clean `just release-check` after adoption.
+The check must exit 0 or 1, plan only rscrypto, and select `v0.10.0` → `v0.11.0`.
+No alias tags or change to rscrypto's tag-creation logic are required.
+Track 2 and provider source ownership remain unchanged.
 No current Action defect is reproduced.
 Shared-cache producer/reader reuse remains unproved and is a separate qualification gate.
 
