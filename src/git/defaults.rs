@@ -1,14 +1,13 @@
 //! Select a default base reference for Git change detection.
 
-use crate::error::RailResult;
+use crate::error::{RailError, RailResult};
 use crate::git::SystemGit;
 
-/// Detect the default base ref for change detection
+/// Detect the default branch that change detection compares against.
 ///
-/// Tries in order:
-/// 1. origin/HEAD symref (most reliable)
-/// 2. origin/main (common convention)
-/// 3. HEAD~1 (fallback for local-only repos)
+/// Tries `origin/HEAD`, then `origin/main`, `origin/master`, `main`, and `master`.
+/// Fails when none exists instead of guessing a nearer commit, because a nearer base
+/// would silently leave earlier commits out of the comparison.
 ///
 /// # Example
 ///
@@ -16,11 +15,11 @@ use crate::git::SystemGit;
 /// # use cargo_rail::git::defaults::detect_default_base_ref;
 /// # use cargo_rail::git::SystemGit;
 /// # let git = SystemGit::open(std::path::Path::new(".")).unwrap();
-/// let base_ref = detect_default_base_ref(&git);
-/// // Returns: the remote default, "origin/main", or "HEAD~1"
+/// let base_ref = detect_default_base_ref(&git)?;
+/// // Returns: the remote default, or the first conventional default branch that exists
+/// # Ok::<(), cargo_rail::error::RailError>(())
 /// ```
 pub fn detect_default_base_ref(git: &SystemGit) -> RailResult<String> {
-    // Try 1: origin/HEAD symref (most reliable)
     let output = git
         .git_cmd()
         .args(["symbolic-ref", "refs/remotes/origin/HEAD", "--short"])
@@ -35,13 +34,15 @@ pub fn detect_default_base_ref(git: &SystemGit) -> RailResult<String> {
         }
     }
 
-    // Try 2: origin/main
-    if git.resolve_reference("origin/main").is_ok() {
-        return Ok("origin/main".to_string());
+    for candidate in ["origin/main", "origin/master", "main", "master"] {
+        if git.resolve_reference(candidate).is_ok() {
+            return Ok(candidate.to_string());
+        }
     }
-
-    // Try 3: Fallback to HEAD~1 (for local-only repos or fresh clones)
-    Ok("HEAD~1".to_string())
+    Err(RailError::with_help(
+        "cannot determine the default branch: none of origin/HEAD, origin/main, origin/master, main, or master exists",
+        "pass --since <REF> to name the comparison base",
+    ))
 }
 
 #[cfg(test)]
@@ -49,14 +50,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_base_prefers_remote_head_then_main_then_local_fallback() {
+    fn default_base_prefers_remote_head_then_conventional_branches_and_never_guesses() {
         let directory = tempfile::tempdir().unwrap();
         crate::git::init_repo(directory.path(), "main").unwrap();
         let git = SystemGit::open(directory.path()).unwrap();
         git.set_config("user.name", "Test User").unwrap();
         git.set_config("user.email", "test@example.com").unwrap();
         git.set_config("commit.gpgsign", "false").unwrap();
-        assert_eq!(detect_default_base_ref(&git).unwrap(), "HEAD~1");
+        // An unborn repository has no default branch to compare against.
+        let error = detect_default_base_ref(&git).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot determine the default branch"),
+            "{error}"
+        );
 
         let commit = git
             .git_cmd()
@@ -64,6 +70,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(commit.status.success(), "{commit:?}");
+        assert_eq!(detect_default_base_ref(&git).unwrap(), "main");
         for name in ["main", "stable"] {
             let output = git
                 .git_cmd()

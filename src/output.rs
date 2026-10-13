@@ -46,8 +46,6 @@ pub struct InvocationOutput {
     progress: bool,
     verbose: bool,
     color: bool,
-    stdout_terminal: bool,
-    stderr_terminal: bool,
 }
 
 impl InvocationOutput {
@@ -78,7 +76,6 @@ impl InvocationOutput {
         protocol: OutputProtocol,
         redirected_progress: bool,
     ) -> Self {
-        let stdout_terminal = std::io::stdout().is_terminal();
         let stderr_terminal = std::io::stderr().is_terminal();
         let raw_or_json = protocol != OutputProtocol::Text;
         Self {
@@ -87,24 +84,12 @@ impl InvocationOutput {
             progress: !quiet && (!raw_or_json || redirected_progress),
             verbose: verbose && !raw_or_json,
             color: !raw_or_json && stderr_terminal && std::env::var_os("NO_COLOR").is_none(),
-            stdout_terminal,
-            stderr_terminal,
         }
     }
 
     /// Selected transport protocol.
     pub const fn protocol(&self) -> OutputProtocol {
         self.protocol
-    }
-
-    /// Whether stdout was a terminal at invocation start.
-    pub const fn stdout_is_terminal(&self) -> bool {
-        self.stdout_terminal
-    }
-
-    /// Whether stderr was a terminal at invocation start.
-    pub const fn stderr_is_terminal(&self) -> bool {
-        self.stderr_terminal
     }
 
     /// Whether bounded operational detail was requested.
@@ -416,7 +401,8 @@ pub fn write_stdout(arguments: std::fmt::Arguments<'_>, newline: bool) {
             && let Err(_stderr_error) = writeln!(std::io::stderr().lock(), "error: failed writing stdout: {error}")
         {
         }
-        std::process::exit(1);
+        // Exit 1 means a pending mutation; an output failure is an operational error.
+        std::process::exit(crate::error::ExitCode::Error.as_i32());
     }
 }
 

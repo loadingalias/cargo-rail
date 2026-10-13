@@ -19,7 +19,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::compiler::cfg_eval::{TargetCfgSet, cargo_target_constraint_matches};
 use crate::compiler::{CoverageView, FeatureSelection};
-use crate::error::{RailError, RailResult};
+use crate::error::{RailError, RailResult, ReplayedError};
 use crate::executable::resolve_program as resolve_executable_program;
 use crate::graph::WorkspaceGraph;
 use crate::source::ContentDigest;
@@ -1034,29 +1034,7 @@ impl ResolutionInputs {
     }
 }
 
-#[derive(Debug, Clone)]
-struct CachedResolutionError {
-    message: String,
-    help: Option<String>,
-}
-
-impl CachedResolutionError {
-    fn from_error(error: RailError) -> Self {
-        Self {
-            message: error.to_string(),
-            help: error.help_message(),
-        }
-    }
-
-    fn to_error(&self) -> RailError {
-        self.help.as_ref().map_or_else(
-            || RailError::message(self.message.clone()),
-            |help| RailError::with_help(self.message.clone(), help.clone()),
-        )
-    }
-}
-
-type CachedView = Result<Arc<ResolutionView>, CachedResolutionError>;
+type CachedView = Result<Arc<ResolutionView>, ReplayedError>;
 type ViewCell = OnceLock<CachedView>;
 
 /// Context-local lazy cache of exact Cargo resolution views.
@@ -1066,8 +1044,8 @@ pub(crate) struct ResolutionViews {
     cargo_current_dir: PathBuf,
     base: Arc<ResolutionView>,
     cache: Mutex<FxHashMap<ResolutionViewKey, Arc<ViewCell>>>,
-    cargo_config: OnceLock<Result<Arc<CargoConfigSnapshot>, CachedResolutionError>>,
-    toolchain: OnceLock<Result<ToolchainIdentity, CachedResolutionError>>,
+    cargo_config: OnceLock<Result<Arc<CargoConfigSnapshot>, ReplayedError>>,
+    toolchain: OnceLock<Result<ToolchainIdentity, ReplayedError>>,
 }
 
 impl ResolutionViews {
@@ -1140,8 +1118,7 @@ impl ResolutionViews {
     pub(crate) fn inputs(&self) -> RailResult<ResolutionInputs> {
         let cargo_config = self.cargo_config()?;
         let toolchain = cached_value(self.toolchain.get_or_init(|| {
-            ToolchainIdentity::capture(&self.cargo_current_dir, &cargo_config)
-                .map_err(CachedResolutionError::from_error)
+            ToolchainIdentity::capture(&self.cargo_current_dir, &cargo_config).map_err(ReplayedError::capture)
         }))?;
         Ok(ResolutionInputs {
             cargo_config,
@@ -1153,7 +1130,7 @@ impl ResolutionViews {
         cached_value(self.cargo_config.get_or_init(|| {
             CargoConfigSnapshot::capture(&self.cargo_current_dir)
                 .map(Arc::new)
-                .map_err(CachedResolutionError::from_error)
+                .map_err(ReplayedError::capture)
         }))
     }
 
@@ -1188,7 +1165,7 @@ impl ResolutionViews {
                 .map_err(|_| RailError::message("Cargo resolution view cache lock poisoned"))?;
             Arc::clone(cache.entry(key.clone()).or_insert_with(|| Arc::new(ViewCell::new())))
         };
-        let result = cell.get_or_init(|| self.load(&key, options).map_err(CachedResolutionError::from_error));
+        let result = cell.get_or_init(|| self.load(&key, options).map_err(ReplayedError::capture));
         cached_value(result)
     }
 
@@ -1274,7 +1251,7 @@ impl ResolutionViews {
     }
 }
 
-fn cached_value<T: Clone>(value: &Result<T, CachedResolutionError>) -> RailResult<T> {
+fn cached_value<T: Clone>(value: &Result<T, ReplayedError>) -> RailResult<T> {
     value.clone().map_err(|error| error.to_error())
 }
 

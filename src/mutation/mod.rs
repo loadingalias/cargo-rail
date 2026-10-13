@@ -624,7 +624,8 @@ pub fn validate_changed_paths_with_allowed_paths(
     let canonical_git_root = canonicalize_existing(&git.worktree_root)?;
     let mut allowed = allowed_worktree_paths(&canonical_git_root, allowed_paths)?;
     allowed.extend(expected_paths(plan).into_iter().chain(declared_input_paths(plan)));
-    let changed = ctx.changed_source_paths()?;
+    // The context's capture predates the writes; only a live capture sees new untracked files.
+    let changed = ctx.live_changed_source_paths()?;
     let unexpected: Vec<_> = changed.into_iter().filter(|path| !allowed.contains(path)).collect();
     if unexpected.is_empty() {
         return Ok(());

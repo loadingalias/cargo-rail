@@ -6,12 +6,7 @@ pub struct ParsedSubject<'a> {
     pub breaking: bool,
     pub description: &'a str,
 }
-impl ParsedSubject<'_> {
-    #[expect(dead_code, reason = "parser API used by release diagnostics")]
-    pub fn is_conventional(&self) -> bool {
-        self.commit_type.is_some()
-    }
-}
+impl ParsedSubject<'_> {}
 pub fn parse_subject<'a>(subject: &'a str, body: Option<&str>) -> ParsedSubject<'a> {
     let breaking_body = body.is_some_and(|b| b.contains("BREAKING CHANGE:") || b.contains("BREAKING-CHANGE:"));
     let Some((head, description)) = subject.split_once(':') else {

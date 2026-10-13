@@ -305,3 +305,81 @@ tag_format = "v{version}"
     })();
     super::helpers::finish_test(result);
 }
+
+/// The post-apply check must see files that appeared after the context captured the worktree.
+#[test]
+fn test_post_apply_check_rejects_untracked_files_created_after_capture() {
+    use cargo_rail::mutation::{
+        MUTATION_CONTRACT_VERSION, MutationPlan, MutationPreApplyChecks, MutationResolvedRefs, validate_changed_paths,
+    };
+
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("post-apply-untracked")?;
+        ws.add_crate("demo", "0.1.0", &[])?;
+        ws.commit("Add demo")?;
+        let ctx = cargo_rail::workspace::WorkspaceContext::build_with_snapshot(&ws.path)?;
+        let empty = MutationPlan {
+            contract_version: MUTATION_CONTRACT_VERSION,
+            operation: "unify".to_string(),
+            operation_id: "unify-test".to_string(),
+            inputs_fingerprint: String::new(),
+            resolved_refs: MutationResolvedRefs {
+                git_head: String::new(),
+                git_branch: "main".to_string(),
+            },
+            actions: Vec::new(),
+            declared_inputs: Vec::new(),
+            risks: Vec::new(),
+            trace: Vec::new(),
+            pre_apply: MutationPreApplyChecks {
+                git_head: String::new(),
+                config_fingerprint: String::new(),
+                toolchain_fingerprint: String::new(),
+                lock_fingerprint: String::new(),
+                metadata_fingerprint: String::new(),
+                worktree_fingerprint: String::new(),
+                changed_paths: Vec::new(),
+            },
+        };
+        validate_changed_paths(&ctx, &empty)?;
+
+        std::fs::write(ws.path.join("unplanned.txt"), "written during apply\n")?;
+        let error = validate_changed_paths(&ctx, &empty).expect_err("a new untracked file is unplanned");
+        assert!(error.to_string().contains("unplanned.txt"), "{error}");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+/// A `--remote` override reaches the same Git commands as configured remotes; an option-like
+/// value must stop before any Git process runs.
+#[test]
+fn test_split_rejects_an_option_like_remote_override() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("split-remote-option")?;
+        ws.add_crate("mylib", "0.1.0", &[])?;
+        ws.commit("Add mylib")?;
+        let split_dir = TempDir::new()?;
+        git(split_dir.path(), &["init", "--initial-branch=main"])?;
+        let config = format!(
+            "[crates.mylib.split]\nremote = \"{}\"\nbranch = \"main\"\nmode = \"single\"\n",
+            split_dir.path().display().to_string().replace('\\', "\\\\")
+        );
+        std::fs::write(ws.path.join("rail.toml"), config)?;
+        let marker = ws.path.join("upload-pack-ran");
+        let remote = format!("--remote=--upload-pack=touch {};", marker.display());
+
+        let output = run_cargo_rail(
+            &ws.path,
+            &["rail", "split", "run", "mylib", "--allow-dirty", "--check", &remote],
+        )?;
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("--remote"),
+            "{output:?}"
+        );
+        assert!(!marker.exists(), "Git ran the option-like remote");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}

@@ -81,31 +81,23 @@ fn main() {
         exit_with_error(error);
     }
     if let Err(error) = diagnostics_result {
+        // The command already wrote its one machine value; keep this failure on stderr.
+        if cargo_rail::output::is_json_mode() {
+            eprintln!("error: {error}");
+            std::process::exit(error.exit_code().as_i32());
+        }
         exit_with_error(error);
     }
 }
 
 fn run(cli: RailCli, cli_preparation_started: Instant) -> RailResult<()> {
-    let workspace_root = if let Some(ref root) = cli.workspace_root {
-        if root.is_absolute() {
-            root.clone()
-        } else {
-            match std::env::current_dir() {
-                Ok(cwd) => cwd.join(root),
-                Err(error) => {
-                    cargo_rail::error!("failed to get current directory: {}", error);
-                    return Err(RailError::ExitWithCode { code: 1 });
-                }
-            }
-        }
-    } else {
-        match std::env::current_dir() {
-            Ok(dir) => dir,
-            Err(error) => {
-                cargo_rail::error!("failed to get current directory: {}", error);
-                return Err(RailError::ExitWithCode { code: 1 });
-            }
-        }
+    let current_dir = || {
+        std::env::current_dir().map_err(|error| RailError::message(format!("failed to get current directory: {error}")))
+    };
+    let workspace_root = match cli.workspace_root {
+        Some(ref root) if root.is_absolute() => root.clone(),
+        Some(ref root) => current_dir()?.join(root),
+        None => current_dir()?,
     };
 
     let config_override = cli.config.as_deref();

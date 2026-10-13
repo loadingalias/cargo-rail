@@ -109,6 +109,16 @@ impl ContentDigest {
     pub(crate) fn from_sha256_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
+
+    /// Whether `text` is `sha256:` followed by a digest in this type's display form.
+    pub(crate) fn is_sha256_text(text: &str) -> bool {
+        text.strip_prefix("sha256:").is_some_and(Self::is_sha256_hex)
+    }
+
+    /// Whether `hex` is this type's display form: 64 lowercase hexadecimal digits.
+    pub(crate) fn is_sha256_hex(hex: &str) -> bool {
+        hex.len() == 64 && hex.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    }
 }
 
 impl fmt::Display for ContentDigest {
@@ -707,7 +717,15 @@ impl GitWorktreeCapture {
     }
 
     pub(crate) fn capture_excluding(git: &SystemGit, generated_roots: &[PathBuf]) -> RailResult<Self> {
-        let exclusions = SourceExclusions::from_absolute_roots(git, generated_roots)?;
+        Self::capture_with(git, SourceExclusions::from_absolute_roots(git, generated_roots)?)
+    }
+
+    /// Capture the live worktree again under this capture's exclusions.
+    pub(crate) fn recapture(&self, git: &SystemGit) -> RailResult<Self> {
+        Self::capture_with(git, self.exclusions.clone())
+    }
+
+    fn capture_with(git: &SystemGit, exclusions: SourceExclusions) -> RailResult<Self> {
         let state = read_git_capture_state(git, &exclusions)?;
         let (tree, filesystem) = capture_final_tree(git, &state.index, &state.status.untracked)?;
         ensure_git_capture_state_unchanged(git, &state, &exclusions)?;

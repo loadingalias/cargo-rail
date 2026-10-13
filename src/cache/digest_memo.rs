@@ -119,8 +119,10 @@ impl RememberedFile {
 
     /// The recorded digest and length, if this record describes exactly this generation.
     pub(crate) fn digest_for(&self, generation: &[u8], bytes: u64) -> Option<(&str, u64)> {
-        (self.bytes == bytes && self.generation == hex(generation) && valid_digest(&self.digest))
-            .then_some((self.digest.as_str(), self.bytes))
+        (self.bytes == bytes
+            && self.generation == hex(generation)
+            && crate::source::ContentDigest::is_sha256_text(&self.digest))
+        .then_some((self.digest.as_str(), self.bytes))
     }
 }
 
@@ -177,8 +179,10 @@ impl DigestMemo {
         let mut bytes = Vec::new();
         file.take(MAX_ENTRY_BYTES + 1).read_to_end(&mut bytes).ok()?;
         let entry: MemoEntry = serde_json::from_slice(&bytes).ok()?;
-        (entry.version == ENTRY_VERSION && entry.generation == hex(generation) && valid_digest(&entry.digest))
-            .then_some((entry.digest, entry.bytes))
+        (entry.version == ENTRY_VERSION
+            && entry.generation == hex(generation)
+            && crate::source::ContentDigest::is_sha256_text(&entry.digest))
+        .then_some((entry.digest, entry.bytes))
     }
 
     /// Record a digest computed from a file whose generation was identical before and after the read.
@@ -359,12 +363,6 @@ fn tree_key(root: &Path, record: TreeRecord) -> Option<Vec<u8>> {
     .to_vec();
     key.extend_from_slice(root.to_str()?.as_bytes());
     Some(key)
-}
-
-fn valid_digest(digest: &str) -> bool {
-    digest
-        .strip_prefix("sha256:")
-        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
 }
 
 fn readiness_digest(key: &[u8]) -> String {

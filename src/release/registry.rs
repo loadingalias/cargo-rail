@@ -83,7 +83,10 @@ impl RegistryObserver {
     }
 
     fn read(&self, name: &str, version: &str, checksum: &str) -> Result<RegistryObservation, String> {
-        if !valid_name(name) || !valid_checksum(checksum) || semver::Version::parse(version).is_err() {
+        if !valid_name(name)
+            || !crate::source::ContentDigest::is_sha256_hex(checksum)
+            || semver::Version::parse(version).is_err()
+        {
             return Err("invalid sealed package identity".into());
         }
         match self.read_index(name)? {
@@ -154,13 +157,6 @@ pub(crate) fn valid_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-pub(crate) fn valid_checksum(checksum: &str) -> bool {
-    checksum.len() == 64
-        && checksum
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
 // Registry records are an extensible external format. Serde rejects duplicate
 // authority fields; unrelated Cargo metadata does not grant publication authority.
 #[derive(Deserialize)]
@@ -184,7 +180,10 @@ fn observe_records(bytes: &[u8], name: &str, version: &str, checksum: &str) -> R
             serde_json::from_slice(line).map_err(|_| "registry returned an invalid index record")?;
         let mut parsed = semver::Version::parse(&record.vers).map_err(|_| "registry returned an invalid version")?;
         parsed.build = semver::BuildMetadata::EMPTY;
-        if record.name != name || !valid_checksum(&record.cksum) || !versions.insert(parsed.clone()) {
+        if record.name != name
+            || !crate::source::ContentDigest::is_sha256_hex(&record.cksum)
+            || !versions.insert(parsed.clone())
+        {
             return Err("registry returned ambiguous package identities or checksums".into());
         }
         if record.v.is_some_and(|v| !matches!(v, 1 | 2)) {

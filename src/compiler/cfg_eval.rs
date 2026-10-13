@@ -45,13 +45,19 @@ impl TargetCfgSet {
     }
 
     fn predicate_applicability(&self, key: &str, value: Option<&str>) -> CfgApplicability {
-        if key == "feature" {
-            return CfgApplicability::Maybe;
+        // Rustflags select target features, and the profile selects the panic strategy;
+        // bare `rustc --print cfg` output sees neither.
+        if matches!(key, "feature" | "target_feature" | "panic") {
+            return if self.matches_predicate(key, value) {
+                CfgApplicability::Yes
+            } else {
+                CfgApplicability::Maybe
+            };
         }
         if self.matches_predicate(key, value) {
             return CfgApplicability::Yes;
         }
-        if key.starts_with("target_") || key == "panic" || (value.is_none() && matches!(key, "unix" | "windows")) {
+        if key.starts_with("target_") || (value.is_none() && matches!(key, "unix" | "windows")) {
             CfgApplicability::No
         } else {
             // Build scripts and caller-provided rustflags can define custom cfgs that
@@ -519,6 +525,21 @@ mod tests {
             "x86_64-unknown-linux-gnu",
             Some(&cfg)
         ));
+    }
+
+    #[test]
+    fn flag_dependent_predicates_stay_possible_for_cleanup() {
+        let cfg =
+            TargetCfgSet::from_rustc_output("unix\ntarget_os=\"linux\"\ntarget_feature=\"sse2\"\npanic=\"unwind\"\n");
+        let may_apply = |expression| cfg_expression_may_apply(expression, std::iter::once(Some(&cfg)));
+
+        // `-C target-feature=+aes` and `panic = "abort"` change these without changing the target.
+        assert!(may_apply("all(feature = \"hw\", target_feature = \"aes\")"));
+        assert!(may_apply("panic = \"abort\""));
+        assert!(may_apply("target_feature = \"sse2\""));
+        // Predicates the target alone fixes are still decided.
+        assert!(!may_apply("target_os = \"windows\""));
+        assert!(!may_apply("windows"));
     }
 
     #[test]

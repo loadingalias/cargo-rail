@@ -4,10 +4,8 @@ use crate::config::Pre1BreakingBump;
 use crate::error::{RailError, RailResult};
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::path::Path;
 use std::str::FromStr;
-use toml_edit::DocumentMut;
 
 /// Version bump strategy
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,36 +220,6 @@ pub(crate) fn commit_bump_level(parsed: &crate::release::changelog::ParsedSubjec
 pub struct VersionBumper;
 
 impl VersionBumper {
-    /// Get current version from Cargo.toml
-    pub fn get_version(manifest_path: &Path) -> RailResult<Version> {
-        let content = fs::read_to_string(manifest_path)
-            .map_err(|e| RailError::message(format!("Failed to read {}: {}", manifest_path.display(), e)))?;
-
-        let doc: DocumentMut = content
-            .parse()
-            .map_err(|e| RailError::message(format!("Failed to parse {} as TOML: {}", manifest_path.display(), e)))?;
-
-        let version_str = doc
-            .get("package")
-            .and_then(|p| p.get("version"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                RailError::with_help(
-                    format!("No version field in {}", manifest_path.display()),
-                    "Ensure [package.version] is set or use workspace inheritance",
-                )
-            })?;
-
-        Version::parse(version_str).map_err(|e| {
-            RailError::message(format!(
-                "Invalid version '{}' in {}: {}",
-                version_str,
-                manifest_path.display(),
-                e
-            ))
-        })
-    }
-
     /// Bump version in Cargo.toml
     ///
     /// Uses lossless TOML editing to preserve comments and formatting.
@@ -321,87 +289,6 @@ impl VersionBumper {
         editor.write()?;
 
         Ok(new_version)
-    }
-
-    /// Update dependency version in a Cargo.toml
-    ///
-    /// Updates dependencies that reference a specific crate to use a new version.
-    /// This is needed when bumping versions in a workspace - dependent crates
-    /// need to update their dependency declarations.
-    pub fn update_dependency_version(manifest_path: &Path, dep_name: &str, new_version: &Version) -> RailResult<bool> {
-        use crate::toml::editor::TomlEditor;
-
-        let mut editor = TomlEditor::open(manifest_path)?;
-        let doc = editor.doc_mut();
-        let mut updated = false;
-
-        // Check all dependency sections
-        for section in &["dependencies", "dev-dependencies", "build-dependencies"] {
-            if let Some(deps) = doc.get_mut(section).and_then(|d| d.as_table_like_mut())
-                && let Some(dep) = deps.get_mut(dep_name)
-            {
-                // Update version field
-                if let Some(dep_table) = dep.as_inline_table_mut()
-                    && dep_table.contains_key("version")
-                {
-                    dep_table.insert("version", format!("^{}", new_version).into());
-                    updated = true;
-                } else if let Some(dep_table) = dep.as_table_mut()
-                    && dep_table.contains_key("version")
-                {
-                    dep_table["version"] = toml_edit::value(format!("^{}", new_version));
-                    updated = true;
-                }
-            }
-        }
-
-        if updated {
-            // Write back
-            editor.write()?;
-        }
-
-        Ok(updated)
-    }
-
-    /// Update [workspace.dependencies] entry for a crate
-    ///
-    /// When a workspace member is bumped, the workspace.dependencies entry
-    /// needs to be updated too if it has a version field.
-    pub fn update_workspace_dependency(
-        manifest_path: &Path,
-        dep_name: &str,
-        new_version: &Version,
-    ) -> RailResult<bool> {
-        use crate::toml::editor::TomlEditor;
-
-        let mut editor = TomlEditor::open(manifest_path)?;
-        let doc = editor.doc_mut();
-        let mut updated = false;
-
-        // Check [workspace.dependencies]
-        if let Some(workspace) = doc.get_mut("workspace")
-            && let Some(deps) = workspace.get_mut("dependencies").and_then(|d| d.as_table_like_mut())
-            && let Some(dep) = deps.get_mut(dep_name)
-        {
-            // Update version field if present
-            if let Some(dep_table) = dep.as_inline_table_mut()
-                && dep_table.contains_key("version")
-            {
-                dep_table.insert("version", new_version.to_string().into());
-                updated = true;
-            } else if let Some(dep_table) = dep.as_table_mut()
-                && dep_table.contains_key("version")
-            {
-                dep_table["version"] = toml_edit::value(new_version.to_string());
-                updated = true;
-            }
-        }
-
-        if updated {
-            editor.write()?;
-        }
-
-        Ok(updated)
     }
 }
 

@@ -242,7 +242,8 @@ pub(crate) struct NativeMacroObservation {
     pub(crate) environment: Vec<String>,
     pub(crate) spawns: Vec<NativeMacroSpawn>,
     pub(crate) unobservable: Vec<NativeMacroUnobservable>,
-    /// Imported symbols that made the observation incomplete, so an `import_unclassified` bypass names them.
+    /// Imported symbols that made the observation incomplete, so a `procedural_macro_import_unclassified` bypass
+    /// names them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) unobservable_imports: Vec<String>,
 }

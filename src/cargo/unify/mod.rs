@@ -2,8 +2,6 @@
 //!
 //! This module contains the core unification logic, split into focused components:
 //! - `version_utils` - Pure version parsing and comparison utilities
-//! - `version_planner` - Version resolution, exact pins, conflict detection
-//! - `feature_planner` - Feature intersection/union, default-features policy
 //! - `transitive_planner` - Fragmented transitive dependency detection & pins
 //! - `feature_pruner` - Dead/optional feature scanning
 //! - `unused_finder` - Unused dependency detection

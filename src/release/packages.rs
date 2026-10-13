@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{RailError, RailResult};
 use crate::release::planner::ReleasePlan;
-use crate::release::registry::{RegistryObservation, RegistryObserver, valid_checksum, valid_name};
+use crate::release::registry::{RegistryObservation, RegistryObserver, valid_name};
 use crate::source::ContentDigest;
 use crate::workspace::WorkspaceContext;
 
@@ -96,7 +96,7 @@ impl PackageArchive {
             || attempt.name != self.name
             || attempt.version != self.version
             || attempt.sha256 != self.sha256
-            || !valid_checksum(&attempt.identity)
+            || !crate::source::ContentDigest::is_sha256_hex(&attempt.identity)
         {
             return Err(RailError::message("upload attempt does not match the sealed package"));
         }
@@ -120,7 +120,7 @@ impl PackageSeal {
             if archive.name != package.name
                 || archive.version != package.new_version.to_string()
                 || !valid_name(&archive.name)
-                || !valid_checksum(&archive.sha256)
+                || !crate::source::ContentDigest::is_sha256_hex(&archive.sha256)
                 || archive.bytes == 0
                 || archive.bytes > MAX_PACKAGE_BYTES
             {
@@ -186,15 +186,7 @@ pub(crate) fn prepare(
     for package in &selected {
         command.args(["--package", &package.name]);
     }
-    for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if name == "CARGO_RAIL_RELEASE_TOKEN"
-            || name == "CARGO_REGISTRY_TOKEN"
-            || name.starts_with("CARGO_REGISTRIES_") && name.ends_with("_TOKEN")
-        {
-            command.env_remove(key);
-        }
-    }
+    super::process::remove_release_credentials(&mut command);
     let output = command.output()?;
     if !output.status.success() {
         return Err(RailError::message(format!(

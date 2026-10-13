@@ -1656,6 +1656,64 @@ fn config_migrate_deletes_a_default_only_file_and_rejects_drift() {
     crate::helpers::finish_test(result);
 }
 
+#[test]
+fn config_migrate_rejects_check_with_apply_and_keeps_explicit_files() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-migrate-explicit")?;
+        ws.add_crate("member", "0.1.0", &[])?;
+        let default_only = "[unify]\ncompiler_targets = []\n";
+        let discovered = ws.path.join(".config/rail.toml");
+        fs::write(&discovered, default_only)?;
+        fs::create_dir_all(ws.path.join("policy"))?;
+        let explicit = ws.path.join("policy/rail.toml");
+        fs::write(&explicit, default_only)?;
+        ws.commit("Default-only configurations")?;
+
+        // `--check` before `apply` must not be silently dropped by the apply path.
+        let combined = run_cargo_rail(&ws.path, &["rail", "config", "migrate", "--check", "apply"])?;
+        assert_eq!(combined.status.code(), Some(2), "{combined:?}");
+        assert_eq!(fs::read_to_string(&discovered)?, default_only);
+
+        // An explicitly selected file is emptied, never deleted, so the same command line keeps working.
+        let selected = ["rail", "--config", "policy/rail.toml"];
+        let applied = run_cargo_rail(&ws.path, &[&selected[..], &["config", "migrate", "apply"]].concat())?;
+        assert!(applied.status.success(), "{applied:?}");
+        assert!(explicit.exists(), "an explicit configuration must not be deleted");
+        let validate = run_cargo_rail(&ws.path, &[&selected[..], &["config", "validate"]].concat())?;
+        assert!(validate.status.success(), "{validate:?}");
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}
+
+#[test]
+fn config_explain_lists_fields_that_serialization_omits_when_unset() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-explain-unset")?;
+        ws.add_crate("member", "0.1.0", &[])?;
+        ws.commit("Default configuration")?;
+
+        for field in ["release.auxiliary_cargo_manifests", "unify.transitive_pinning.host"] {
+            let output = run_cargo_rail(&ws.path, &["rail", "config", "explain", field, "-f", "json"])?;
+            assert!(output.status.success(), "{field}: {output:?}");
+        }
+        let all = run_cargo_rail(&ws.path, &["rail", "config", "explain", "--all", "-f", "json"])?;
+        assert!(all.status.success(), "{all:?}");
+        let all: serde_json::Value = serde_json::from_slice(&all.stdout)?;
+        let paths = all["fields"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("explain fields"))?
+            .iter()
+            .filter_map(|field| field["path"].as_str())
+            .collect::<Vec<_>>();
+        for field in ["release.auxiliary_cargo_manifests", "unify.transitive_pinning.host"] {
+            assert!(paths.contains(&field), "--all omits {field}: {paths:?}");
+        }
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}
+
 /// A previous-minor policy file with keys that later releases removed.
 const PREVIOUS_MINOR_POLICY: &str = "# Project policy\n[run]\nprofile = \"ci\"\n\n[release]\n\
      require_changelog_entries = true\n\n[unify]\ninclude_paths = false\n";

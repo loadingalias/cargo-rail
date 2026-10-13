@@ -58,7 +58,6 @@ fn create_test_workspace() -> Result<TempDir> {
             timestamp: format!("2024-01-01T00:00:0{}+00:00", i),
             command: format!("test {}", i),
             files_modified: vec![],
-            config_snapshot: None,
             description: None,
         };
         metadata.save(&backup_dir)?;

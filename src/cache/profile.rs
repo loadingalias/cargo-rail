@@ -153,9 +153,9 @@ impl InstalledCacheProfile {
 
     fn validate(&self) -> RailResult<()> {
         if self.version != PROFILE_VERSION
-            || !valid_identity(&self.profile_id)
-            || !valid_identity(&self.generation)
-            || !valid_identity(&self.owner_installation)
+            || !crate::source::ContentDigest::is_sha256_hex(&self.profile_id)
+            || !crate::source::ContentDigest::is_sha256_hex(&self.generation)
+            || !crate::source::ContentDigest::is_sha256_hex(&self.owner_installation)
             || self.roots.len() > MAX_PROFILE_ROOTS
             || (self.roots.is_empty() != (self.state == ProfileState::Detached))
         {
@@ -165,7 +165,7 @@ impl InstalledCacheProfile {
         let mut paths = BTreeSet::new();
         for root in &self.roots {
             if !root.canonical_root.is_absolute()
-                || !valid_identity(&root.physical_identity)
+                || !crate::source::ContentDigest::is_sha256_hex(&root.physical_identity)
                 || !physical.insert(root.physical_identity.as_str())
                 || !paths.insert(root.canonical_root.as_path())
             {
@@ -210,8 +210,8 @@ struct ProfileBindingRecord {
 impl ProfileBindingRecord {
     fn validate(&self) -> RailResult<()> {
         if self.version != BINDING_VERSION
-            || !valid_identity(&self.physical_identity)
-            || !valid_identity(&self.profile_id)
+            || !crate::source::ContentDigest::is_sha256_hex(&self.physical_identity)
+            || !crate::source::ContentDigest::is_sha256_hex(&self.profile_id)
             || !self.canonical_root.is_absolute()
         {
             return Err(RailError::message("workspace cache profile binding is invalid"));
@@ -348,7 +348,7 @@ struct ProfileTransaction {
 impl ProfileTransaction {
     fn validate(&self) -> RailResult<()> {
         if self.version != TRANSACTION_VERSION
-            || !valid_identity(&self.transaction_id)
+            || !crate::source::ContentDigest::is_sha256_hex(&self.transaction_id)
             || self.mutations.is_empty()
             || self.mutations.len() > MAX_TRANSACTION_MUTATIONS
         {
@@ -1556,18 +1556,11 @@ fn valid_relative_store_path(path: &Path) -> bool {
 }
 
 fn validate_identity(value: &str) -> RailResult<&str> {
-    if valid_identity(value) {
+    if crate::source::ContentDigest::is_sha256_hex(value) {
         Ok(value)
     } else {
         Err(RailError::message("cache profile identity is invalid"))
     }
-}
-
-fn valid_identity(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]

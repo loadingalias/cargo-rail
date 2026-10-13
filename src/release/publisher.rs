@@ -73,13 +73,6 @@ impl<'a> ReleasePublisher<'a> {
         Self { ctx, release_config }
     }
 
-    /// Pre-flight validation: check all prerequisites before starting release
-    ///
-    /// This catches issues early rather than failing mid-release.
-    pub fn preflight_check(&self, plan: &ReleasePlan, skip_publish: bool, skip_tag: bool) -> RailResult<Vec<String>> {
-        Ok(self.preflight(plan, skip_publish, skip_tag)?.warnings)
-    }
-
     fn preflight(&self, plan: &ReleasePlan, skip_publish: bool, skip_tag: bool) -> RailResult<ReleasePreflight> {
         for package in &plan.crates {
             package.api_evidence.require_ready(&package.name)?;
@@ -1485,7 +1478,7 @@ impl<'a> ReleasePublisher<'a> {
                     path.display()
                 )));
             };
-            git.run_git(&["clean", "-f", "--", path])?;
+            git.run_git(&["--literal-pathspecs", "clean", "-f", "--", path])?;
         }
         Ok(())
     }

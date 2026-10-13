@@ -1007,19 +1007,6 @@ impl SystemGit {
         self.get_commits_bulk(&shas)
     }
 
-    /// Get files changed in a specific commit
-    ///
-    /// Returns list of (path, change_type) where change_type is A(dded), M(odified), D(eleted),
-    /// R(enamed), or C(opied).
-    ///
-    /// For renames and copies, both the old and new paths are returned:
-    /// - Old path with 'D' (deleted from old location)
-    /// - New path with 'A' (added at new location)
-    pub fn get_changed_files(&self, commit_sha: &str) -> RailResult<Vec<(PathBuf, char)>> {
-        let output = self.run_git(&["diff-tree", "--no-commit-id", "--name-status", "-r", "-z", commit_sha])?;
-        parse_name_status_output_z(&output.stdout)
-    }
-
     /// Get per-commit path changes through one bounded `diff-tree --stdin` stream.
     pub(crate) fn get_changed_files_bulk(&self, commit_shas: &[String]) -> RailResult<Vec<Vec<(PathBuf, char)>>> {
         use std::io::Write as _;
@@ -1144,32 +1131,11 @@ impl SystemGit {
         Ok(sha)
     }
 
-    /// Get commits touching a specific path in a range
-    ///
-    /// Returns commits in chronological order (oldest first).
-    pub fn get_commits_touching_path(
-        &self,
-        path: &Path,
-        since_sha: Option<&str>,
-        until_ref: &str,
-    ) -> RailResult<Vec<CommitInfo>> {
+    /// Get the commits reachable from `until_ref` that touch `path`, oldest first.
+    pub fn get_commits_touching_path(&self, path: &Path, until_ref: &str) -> RailResult<Vec<CommitInfo>> {
         let relative_path = self.normalize_path(path)?;
         let git_path = utils::path_to_git_format(&relative_path);
-
-        let mut args = vec!["log", "--reverse", "--format=%H"];
-        let range_arg;
-
-        // Add range
-        if let Some(since) = since_sha {
-            range_arg = format!("{}..{}", since, until_ref);
-            args.push(&range_arg);
-        } else {
-            args.push(until_ref);
-        }
-
-        // Add path filter
-        args.push("--");
-        args.push(&git_path);
+        let args = ["log", "--reverse", "--format=%H", until_ref, "--", &git_path];
 
         let output = self.run_git(&args)?;
         let shas: Vec<String> = String::from_utf8_lossy(&output.stdout)
@@ -2170,22 +2136,6 @@ impl SystemGit {
         }))
     }
 
-    /// Add a remote repository
-    pub fn add_remote(&self, name: &str, url: &str) -> RailResult<()> {
-        match self.run_git(&["remote", "add", name, url]) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                // Check if error is because remote already exists
-                if let RailError::Git(GitError::CommandFailed { stderr, .. }) = &e
-                    && stderr.contains("already exists")
-                {
-                    return Ok(());
-                }
-                Err(e)
-            }
-        }
-    }
-
     /// List all remotes
     pub fn list_remotes(&self) -> RailResult<Vec<(String, String)>> {
         // Use run_git_check since failure returns empty list
@@ -2206,25 +2156,6 @@ impl SystemGit {
         }
 
         Ok(remotes)
-    }
-
-    /// Push to remote
-    pub fn push_to_remote(&self, remote_name: &str, branch: &str) -> RailResult<()> {
-        progress!("   Pushing to remote '{}'...", remote_name);
-
-        if let Err(error) = self.run_git_observable(&["push", "-u", remote_name, branch]) {
-            return match error {
-                RailError::Git(GitError::CommandFailed { stderr, .. }) => Err(RailError::Git(GitError::PushFailed {
-                    remote: remote_name.to_string(),
-                    branch: branch.to_string(),
-                    reason: stderr,
-                })),
-                other => Err(other),
-            };
-        }
-
-        progress!("   ✅ Pushed to {}/{}", remote_name, branch);
-        Ok(())
     }
 
     /// Publish one exact commit to an exact configured URL with an exact
@@ -2255,7 +2186,7 @@ impl SystemGit {
         let refspec = format!("{desired_commit}:{destination_ref}");
         progress!("   Publishing the exact prepared target commit...");
 
-        if let Err(error) = self.run_git_observable(&["push", &lease, remote_url, &refspec]) {
+        if let Err(error) = self.run_git_observable(&["push", &lease, "--", remote_url, &refspec]) {
             return match error {
                 RailError::Git(GitError::CommandFailed { stderr, .. }) => Err(RailError::Git(GitError::PushFailed {
                     remote: "configured remote URL".to_string(),
@@ -2267,16 +2198,6 @@ impl SystemGit {
         }
 
         progress!("   ✅ Published exact prepared target commit");
-        Ok(())
-    }
-
-    /// Fetch from remote
-    pub fn fetch_from_remote(&self, remote_name: &str) -> RailResult<()> {
-        progress!("   Fetching from remote '{}'...", remote_name);
-
-        self.run_git(&["fetch", remote_name])?;
-
-        progress!("   ✅ Fetched from {}", remote_name);
         Ok(())
     }
 
@@ -4218,22 +4139,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_changed_files() {
-        let git = SystemGit::open(&find_git_root()).unwrap();
-        let head = git.head_commit().unwrap();
-
-        // Get changed files for HEAD
-        let changed = git.get_changed_files(&head).unwrap();
-
-        // HEAD should have at least one changed file (unless it's the initial commit)
-        // Just verify the call succeeds and returns valid data
-        for (path, change_type) in changed {
-            assert!(!path.as_os_str().is_empty());
-            assert!(['A', 'M', 'D', 'R', 'C'].contains(&change_type));
-        }
-    }
-
-    #[test]
     fn test_get_commits_bulk() {
         let git = SystemGit::open(&find_git_root()).unwrap();
 
@@ -4314,9 +4219,7 @@ mod tests {
         let git = SystemGit::open(&find_git_root()).unwrap();
 
         // Get commits that touched Cargo.toml
-        let commits = git
-            .get_commits_touching_path(Path::new("Cargo.toml"), None, "HEAD")
-            .unwrap();
+        let commits = git.get_commits_touching_path(Path::new("Cargo.toml"), "HEAD").unwrap();
 
         // Cargo.toml should have been modified at least once
         assert!(!commits.is_empty(), "Cargo.toml should have commits");

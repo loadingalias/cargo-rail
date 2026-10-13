@@ -2637,7 +2637,7 @@ fn transfer_authenticated_component(
         || crate::utils::is_symlink_or_reparse(&metadata)
         || metadata.len() == 0
         || metadata.len() > MAX_FACT_DRIVER_BYTES
-        || !is_executable(&metadata)
+        || !crate::executable::is_executable(&metadata)
     {
         return Err(RailError::message(
             "compiler fact driver is not a bounded real executable file",
@@ -3042,18 +3042,6 @@ fn valid_hex(value: &str, length: usize) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-#[cfg(unix)]
-fn is_executable(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    metadata.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn is_executable(_metadata: &fs::Metadata) -> bool {
-    true
 }
 
 #[cfg(test)]

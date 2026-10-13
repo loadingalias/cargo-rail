@@ -178,7 +178,7 @@ fn check_release(ctx: &WorkspaceContext, crate_name: &str, baseline: &str, targe
         return Err(RailError::message("manifest path is not valid UTF-8"));
     };
 
-    let output = process::run(
+    let output = process::run_without_release_credentials(
         "cargo",
         &[
             "semver-checks",

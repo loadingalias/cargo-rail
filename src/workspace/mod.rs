@@ -17,17 +17,12 @@ pub(crate) use config_preflight::discovery_root;
 pub mod context;
 /// Immutable authoritative workspace capture.
 pub mod snapshot;
-/// High-level façade for crate information queries
-pub mod view;
 
 // Re-export workspace types from context module
 pub use context::{CargoState, GitState, WorkspaceContext};
 pub use snapshot::{
     LockedPackageIdentity, LockfileSnapshot, SnapshotFile, SnapshotId, SnapshotPackage, WorkspaceSnapshot,
 };
-
-// Re-export view types
-pub use view::{CrateInfo, WorkspaceView};
 
 /// Return the workspace-owned root for generated cargo-rail state.
 pub(crate) fn cargo_rail_state_root(workspace_root: &Path) -> PathBuf {

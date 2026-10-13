@@ -97,8 +97,29 @@ fn run_init_impl(
         eprintln!("         cargo-rail works best with Cargo workspaces\n");
     }
 
-    // Check if target path already exists
+    // Discovery reads policy only at the Cargo workspace root, so a file written below it
+    // would never become active.
+    let discovery_root = crate::workspace::discovery_root(workspace_root);
+    if !dry_run && crate::utils::canonicalize_existing(workspace_root).is_ok_and(|root| root != discovery_root) {
+        return Err(RailError::with_help(
+            format!(
+                "'{}' is inside the Cargo workspace at '{}'",
+                workspace_root.display(),
+                discovery_root.display()
+            ),
+            "run cargo rail init from the workspace root, where configuration discovery reads policy",
+        ));
+    }
     // In --dry-run mode, we just preview, so existence doesn't matter.
+    if !dry_run
+        && let Some(existing) = check_existing_config(workspace_root)
+        && !existing.components().eq(config_path.components())
+    {
+        return Err(RailError::with_help(
+            format!("active configuration already exists: {}", existing.display()),
+            "edit the active file, or pass its exact path with --output and --force",
+        ));
+    }
     if config_path.exists() && !dry_run {
         if !force {
             return Err(RailError::with_help(
@@ -109,13 +130,6 @@ fn run_init_impl(
         if !json {
             progress!("overwriting: {}", config_path.display());
         }
-    } else if let Some(existing) = check_existing_config(workspace_root)
-        && existing != config_path
-    {
-        return Err(RailError::with_help(
-            format!("active configuration already exists: {}", existing.display()),
-            "edit the active file, or pass its exact path with --output and --force",
-        ));
     }
 
     let mut targets = selected_targets.to_vec();

@@ -234,7 +234,7 @@ pub fn run_sync(ctx: &WorkspaceContext, args: SyncArgs) -> RailResult<()> {
                         let authority = &mapping_snapshots[&sync_config.crate_name].origin_authority;
                         serde_json::json!({
                           "crate_name": sync_config.crate_name,
-                          "mode": split_mode_name(&sync_config.mode),
+                          "mode": sync_config.mode.as_str(),
                           "target_repo": sync_config.target_repo_path,
                           "branch": sync_config.branch,
                           "remote_url": sync_config.remote_url,
@@ -743,13 +743,6 @@ fn print_sync_summary(
     }
 
     Ok(())
-}
-
-fn split_mode_name(mode: &crate::config::SplitMode) -> &'static str {
-    match mode {
-        crate::config::SplitMode::Single => "single",
-        crate::config::SplitMode::Combined => "combined",
-    }
 }
 
 fn direction_name(direction: &SyncDirection) -> &'static str {

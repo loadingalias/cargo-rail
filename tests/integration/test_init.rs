@@ -285,3 +285,34 @@ fn test_init_refuses_shadowed_output_path() {
     })();
     super::helpers::finish_test(result);
 }
+
+/// Discovery reads policy only at the workspace root, so init must not write below it,
+/// and `--force` must not overwrite a file that another discovery candidate shadows.
+#[test]
+fn test_init_writes_only_the_active_discovery_location() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("init-active-location")?;
+        let member = ws.add_crate("member", "0.1.0", &[])?;
+        ws.commit("Add member")?;
+
+        let from_member = run_cargo_rail(&member, &["rail", "init"])?;
+        assert!(!from_member.status.success(), "{from_member:?}");
+        assert!(!member.join(".config/rail.toml").exists());
+
+        let active = ws.path.join("rail.toml");
+        std::fs::write(&active, "# active\n")?;
+        let shadowed = ws.path.join(".config/rail.toml");
+        std::fs::create_dir_all(ws.path.join(".config"))?;
+        std::fs::write(&shadowed, "# shadowed\n")?;
+        let forced = run_cargo_rail(&ws.path, &["rail", "init", "--force"])?;
+        assert!(!forced.status.success(), "{forced:?}");
+        assert!(
+            String::from_utf8_lossy(&forced.stderr).contains("active configuration already exists"),
+            "{forced:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&shadowed)?, "# shadowed\n");
+        assert_eq!(std::fs::read_to_string(&active)?, "# active\n");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}

@@ -308,7 +308,8 @@ fn git_input(root: &Path, arguments: &[&str], input: &[u8]) -> RailResult<String
     Ok(value.to_owned())
 }
 
-fn oid(value: &str) -> bool {
+/// Whether `value` is a full SHA-1 or SHA-256 Git object ID in lowercase hex.
+pub(super) fn oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64)
         && value
             .bytes()

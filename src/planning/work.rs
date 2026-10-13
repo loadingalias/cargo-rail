@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use cargo_metadata::{Metadata, MetadataCommand, Package, PackageId};
 use glob::Pattern;
-use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -20,6 +19,7 @@ use crate::change_detection::semantic::{SemanticFileChange, SemanticScope};
 use crate::config::{CargoPrerequisiteConfig, CargoRootConfig, CargoTargetRootConfig, PlanWorkConfig, PlanWorkScope};
 use crate::error::{RailError, RailResult};
 use crate::graph::{DependencyUniverse, ImpactPropagation};
+use crate::source::ContentDigest;
 use crate::workspace::WorkspaceContext;
 
 const PLAN_CONTRACT_VERSION: u32 = 9;
@@ -589,6 +589,8 @@ struct StructuralCargoImpact {
     historical_development_origins: BTreeMap<PackageId, String>,
     seed_paths: BTreeMap<PackageId, BTreeSet<String>>,
     unattributed_seeds: BTreeSet<PackageId>,
+    /// Seeds that another seed's change also reaches through dependencies.
+    seeds_reached_by_other_seeds: BTreeSet<PackageId>,
 }
 
 struct CargoDomain {
@@ -766,6 +768,7 @@ impl PlanningCargoModel {
                 continue;
             }
             let propagation = domain.universe.propagate(&known)?;
+            merged.reached_seeds.extend(propagation.reached_seeds);
             merged.build.extend(propagation.build);
             merged.development.extend(propagation.development);
             for (package, origin) in propagation.build_origins {
@@ -1870,8 +1873,13 @@ fn structural_cargo_impact(
         }
     }
     impact.deliverables_workspace = paths.iter().any(|path| is_global_deliverable_cargo_input(path));
+    // Toolchain and Cargo configuration changes reach every package and have no semantic diff.
+    if paths.iter().any(|path| is_unanalyzed_global_cargo_input(path)) {
+        impact.workspace = true;
+    }
 
     let propagation = cargo_model.propagate(&impact.seeds)?;
+    impact.seeds_reached_by_other_seeds = propagation.reached_seeds;
     impact.build.extend(impact.seeds.iter().cloned());
     impact.build.extend(propagation.build);
     impact.development = propagation.development;
@@ -1984,6 +1992,10 @@ fn package_owns_historical_path(root: &str, path: &str) -> bool {
     } else {
         path == format!("{root}/Cargo.toml") || path.strip_prefix(root).is_some_and(|suffix| suffix.starts_with('/'))
     }
+}
+
+fn is_unanalyzed_global_cargo_input(path: &str) -> bool {
+    matches!(path, "rust-toolchain" | "rust-toolchain.toml") || path.starts_with(".cargo/config")
 }
 
 fn is_global_deliverable_cargo_input(path: &str) -> bool {
@@ -3038,7 +3050,7 @@ fn selection_for_roots(ctx: &WorkspaceContext, roots: &[ResolvedCargoRoot]) -> R
         .filter(|package| package_ids.contains(&package.id))
         .copied()
         .collect::<Vec<_>>();
-    let mut selection = selection_for_packages(ctx, &mut packages, &[])?;
+    let mut selection = selection_for_packages(ctx, &mut packages, &[], true)?;
     let targets = if roots.iter().all(|root| root.target.is_some()) {
         roots
             .iter()
@@ -3183,7 +3195,8 @@ fn cargo_selection(
     work: &str,
     paths: &[&str],
 ) -> RailResult<CargoSelection> {
-    if impact.workspace {
+    // Clippy configuration applies to every package it governs, not only to changed sources.
+    if impact.workspace || work == "cargo.clippy" && paths.iter().any(|path| is_clippy_configuration(path)) {
         return Ok(CargoSelection::Workspace {
             cargo_args: Vec::new(),
             targets: Vec::new(),
@@ -3238,7 +3251,13 @@ fn cargo_selection(
                 .ok_or_else(|| RailError::message(format!("selected Cargo package '{id}' is absent from metadata")))
         })
         .collect::<RailResult<Vec<_>>>()?;
-    selection_for_packages(ctx, &mut packages, paths)
+    // A package narrows to exact targets only when its own target-root edits are its sole cause.
+    let exact_targets = selected.iter().all(|package| {
+        impact.seeds.contains(package)
+            && !impact.unattributed_seeds.contains(package)
+            && !impact.seeds_reached_by_other_seeds.contains(package)
+    });
+    selection_for_packages(ctx, &mut packages, paths, exact_targets)
 }
 
 fn declared_path_selection(
@@ -3273,7 +3292,7 @@ fn declared_path_selection(
                 targets: Vec::new(),
             });
         }
-        return selection_for_packages(ctx, &mut packages, paths);
+        return selection_for_packages(ctx, &mut packages, paths, true);
     }
 
     let mut selected = HashSet::new();
@@ -3311,17 +3330,22 @@ fn declared_path_selection(
             targets: Vec::new(),
         });
     }
-    selection_for_packages(ctx, &mut packages, paths)
+    selection_for_packages(ctx, &mut packages, paths, true)
 }
 
 fn selection_for_packages(
     ctx: &WorkspaceContext,
     packages: &mut Vec<&Package>,
     paths: &[&str],
+    exact_targets: bool,
 ) -> RailResult<CargoSelection> {
     let selectors = portable_package_selectors(ctx, packages)?;
     let cargo_args = cargo_package_args(&selectors);
-    let targets = target_selectors(ctx, packages, paths);
+    let targets = if exact_targets {
+        target_selectors(ctx, packages, paths)
+    } else {
+        Vec::new()
+    };
     Ok(CargoSelection::Packages {
         packages: selectors,
         cargo_args,
@@ -3549,15 +3573,7 @@ fn plan_identity(plan: &WorkPlan) -> RailResult<String> {
 }
 
 fn identity(prefix: &str, bytes: &[u8]) -> RailResult<String> {
-    crate::instrumentation::record_hash(bytes.len());
-    let digest = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        hex.push(char::from(HEX[usize::from(byte >> 4)]));
-        hex.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    Ok(format!("{prefix}:sha256:{hex}"))
+    Ok(format!("{prefix}:sha256:{}", ContentDigest::sha256(bytes)))
 }
 
 fn canonical_bytes<T: Serialize>(value: &T) -> RailResult<Vec<u8>> {
@@ -3567,7 +3583,8 @@ fn canonical_bytes<T: Serialize>(value: &T) -> RailResult<Vec<u8>> {
         .map_err(|error| RailError::message(format!("failed to serialize canonical planner identity: {error}")))
 }
 
-fn canonicalize(value: Value) -> Value {
+/// Sort object keys recursively so equal values serialize to equal identity bytes.
+pub(super) fn canonicalize(value: Value) -> Value {
     match value {
         Value::Object(object) => {
             let mut entries = object.into_iter().collect::<Vec<_>>();

@@ -120,6 +120,7 @@ impl SplitConfig {
                 field: format!("remote for split '{}'", self.name),
             }));
         }
+        validate_remote_argument(&format!("crates.{}.split.remote", self.name), &self.remote)?;
         if self.branch.trim().is_empty() {
             return Err(RailError::Config(ConfigError::InvalidField {
                 field: format!("crates.{}.split.branch", self.name),
@@ -158,6 +159,17 @@ impl SplitConfig {
     }
 }
 
+/// Reject a remote that Git would read as an option, such as `--upload-pack=<command>`.
+pub(crate) fn validate_remote_argument(field: &str, remote: &str) -> RailResult<()> {
+    if remote.starts_with('-') {
+        return Err(RailError::Config(ConfigError::InvalidField {
+            field: field.to_string(),
+            reason: "must be a repository URL or path, not an option".to_string(),
+        }));
+    }
+    Ok(())
+}
+
 /// Split mode: single crate or combined multi-crate
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -167,6 +179,16 @@ pub enum SplitMode {
     Single,
     /// Multiple crates in one repository
     Combined,
+}
+
+impl SplitMode {
+    /// The configuration and machine-output spelling.
+    pub(crate) const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Combined => "combined",
+        }
+    }
 }
 
 /// How to structure a combined split repository
@@ -252,6 +274,25 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("remote"));
+    }
+
+    #[test]
+    fn test_split_config_rejects_a_remote_that_git_would_read_as_an_option() {
+        let config = SplitConfig {
+            name: "test-crate".to_string(),
+            remote: "--upload-pack=touch /tmp/split-remote-option".to_string(),
+            branch: "main".to_string(),
+            mode: SplitMode::Single,
+            workspace_mode: WorkspaceMode::default(),
+            members: vec!["test-crate".to_string()],
+            include: vec![],
+            exclude: vec![],
+            publish: true,
+            changelog_path: None,
+        };
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("crates.test-crate.split.remote"), "{error}");
     }
 
     #[test]

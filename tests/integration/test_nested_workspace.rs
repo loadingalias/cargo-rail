@@ -119,7 +119,7 @@ fn test_nested_workspace_excludes_only_its_resolved_generated_roots() {
             std::fs::write(path, content)?;
         }
 
-        let ctx = WorkspaceContext::build_with_source_capture(&ws.workspace_root, true)?;
+        let ctx = WorkspaceContext::build_with_snapshot(&ws.workspace_root)?;
         let paths = ctx
             .source_capture()
             .expect("source capture should be present")

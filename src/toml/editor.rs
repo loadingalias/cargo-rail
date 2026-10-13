@@ -222,15 +222,6 @@ impl TomlEditor {
         crate::utils::write_file_atomic(&self.path, self.doc.to_string().as_bytes())
     }
 
-    /// Write with backup (.bak file)
-    pub fn write_with_backup(self) -> RailResult<()> {
-        let backup_path = self.path.with_extension("toml.bak");
-        fs::write(&backup_path, &self.original_content)
-            .map_err(|e| RailError::message(format!("Failed to create backup: {}", e)))?;
-
-        self.write()
-    }
-
     /// Rollback changes (restore from backup)
     pub fn rollback(&self) -> RailResult<()> {
         let backup_path = self.path.with_extension("toml.bak");
@@ -238,53 +229,6 @@ impl TomlEditor {
             fs::rename(&backup_path, &self.path)
                 .map_err(|e| RailError::message(format!("Failed to restore backup: {}", e)))?;
         }
-        Ok(())
-    }
-}
-
-/// Validate a batch, then write each file atomically with backups for manual recovery.
-#[derive(Debug, Default)]
-pub struct TomlBatchEditor {
-    editors: Vec<TomlEditor>,
-}
-
-impl TomlBatchEditor {
-    /// Create a new batch editor
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Add an editor to the batch
-    pub fn add(&mut self, editor: TomlEditor) -> &mut Self {
-        self.editors.push(editor);
-        self
-    }
-
-    /// Validate all editors
-    pub fn validate_all(&self) -> RailResult<()> {
-        for editor in &self.editors {
-            editor.validate()?;
-        }
-        Ok(())
-    }
-
-    /// Validate all files and create backups before writing.
-    ///
-    /// A write failure can leave earlier files updated. Restore `.toml.bak` files to recover.
-    pub fn commit(self) -> RailResult<()> {
-        self.validate_all()?;
-
-        for editor in &self.editors {
-            let backup_path = editor.path.with_extension("toml.bak");
-            fs::write(&backup_path, &editor.original_content).map_err(|e| {
-                RailError::message(format!("Failed to create backup for {}: {}", editor.path.display(), e))
-            })?;
-        }
-
-        for editor in self.editors {
-            editor.write()?;
-        }
-
         Ok(())
     }
 }

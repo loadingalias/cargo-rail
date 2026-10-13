@@ -1161,6 +1161,95 @@ fn test_plan_cargo_selectors_exclude_non_workspace_dependency_packages() {
 }
 
 #[test]
+fn test_plan_global_cargo_inputs_select_the_whole_workspace() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-global-cargo-inputs")?;
+        ws.add_crate("first", "0.1.0", &[])?;
+        ws.add_crate("second", "0.1.0", &[])?;
+        generate_lockfile(&ws)?;
+        ws.commit("establish independent members")?;
+        let active = Command::new("rustup")
+            .current_dir(&ws.path)
+            .args(["show", "active-toolchain"])
+            .output()?;
+        ensure!(active.status.success(), "rustup failed: {active:?}");
+        let active = String::from_utf8(active.stdout)?;
+        let active = active.split_whitespace().next().context("active toolchain")?;
+        let toolchain = format!("[toolchain]\nchannel = '{active}'\n");
+        let cases = [
+            (
+                "rust-toolchain.toml",
+                toolchain.as_str(),
+                &["cargo.build", "cargo.test"][..],
+            ),
+            (
+                ".cargo/config.toml",
+                "[build]\nrustflags = ['--cfg', 'global']\n",
+                &["cargo.build", "cargo.test"][..],
+            ),
+            (
+                "clippy.toml",
+                "too-many-arguments-threshold = 9\n",
+                &["cargo.clippy"][..],
+            ),
+        ];
+        for (path, content, work_items) in cases {
+            let file = ws.path.join(path);
+            std::fs::create_dir_all(file.parent().context("input parent")?)?;
+            std::fs::write(&file, content)?;
+            std::fs::write(ws.path.join("crates/first/src/lib.rs"), "pub fn changed() {}\n")?;
+            let planned = plan(&ws, &["--since", "HEAD"])?;
+            for work in work_items {
+                assert_eq!(planned["work"][*work]["state"], "required", "{path}: {work}");
+                assert_eq!(
+                    planned["work"][*work]["scope"]["selection"]["kind"], "workspace",
+                    "{path} must not narrow {work} to the edited member"
+                );
+            }
+            git(&ws.path, &["checkout", "--", "."])?;
+            std::fs::remove_file(&file)?;
+        }
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_plan_target_selectors_never_narrow_a_package_reached_by_another_change() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("plan-target-cross-cause")?;
+        ws.add_crate("base", "0.1.0", &[])?;
+        let consumer = ws.add_crate("consumer", "0.1.0", &[("base", r#"{ path = "../base" }"#)])?;
+        std::fs::create_dir_all(consumer.join("tests"))?;
+        std::fs::write(consumer.join("tests/contract.rs"), "#[test]\nfn contract() {}\n")?;
+        generate_lockfile(&ws)?;
+        ws.commit("establish dependent packages")?;
+
+        std::fs::write(
+            consumer.join("tests/contract.rs"),
+            "#[test]\nfn contract() { assert!(true); }\n",
+        )?;
+        let alone = plan(&ws, &["--since", "HEAD"])?;
+        assert!(
+            alone["work"]["cargo.test"]["scope"]["selection"]["targets"]
+                .as_array()
+                .is_some_and(|targets| targets.iter().any(|target| target["name"] == "contract")),
+            "an isolated integration-test edit keeps exact narrowing: {alone:#}"
+        );
+
+        std::fs::write(ws.path.join("crates/base/src/lib.rs"), "pub fn changed() {}\n")?;
+        let both = plan(&ws, &["--since", "HEAD"])?;
+        assert_eq!(
+            both["work"]["cargo.test"]["scope"]["selection"]["targets"],
+            serde_json::json!([]),
+            "the consumer's dependency changed, so all of its tests are affected"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_plan_target_selectors_require_complete_exact_coverage() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("plan-target-and-manifest")?;
@@ -1352,12 +1441,12 @@ fn test_plan_object_pair_uses_only_to_tree_authority() {
         assert_eq!(expected["inputs"]["head"], head);
         assert_eq!(expected["work"]["historical"]["state"], "required");
         assert_eq!(expected["work"]["historical"]["scope"]["selection"]["kind"], "all");
-        // Unattributed non-Rust inputs widen Cargo work, so the semver selection carries the
-        // head-only package membership.
-        let selected_packages = expected["work"]["release.semver"]["scope"]["selection"]["packages"]
-            .as_array()
-            .context("historical Cargo package selection missing")?;
-        assert!(selected_packages.iter().any(|package| package["name"] == "head-member"));
+        // The `to` tree changes Cargo configuration, so every Cargo item covers that tree's whole
+        // workspace; the checkout and clone comparisons below prove which tree supplied it.
+        assert_eq!(
+            expected["work"]["release.semver"]["scope"]["selection"]["kind"],
+            "workspace"
+        );
 
         let root_manifest = std::fs::read_to_string(ws.path.join("Cargo.toml"))?;
         std::fs::write(

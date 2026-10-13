@@ -148,8 +148,6 @@ impl BackupManager {
             crate::status!("  restored: {}", file.display());
         }
 
-        println!("backup restored");
-
         Ok(())
     }
 

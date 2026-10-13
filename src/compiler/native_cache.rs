@@ -5539,7 +5539,8 @@ pub(crate) fn direct_wrapper_executable() -> RailResult<PathBuf> {
         .parent()
         .map(|directory| directory.join(DIRECT_WRAPPER_NAME))
         .filter(|candidate| {
-            fs::metadata(candidate).is_ok_and(|metadata| metadata.is_file() && executable_metadata(&metadata))
+            fs::metadata(candidate)
+                .is_ok_and(|metadata| metadata.is_file() && crate::executable::is_executable(&metadata))
         })
         .unwrap_or(cargo_rail_executable))
 }
@@ -5550,7 +5551,8 @@ pub(crate) fn direct_worker_executable() -> RailResult<PathBuf> {
         .parent()
         .map(|directory| directory.join(DIRECT_WORKER_NAME))
         .filter(|candidate| {
-            fs::metadata(candidate).is_ok_and(|metadata| metadata.is_file() && executable_metadata(&metadata))
+            fs::metadata(candidate)
+                .is_ok_and(|metadata| metadata.is_file() && crate::executable::is_executable(&metadata))
         })
         .ok_or_else(|| RailError::message("native compiler cache worker executable is unavailable"))
 }
@@ -5561,21 +5563,10 @@ pub(crate) fn direct_distributed_worker_executable() -> RailResult<PathBuf> {
         .parent()
         .map(|directory| directory.join(DISTRIBUTED_WORKER_NAME))
         .filter(|candidate| {
-            fs::metadata(candidate).is_ok_and(|metadata| metadata.is_file() && executable_metadata(&metadata))
+            fs::metadata(candidate)
+                .is_ok_and(|metadata| metadata.is_file() && crate::executable::is_executable(&metadata))
         })
         .ok_or_else(|| RailError::message("distributed compiler worker executable is unavailable"))
-}
-
-#[cfg(unix)]
-fn executable_metadata(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    metadata.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn executable_metadata(_metadata: &fs::Metadata) -> bool {
-    true
 }
 
 impl NativeCacheContext {
@@ -10146,7 +10137,6 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
                         &mut raw,
                         "distributed_compiler_execution_failed",
                         Some(pre_link_action),
-                        None,
                         metrics.bytes_hashed,
                         metrics.cache_bytes_read,
                     ));
@@ -11236,7 +11226,8 @@ fn prepare_observed_cold_child(
         let driver_inputs = observation_directory.join(APPLE_LINK_DRIVER_INPUTS_FILE);
         if let Some(driver) = driver
             && adapter.as_ref().is_some_and(|adapter| adapter.is_absolute())
-            && fs::metadata(&driver).is_ok_and(|metadata| metadata.is_file() && executable_metadata(&metadata))
+            && fs::metadata(&driver)
+                .is_ok_and(|metadata| metadata.is_file() && crate::executable::is_executable(&metadata))
             && fs::symlink_metadata(&certificate).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
             && fs::symlink_metadata(&driver_inputs).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
         {
@@ -11321,7 +11312,9 @@ fn stage_named_link_adapter(selection: &str, observation_directory: &Path) -> Ra
     // A hard link changes the installed worker metadata and invalidates its receipt.
     let mut source_file = File::open(&source)?;
     let source_metadata = source_file.metadata()?;
-    if !source_metadata.is_file() || !executable_metadata(&source_metadata) || source_metadata.len() > MAX_SOURCE_BYTES
+    if !source_metadata.is_file()
+        || !crate::executable::is_executable(&source_metadata)
+        || source_metadata.len() > MAX_SOURCE_BYTES
     {
         return Err(RailError::message("linker adapter executable is unavailable"));
     }
@@ -11342,7 +11335,8 @@ fn stage_named_link_adapter(selection: &str, observation_directory: &Path) -> Ra
         .persist_noclobber(&destination)
         .map_err(|error| RailError::message(format!("linker adapter staging failed: {error}")))?;
     if crate::utils::canonicalize_existing(&directory)? != directory
-        || !fs::metadata(&destination).is_ok_and(|metadata| metadata.is_file() && executable_metadata(&metadata))
+        || !fs::metadata(&destination)
+            .is_ok_and(|metadata| metadata.is_file() && crate::executable::is_executable(&metadata))
     {
         return Err(RailError::message("staged linker adapter is not executable"));
     }
@@ -13701,7 +13695,7 @@ fn encoded_output_path_forms(path: &str, encoding: OutputBindingEncoding) -> Vec
     }
 }
 
-fn json_string_contents(value: &[u8]) -> Vec<u8> {
+pub(super) fn json_string_contents(value: &[u8]) -> Vec<u8> {
     let Ok(value) = std::str::from_utf8(value) else {
         return value.to_vec();
     };
@@ -13711,7 +13705,7 @@ fn json_string_contents(value: &[u8]) -> Vec<u8> {
     }
 }
 
-fn escape_dep_info_path(path: &[u8]) -> Vec<u8> {
+pub(super) fn escape_dep_info_path(path: &[u8]) -> Vec<u8> {
     let mut escaped = Vec::with_capacity(path.len());
     for byte in path {
         if byte.is_ascii_whitespace() || matches!(byte, b'\\' | b'#' | b':') {
@@ -17151,7 +17145,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
             &mut raw,
             "compiler_debug_output_capture_unavailable",
             None,
-            None,
             0,
             cache_bytes_read,
         ));
@@ -17161,7 +17154,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
         drop(publish_and_record_cold_observation(
             &mut raw,
             "compiler_execution_failed",
-            None,
             None,
             0,
             cache_bytes_read,
@@ -17189,7 +17181,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
                 drop(publish_and_record_cold_observation(
                     &mut raw,
                     error.reason,
-                    None,
                     None,
                     capture.bytes_hashed,
                     cache_bytes_read,
@@ -17221,7 +17212,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
                     &mut raw,
                     reason,
                     None,
-                    None,
                     capture.bytes_hashed,
                     cache_bytes_read,
                 ));
@@ -17234,7 +17224,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
             &mut raw,
             "compiler_output_paths_unavailable",
             None,
-            None,
             0,
             cache_bytes_read,
         ));
@@ -17244,7 +17233,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
         drop(publish_and_record_cold_observation(
             &mut raw,
             "compiler_stream_limit_exceeded",
-            None,
             None,
             0,
             cache_bytes_read,
@@ -17257,7 +17245,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
         drop(publish_and_record_cold_observation(
             &mut raw,
             reason,
-            None,
             None,
             bytes_hashed,
             cache_bytes_read,
@@ -17283,7 +17270,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
                 &mut raw,
                 "native_library_capture_unavailable",
                 None,
-                None,
                 bytes_hashed,
                 cache_bytes_read,
             ));
@@ -17298,7 +17284,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
             drop(publish_and_record_cold_observation(
                 &mut raw,
                 "compiler_selected_dynamic_input_unavailable",
-                None,
                 None,
                 bytes_hashed,
                 cache_bytes_read,
@@ -17325,7 +17310,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
                 &mut raw,
                 "compiler_selected_repository_input_capture_unavailable",
                 None,
-                None,
                 bytes_hashed,
                 cache_bytes_read,
             ));
@@ -17345,7 +17329,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
                 &mut raw,
                 "compiler_selected_environment_unavailable",
                 None,
-                None,
                 bytes_hashed,
                 cache_bytes_read,
             ));
@@ -17360,7 +17343,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
                 &mut raw,
                 "compiler_stdout_unavailable",
                 None,
-                None,
                 0,
                 cache_bytes_read,
             ));
@@ -17373,7 +17355,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
             drop(publish_and_record_cold_observation(
                 &mut raw,
                 "compiler_stderr_unavailable",
-                None,
                 None,
                 0,
                 cache_bytes_read,
@@ -17392,7 +17373,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
             &mut raw,
             "compiler_base_action_changed_after_dynamic_capture",
             None,
-            None,
             bytes_hashed,
             cache_bytes_read,
         ));
@@ -17406,7 +17386,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
             drop(publish_and_record_cold_observation(
                 &mut raw,
                 crate::cache::installation::NativeCacheFailureReason::ActionIdentity.as_str(),
-                None,
                 None,
                 bytes_hashed,
                 cache_bytes_read,
@@ -17423,7 +17402,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
                 &mut raw,
                 crate::cache::installation::NativeCacheFailureReason::PostExecutionWitness.as_str(),
                 Some(pre_link_action.clone()),
-                None,
                 bytes_hashed,
                 cache_bytes_read,
             ));
@@ -17456,7 +17434,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
                     _ => "apple_linker_witness_unavailable",
                 },
                 Some(pre_link_action),
-                None,
                 bytes_hashed,
                 cache_bytes_read,
             ));
@@ -17476,7 +17453,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
             &mut raw,
             "cold_input_changed_during_execution",
             link_candidate,
-            None,
             bytes_hashed,
             cache_bytes_read,
         ));
@@ -17495,7 +17471,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
             &mut raw,
             "native_library_search_unreported",
             link_candidate,
-            None,
             bytes_hashed,
             cache_bytes_read,
         ));
@@ -17518,7 +17493,6 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
                 &mut raw,
                 crate::cache::installation::NativeCacheFailureReason::ActionIdentity.as_str(),
                 link_candidate,
-                None,
                 bytes_hashed,
                 cache_bytes_read,
             ));
@@ -17854,11 +17828,10 @@ fn publish_and_record_cold_observation(
     raw: &mut RawCompilerInvocation,
     reason: &'static str,
     action_key: Option<String>,
-    result_key: Option<String>,
     bytes_hashed: u64,
     cache_bytes_read: u64,
 ) -> RailResult<()> {
-    publish_cold_observation(raw, reason, action_key, result_key, bytes_hashed)?;
+    publish_cold_observation(raw, reason, action_key, None, bytes_hashed)?;
     let metadata = raw.cache_wrapper.as_ref();
     write_cache_event(
         CompilerCacheWrapperStatus::Bypassed,

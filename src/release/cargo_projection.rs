@@ -773,7 +773,14 @@ fn require_head_file(ctx: &WorkspaceContext, workspace_path: &Path, description:
     let head = git.run_git_at_worktree_root(&["ls-tree", "-z", "HEAD", "--", &repository_path])?;
     let (head_mode, head_object) = parse_head_entry(&head.stdout, &repository_path)
         .ok_or_else(|| head_file_mismatch(description, workspace_path, "HEAD has no matching regular-file entry"))?;
-    let index = git.run_git_at_worktree_root(&["ls-files", "--stage", "-z", "--", &repository_path])?;
+    let index = git.run_git_at_worktree_root(&[
+        "--literal-pathspecs",
+        "ls-files",
+        "--stage",
+        "-z",
+        "--",
+        &repository_path,
+    ])?;
     let (index_mode, index_object) = parse_index_entry(&index.stdout, &repository_path).ok_or_else(|| {
         head_file_mismatch(
             description,

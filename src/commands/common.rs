@@ -674,11 +674,6 @@ impl TextJsonOutputFormat {
     pub fn is_json(&self) -> bool {
         matches!(self, Self::Json)
     }
-
-    /// Check if this format is structured output.
-    pub fn is_json_like(&self) -> bool {
-        self.is_json()
-    }
 }
 
 /// Output format for `cargo rail split run`.
@@ -702,11 +697,6 @@ impl SplitOutputFormat {
     pub fn is_json(&self) -> bool {
         matches!(self, Self::Json)
     }
-
-    /// Check if this format is structured output.
-    pub fn is_json_like(&self) -> bool {
-        matches!(self, Self::Json | Self::JsonLines)
-    }
 }
 
 /// Output format for `cargo rail change`.
@@ -727,36 +717,6 @@ impl ChangeOutputFormat {
     pub fn is_json(&self) -> bool {
         matches!(self, Self::Json)
     }
-
-    /// Check if this format is JSON-like structured output.
-    pub fn is_json_like(&self) -> bool {
-        self.is_json()
-    }
-}
-
-/// Output format for `cargo rail unify`.
-///
-/// `unify` currently supports only text and JSON output. Unlike planner/executor surfaces,
-/// it does not produce list-like formats (cargo-args, github, jsonl, etc.).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
-pub enum UnifyOutputFormat {
-    /// Human-readable text
-    #[default]
-    Text,
-    /// JSON
-    Json,
-}
-
-impl UnifyOutputFormat {
-    /// Check if this format is JSON
-    pub fn is_json(&self) -> bool {
-        matches!(self, Self::Json)
-    }
-
-    /// Check if this format is a JSON-like structured format
-    pub fn is_json_like(&self) -> bool {
-        self.is_json()
-    }
 }
 
 /// Output format for `cargo rail surface`.
@@ -776,11 +736,6 @@ impl SurfaceOutputFormat {
     /// Check if this format is JSON.
     pub fn is_json(&self) -> bool {
         matches!(self, Self::Json)
-    }
-
-    /// Check if this format is structured output.
-    pub fn is_json_like(&self) -> bool {
-        self.is_json()
     }
 }
 
@@ -1020,22 +975,12 @@ impl<'a> SplitSyncConfigBuilder<'a> {
         self
     }
 
-    /// Validate all selected configurations
+    /// Validate the one input that configuration preflight did not check: the `--remote` override.
     pub fn validate(self) -> RailResult<Self> {
-        for split_config in &self.split_configs {
-            split_config.validate()?;
+        if let Some(remote) = &self.remote_override {
+            crate::config::validate_remote_argument("--remote", remote)?;
         }
         Ok(self)
-    }
-
-    /// Check if all remotes are local paths (testing mode)
-    pub fn all_local(&self) -> bool {
-        self.split_configs.iter().all(|s| {
-            self.remote_override
-                .as_ref()
-                .map(|r| crate::utils::is_local_path(r))
-                .unwrap_or_else(|| s.is_local_testing())
-        })
     }
 
     /// Get the number of selected crates

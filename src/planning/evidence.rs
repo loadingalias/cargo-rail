@@ -5,9 +5,7 @@ use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use rscrypto::Sha256;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::workspace::WorkspaceContext;
 
@@ -754,7 +752,7 @@ fn revalidate_observed_inputs(
         if identity == &git_identity {
             continue;
         }
-        if valid_sha256_identity(identity) {
+        if crate::source::ContentDigest::is_sha256_text(identity) {
             sha_paths.push((path.as_str(), identity.as_str()));
             continue;
         }
@@ -840,12 +838,6 @@ fn revalidate_observed_directories(
     Ok(())
 }
 
-fn valid_sha256_identity(identity: &str) -> bool {
-    identity
-        .strip_prefix("sha256:")
-        .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
-}
-
 pub(super) fn required_capabilities(work: &str) -> &'static [&'static str] {
     match work {
         "cargo.doc" | "cargo.doctest" => &[
@@ -879,35 +871,14 @@ fn incompatible(code: &str, description: String) -> (String, String) {
 
 fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
     let value = serde_json::to_value(value).map_err(|error| error.to_string())?;
-    serde_json::to_vec(&canonicalize(value)).map_err(|error| error.to_string())
-}
-
-fn canonicalize(value: Value) -> Value {
-    match value {
-        Value::Object(object) => {
-            let mut entries = object.into_iter().collect::<Vec<_>>();
-            entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-            Value::Object(
-                entries
-                    .into_iter()
-                    .map(|(key, value)| (key, canonicalize(value)))
-                    .collect(),
-            )
-        }
-        Value::Array(values) => Value::Array(values.into_iter().map(canonicalize).collect()),
-        other => other,
-    }
+    serde_json::to_vec(&super::work::canonicalize(value)).map_err(|error| error.to_string())
 }
 
 fn digest_identity(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        hex.push(char::from(HEX[usize::from(byte >> 4)]));
-        hex.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    format!("planning-evidence-v{EVIDENCE_VERSION}:sha256:{hex}")
+    format!(
+        "planning-evidence-v{EVIDENCE_VERSION}:sha256:{}",
+        crate::source::ContentDigest::sha256(bytes)
+    )
 }
 
 #[cfg(test)]

@@ -6230,33 +6230,12 @@ fn path_spellings(path: &Path) -> Vec<Vec<u8>> {
 
     let mut spellings = literals.clone();
     for literal in literals {
-        spellings.push(json_string_contents(&literal));
-        spellings.push(escape_dep_info_path(&literal));
+        spellings.push(super::native_cache::json_string_contents(&literal));
+        spellings.push(super::native_cache::escape_dep_info_path(&literal));
     }
     spellings.sort_unstable_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
     spellings.dedup();
     spellings
-}
-
-fn json_string_contents(value: &[u8]) -> Vec<u8> {
-    let Ok(value) = std::str::from_utf8(value) else {
-        return value.to_vec();
-    };
-    match serde_json::to_vec(value) {
-        Ok(encoded) if encoded.len() >= 2 => encoded[1..encoded.len() - 1].to_vec(),
-        _ => value.as_bytes().to_vec(),
-    }
-}
-
-fn escape_dep_info_path(path: &[u8]) -> Vec<u8> {
-    let mut escaped = Vec::with_capacity(path.len());
-    for byte in path {
-        if byte.is_ascii_whitespace() || matches!(byte, b'\\' | b'#' | b':') {
-            escaped.push(b'\\');
-        }
-        escaped.push(*byte);
-    }
-    escaped
 }
 
 fn replace_bytes(input: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {

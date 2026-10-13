@@ -111,7 +111,7 @@ pub fn run_release_plan(
 
         // Validate changelog paths (catches path traversal issues early)
         validator.validate_changelog_paths(&target_crates, release_config)?;
-        validator.validate_apply_preconditions(&plan, true, skip_tag, false)?;
+        validator.validate_apply_preconditions(&plan, true, skip_tag)?;
 
         if !json {
             println!("{}", plan.format_summary_with_flags(skip_publish, skip_tag));
@@ -253,7 +253,7 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
     let config = ctx.config().map(|c| &c.release);
     let release_config =
         config.ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
-    let skip_publish = registry_publication_skipped(args.publish, release_config)?;
+    let skip_publish = registry_publication_skipped(args.publish, "--publish", release_config)?;
 
     let workspace_members = ctx.graph().workspace_members();
     let mut warnings = ctx
@@ -410,7 +410,7 @@ pub fn run_release_publish(ctx: &WorkspaceContext, args: ReleasePublishArgs) -> 
             }
         }
 
-        validator.validate_apply_preconditions(&plan, effective_skip_publish, effective_skip_tag, false)?;
+        validator.validate_apply_preconditions(&plan, effective_skip_publish, effective_skip_tag)?;
         mutation::validate_pre_apply_with_allowed_paths(ctx, &mutation_plan, &plan_control_paths)?;
         mutation::validate_changed_paths_with_allowed_paths(ctx, &mutation_plan, &allowed_unstaged_paths)?;
         let plan_receipt = mutation::write_receipt(
@@ -555,7 +555,7 @@ pub(super) fn run_release_publication_check_with_plan_inputs(
         .as_ref()
         .map(|config| &config.release)
         .ok_or_else(|| RailError::with_help("no release configuration", "run 'cargo rail init' first"))?;
-    let skip_publish = registry_publication_skipped(true, release_config)?;
+    let skip_publish = registry_publication_skipped(true, "--publication", release_config)?;
     debug_assert!(!skip_publish);
 
     let workspace_members = ctx.graph().workspace_members();
@@ -590,7 +590,7 @@ pub(super) fn run_release_publication_check_with_plan_inputs(
         validator.validate_changelog_paths(&target_crates, release_config)?;
         // Match run's local/tag/release-note checks without performing registry
         // lookups. Live publication checks remain opt-in under --extended.
-        validator.validate_apply_preconditions(&plan, true, skip_tag, false)?;
+        validator.validate_apply_preconditions(&plan, true, skip_tag)?;
 
         let insights = ReleasePlanner::new(ctx, release_config).release_check_insights(&target_crates)?;
         let commit_diagnostics = insights.commit_diagnostics;
@@ -714,7 +714,12 @@ pub(super) fn run_release_publication_check_with_plan_inputs(
         }
         if has_pending_changes {
             if !json {
-                println!("\nPublication-ready changes detected. Run the matching release command to apply.");
+                let summary = if publishable_crates.is_empty() {
+                    "Release changes detected; no selected crate publishes to crates.io."
+                } else {
+                    "Publication-ready changes detected."
+                };
+                println!("\n{summary} Run the matching release command to apply.");
             }
             return Err(RailError::CheckHasPendingChanges);
         }
@@ -842,19 +847,24 @@ fn dependent_policy(include_dependents: bool) -> DependentPolicy {
     }
 }
 
-fn registry_publication_skipped(publish: bool, release_config: &crate::config::ReleaseConfig) -> RailResult<bool> {
+/// `flag` names the option that requested publication, so diagnostics match what the user typed.
+fn registry_publication_skipped(
+    publish: bool,
+    flag: &str,
+    release_config: &crate::config::ReleaseConfig,
+) -> RailResult<bool> {
     if !publish {
         return Ok(true);
     }
     if release_config.remote_effects == ReleaseRemoteEffects::None {
         return Err(RailError::with_help(
-            "--publish cannot be combined with release.remote_effects = \"none\"",
+            format!("{flag} cannot be combined with release.remote_effects = \"none\""),
             "select an explicit remote effect authority before authorizing irreversible crates.io publication",
         ));
     }
     let registry = release_config.registry_publication.registry().ok_or_else(|| {
         RailError::with_help(
-            "--publish requires release.registry_publication = \"crates-io\"",
+            format!("{flag} requires release.registry_publication = \"crates-io\""),
             "authorize the exact registry in rail.toml as well as at invocation time",
         )
     })?;
@@ -1316,11 +1326,6 @@ pub fn run_release_resume(ctx: &WorkspaceContext, transaction: Option<&str>, exe
         .ok_or_else(|| RailError::message("no release configuration"))?
         .release;
     ReleasePublisher::new(ctx, release_config).resume(&path, executor)
-}
-
-/// Abort an active release before any external side effect has occurred.
-pub fn run_release_abort(ctx: &WorkspaceContext, transaction: Option<&str>, yes: bool) -> RailResult<()> {
-    run_release_abort_with_options(ctx, transaction, false, yes)
 }
 
 pub(crate) fn run_release_abort_with_options(

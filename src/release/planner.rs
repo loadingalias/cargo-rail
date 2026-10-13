@@ -1147,11 +1147,6 @@ impl ReleasePlan {
 
         output
     }
-
-    /// Format summary for display (default: no skip flags)
-    pub fn format_summary(&self) -> String {
-        self.format_summary_with_flags(false, false)
-    }
 }
 
 fn planned_change_entries(intents: &[ChangeIntent]) -> Vec<PlannedChangeEntry> {

@@ -117,7 +117,7 @@ impl ReleaseIntent {
                 .to_str()
                 .ok_or_else(|| RailError::message("release intent path is not UTF-8"))?;
             let normalized = crate::source::RepositoryPath::new(path)?;
-            if normalized.as_str() != text || text.contains(['\\', ':']) {
+            if normalized.as_str() != text || text.contains(['\\', ':']) || names_git_directory(path) {
                 return Err(RailError::message(
                     "release intent paths must be normalized repository-relative paths",
                 ));
@@ -803,7 +803,7 @@ impl ReleaseState {
                     || write
                         .before_digest
                         .as_deref()
-                        .is_some_and(|digest| !super::registry::valid_checksum(digest)))
+                        .is_some_and(|digest| !crate::source::ContentDigest::is_sha256_hex(digest)))
             {
                 return Err(RailError::message(
                     "release changelog bytes do not match their bound path and digest",
@@ -827,7 +827,7 @@ impl ReleaseState {
             if projection.before_digest.as_deref().is_some_and(|digest| {
                 !digest
                     .strip_prefix("sha256:")
-                    .is_some_and(super::registry::valid_checksum)
+                    .is_some_and(crate::source::ContentDigest::is_sha256_hex)
             }) || format!(
                 "sha256:{}",
                 crate::source::ContentDigest::sha256(projection.content.as_bytes())
@@ -916,7 +916,7 @@ impl ReleaseState {
             if progress
                 .publication_attempt
                 .as_deref()
-                .is_some_and(|id| !super::registry::valid_checksum(id))
+                .is_some_and(|id| !crate::source::ContentDigest::is_sha256_hex(id))
                 || progress.publication.status == StepStatus::Pending && progress.publication_attempt.is_some()
                 || progress.publication.status == StepStatus::InProgress && progress.publication_attempt.is_none()
             {
@@ -1078,13 +1078,35 @@ pub(crate) fn normalize_release_path(worktree_root: &Path, path: &Path, kind: &s
             path.display()
         )));
     }
+    // Records can arrive from a remote; a write into `.git` could change Git configuration or hooks.
+    if names_git_directory(&relative) {
+        return Err(RailError::message(format!(
+            "release {kind} path '{}' is inside the Git directory",
+            path.display()
+        )));
+    }
     Ok(relative)
 }
 
+fn names_git_directory(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(".git"))
+    })
+}
+
+/// Return the canonical `path` of a release journal directly inside `root`'s release-state directory.
+///
+/// Rejects a journal elsewhere and a release-state directory reached through a link, so release status,
+/// recovery, and `clean` never act on another repository's records.
 pub(crate) fn validate_state_path(root: &Path, path: &Path) -> RailResult<PathBuf> {
     let canonical = canonicalize_existing(path)?;
-    let dir = canonicalize_existing(&state_dir(root))?;
-    if canonical.parent().is_none_or(|parent| parent != dir) {
+    // Like `lock`, require the real contained directory; a linked `releases`
+    // directory would otherwise resolve both sides into another repository.
+    let dir = state_dir(&canonicalize_existing(root)?);
+    if canonicalize_existing(&dir)? != dir || canonical.parent().is_none_or(|parent| parent != dir) {
         return Err(RailError::message(format!(
             "release state '{}' is outside the workspace release-state directory",
             path.display()
@@ -1152,7 +1174,7 @@ pub(crate) fn restore_preparation(root: &Path, path: &Path) -> RailResult<()> {
         let planned = planned
             .to_str()
             .ok_or_else(|| RailError::message(format!("release path '{}' is not valid UTF-8", planned.display())))?;
-        git.run_git(&["clean", "-f", "--", planned])?;
+        git.run_git(&["--literal-pathspecs", "clean", "-f", "--", planned])?;
     }
     for backup in &state.intent.local_input_backups {
         let relative = normalize_release_path(&git.worktree_root, &backup.path, "backup")?;
@@ -1595,6 +1617,46 @@ mod tests {
 
         let error = ReleaseState::load_for_recovery(&path).unwrap_err();
         assert!(error.to_string().contains("path"), "{error}");
+    }
+
+    #[test]
+    fn current_recovery_rejects_a_backup_inside_the_git_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = state_dir(root.path());
+        std::fs::create_dir_all(&directory).unwrap();
+        for path in [".git/config", ".GIT/hooks/pre-commit"] {
+            let mut state = fixture(RELEASE_STATE_SCHEMA_VERSION, RELEASE_PLAN_CONTRACT_VERSION);
+            state.intent.local_input_backups = vec![LocalInputBackup {
+                path: PathBuf::from(path),
+                content: "[core]\n\tfsmonitor = /tmp/attacker\n".to_string(),
+                restore: BackupRestorePolicy::Always,
+            }];
+            state.intent.identity = state.intent.identity_for(&state.transaction_id).unwrap();
+            let record = directory.join("release-test.json");
+            std::fs::write(&record, serde_json::to_vec(&state).unwrap()).unwrap();
+            let error = ReleaseState::load_for_recovery(&record).unwrap_err();
+            assert!(error.to_string().contains("path"), "{path}: {error}");
+            assert!(
+                normalize_release_path(root.path(), Path::new(path), "backup").is_err(),
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_paths_reject_a_linked_release_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let journal = outside.path().join("release-other.json");
+        std::fs::write(&journal, "{}\n").unwrap();
+        let releases = state_dir(root.path());
+        std::fs::create_dir_all(releases.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &releases).unwrap();
+
+        let error = validate_state_path(root.path(), &releases.join("release-other.json")).unwrap_err();
+        assert!(error.to_string().contains("release-state directory"), "{error}");
+        assert!(journal.exists());
     }
 
     #[test]

@@ -1,15 +1,9 @@
-//! TOML manipulation and formatting library
+//! TOML manipulation and formatting.
 //!
-//! A 3-layer architecture for safe, consistent TOML operations:
-//! 1. **Format**: String template building with validation
-//! 2. **Builder**: High-level config construction (internal)
-//! 3. **Editor**: Safe mutation operations with atomic writes
+//! `format` renders and standardizes TOML text; `editor` applies validated, atomic edits to one file.
 
-pub(crate) mod builder; // Internal - used by init command
 pub mod editor;
 pub mod format;
 
-#[doc(hidden)]
-pub use builder::WorkspaceDepsBuilder;
 pub use editor::TomlEditor;
 pub use format::TomlFormatter;

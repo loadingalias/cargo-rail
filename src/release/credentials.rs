@@ -10,7 +10,7 @@ use std::io::{BufRead as _, Read as _, Write as _};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use super::registry::{RegistryObservation, RegistryObserver, valid_checksum, valid_name};
+use super::registry::{RegistryObservation, RegistryObserver, valid_name};
 
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
 const MAX_PACKAGES: usize = 4096;
@@ -358,7 +358,7 @@ fn authorize(request: &Request) -> Result<(), &'static str> {
     for [name, version, checksum] in args[2..].as_chunks::<3>().0 {
         if !valid_name(name)
             || semver::Version::parse(version).is_err()
-            || !valid_checksum(checksum)
+            || !crate::source::ContentDigest::is_sha256_hex(checksum)
             || !identities.insert((name, version))
         {
             return Err("invalid or duplicate sealed package identity");

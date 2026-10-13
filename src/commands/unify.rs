@@ -6,7 +6,7 @@
 //! 3. Intersection-based feature unification
 
 use crate::cargo::{ManifestWriter, UnifyAnalyzer, UnifyReport};
-use crate::commands::common::{UnifyOutputFormat, format_preview_list};
+use crate::commands::common::{TextJsonOutputFormat, format_preview_list};
 use crate::error::{RailError, RailResult};
 use crate::mutation::{self, ExpectedMutation, MutationAction, MutationEffect, MutationRisk, MutationTrace};
 use crate::progress;
@@ -823,7 +823,7 @@ fn tool_release_and_channel(verbose_version: &str) -> (String, &'static str) {
 }
 
 /// Inspect the exact Cargo resolution domains used by dependency unification.
-pub fn run_unify_doctor(ctx: &WorkspaceContext, format: UnifyOutputFormat) -> RailResult<()> {
+pub fn run_unify_doctor(ctx: &WorkspaceContext, format: TextJsonOutputFormat) -> RailResult<()> {
     let snapshot = ctx.snapshot()?;
     let root = root_manifest_value(ctx)?;
     let (resolver, resolver_source) = resolver_diagnostic(&root);
@@ -1016,7 +1016,7 @@ pub struct UnifyAnalyzeOptions<'a> {
     pub(crate) check: bool,
     pub(crate) show_diff: bool,
     pub(crate) explain: bool,
-    pub(crate) format: UnifyOutputFormat,
+    pub(crate) format: TextJsonOutputFormat,
     pub(crate) output: Option<&'a PathBuf>,
     pub(crate) backup: bool,
     pub(crate) no_report: bool,
@@ -2073,7 +2073,7 @@ pub fn run_unify_apply(
     no_report: bool,
     report_path: Option<std::path::PathBuf>,
     plan_path: Option<std::path::PathBuf>,
-    format: UnifyOutputFormat,
+    format: TextJsonOutputFormat,
 ) -> RailResult<()> {
     ctx.snapshot()?;
     use crate::backup::{BackupManager, BackupMetadata};

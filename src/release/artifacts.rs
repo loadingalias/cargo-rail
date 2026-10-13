@@ -222,12 +222,14 @@ pub(crate) fn validate_record(state: &ReleaseState) -> RailResult<()> {
             || !ids.insert(evidence.artifact_id)
             || evidence.bytes == 0
             || evidence.bytes > MAX_ARCHIVE_BYTES
-            || !checksum(&evidence.sha256)
+            || !crate::source::ContentDigest::is_sha256_hex(&evidence.sha256)
             || evidence.expires_at == 0
             || run.is_none_or(|run| run.run_id != evidence.run_id || run.attempt != evidence.attempt)
             || evidence.files.len() != requirement.files.len()
             || evidence.files.iter().zip(&requirement.files).any(|(actual, expected)| {
-                actual.name != expected.name || actual.bytes > MAX_ASSET_BYTES || !checksum(&actual.sha256)
+                actual.name != expected.name
+                    || actual.bytes > MAX_ASSET_BYTES
+                    || !crate::source::ContentDigest::is_sha256_hex(&actual.sha256)
             })
         {
             return Err(RailError::message(
@@ -236,10 +238,6 @@ pub(crate) fn validate_record(state: &ReleaseState) -> RailResult<()> {
         }
     }
     Ok(())
-}
-
-fn checksum(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Download and verify before any publication. A retained identity may never select another artifact.
@@ -377,7 +375,7 @@ fn inspect_metadata(
     if value["name"] != name
         || value["expired"] != false
         || bytes > MAX_ARCHIVE_BYTES
-        || !checksum(digest)
+        || !crate::source::ContentDigest::is_sha256_hex(digest)
         || expires_at <= chrono::Utc::now().timestamp().cast_unsigned()
         || expires_at <= created_at
         || value["workflow_run"]["id"] != run.run_id

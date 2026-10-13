@@ -93,8 +93,8 @@ Keep only choices that differ from defaults.
 cargo rail config migrate                 # preview; changes no files
 cargo rail config migrate --check         # exit 1 when a migration is pending
 cargo rail config migrate apply           # revalidate drift, then write
-cargo rail config migrate -f json > migrate.json
-cargo rail config migrate apply --plan migrate.json
+cargo rail config migrate -f json > target/migrate.json
+cargo rail config migrate apply --plan target/migrate.json
 ```
 
 The migration removes a setting only when removing it leaves the effective policy unchanged,
@@ -111,6 +111,8 @@ and points to this migration.
 A removed key that needs a manual edit, such as a split's `paths`, is reported but never changed.
 The JSON preview includes `mutation_plan`.
 `apply --plan` accepts that plan, saved to a file, only while the configuration and checkout are unchanged.
+Save the plan in an ignored directory such as `target/` or outside the checkout:
+an untracked plan file in the worktree is a checkout change.
 
 ```toml
 targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]

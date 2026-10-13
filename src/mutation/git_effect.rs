@@ -238,6 +238,15 @@ impl GitPathImage {
             Self::Entry { mode, oid } => Some((mode, oid)),
         }
     }
+
+    /// Whether one observed index or tree entry is exactly this image, including absence.
+    pub(crate) fn matches(&self, entry: Option<&crate::git::ops::GitTreeEntry>) -> bool {
+        match (entry, self.entry_parts()) {
+            (None, None) => true,
+            (Some(entry), Some((mode, oid))) => entry.mode == mode && entry.object_id == oid,
+            _ => false,
+        }
+    }
 }
 
 /// Mapping authority bound to a prepared split or sync effect.

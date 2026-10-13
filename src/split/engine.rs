@@ -1303,7 +1303,7 @@ impl<'a> SplitEngine<'a> {
         }
         let current_authority = self.capture_current_split_authority(config, origin)?.1;
         let expected_digest = if current_head.as_deref() == repository.expected_oid.as_deref() {
-            self.validate_split_path_images(&target, journal, true)?;
+            self.validate_split_path_images(&target, journal)?;
             mapping.pre_authority()
         } else {
             mapping.post_authority()
@@ -1660,7 +1660,7 @@ impl<'a> SplitEngine<'a> {
             if actual_authority.1 != *pre_authority {
                 return Err(split_mapping_authority_changed_error("prepared pre-effect recovery"));
             }
-            self.validate_split_path_images(&target, journal, true)?;
+            self.validate_split_path_images(&target, journal)?;
         } else if actual_authority.1 != *post_authority {
             return Err(split_mapping_authority_changed_error("prepared post-ref recovery"));
         }
@@ -1701,12 +1701,7 @@ impl<'a> SplitEngine<'a> {
         Ok(())
     }
 
-    fn validate_split_path_images(
-        &self,
-        target: &SystemGit,
-        journal: &GitEffectJournal,
-        require_old: bool,
-    ) -> RailResult<()> {
+    fn validate_split_path_images(&self, target: &SystemGit, journal: &GitEffectJournal) -> RailResult<()> {
         let paths = journal
             .paths()
             .iter()
@@ -1714,15 +1709,8 @@ impl<'a> SplitEngine<'a> {
             .collect::<Vec<_>>();
         let images = target.exact_path_images(&paths)?;
         for (transition, images) in journal.paths().iter().zip(images) {
-            let index_old = git_entry_matches_image(images.index.as_ref(), transition.old());
-            let worktree_old = git_entry_matches_image(images.worktree.as_ref(), transition.old());
-            let index_new = git_entry_matches_image(images.index.as_ref(), transition.new_image());
-            let worktree_new = git_entry_matches_image(images.worktree.as_ref(), transition.new_image());
-            let accepted = if require_old {
-                index_old && worktree_old
-            } else {
-                (index_old || index_new) && (worktree_old || worktree_new)
-            };
+            let accepted =
+                transition.old().matches(images.index.as_ref()) && transition.old().matches(images.worktree.as_ref());
             if !accepted {
                 return Err(RailError::with_help(
                     format!(
@@ -1758,8 +1746,8 @@ impl<'a> SplitEngine<'a> {
             .map(|entry| (entry.path.clone(), entry))
             .collect::<std::collections::BTreeMap<_, _>>();
         for transition in journal.paths() {
-            if !git_entry_matches_image(old.get(transition.path()), transition.old())
-                || !git_entry_matches_image(new.get(transition.path()), transition.new_image())
+            if !transition.old().matches(old.get(transition.path()))
+                || !transition.new_image().matches(new.get(transition.path()))
             {
                 return Err(RailError::message(format!(
                     "prepared split journal path '{}' disagrees with its exact old or result tree",
@@ -1892,14 +1880,6 @@ impl<'a> SplitEngine<'a> {
 
         progress!("   Created workspace Cargo.toml with {} members", members.len());
         Ok(doc.to_string().into_bytes())
-    }
-}
-
-fn git_entry_matches_image(entry: Option<&GitTreeEntry>, image: &GitPathImage) -> bool {
-    match (entry, image.entry_parts()) {
-        (None, None) => true,
-        (Some(entry), Some((mode, object_id))) => entry.mode == mode && entry.object_id == object_id,
-        _ => false,
     }
 }
 

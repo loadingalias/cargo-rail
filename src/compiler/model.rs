@@ -382,39 +382,6 @@ impl MemberEvidence {
         }
     }
 
-    /// Summarize per-configuration evidence for a dependency proof.
-    #[must_use]
-    pub fn dependency_summary(&self, dependency: &DependencyIdentity, required_targets: &[&str]) -> EvidenceSummary {
-        let mut summary = EvidenceSummary::default();
-        for target in required_targets {
-            let target = PlatformTarget::from(*target);
-            let configurations = self.configurations.get(&target);
-            for features in FeatureSelection::BASELINES {
-                if configurations.is_none_or(|items| !items.contains_key(&features)) {
-                    summary.applicable += 1;
-                    summary.incomplete += 1;
-                }
-            }
-            for evidence in configurations.into_iter().flat_map(BTreeMap::values) {
-                summary.applicable += 1;
-                match dependency_state_in_configuration(evidence, dependency) {
-                    DependencyEvidenceState::Used => {
-                        summary.complete += 1;
-                        summary.used += 1;
-                    }
-                    DependencyEvidenceState::Unused => {
-                        summary.complete += 1;
-                        summary.unused += 1;
-                    }
-                    DependencyEvidenceState::Incomplete | DependencyEvidenceState::Inapplicable => {
-                        summary.incomplete += 1
-                    }
-                }
-            }
-        }
-        summary
-    }
-
     /// Evaluate only explicitly required feature modes.
     ///
     /// Optional-dependency proofs use this to ignore configurations where Cargo

@@ -994,11 +994,8 @@ fn apply_visibility_mutation(
                     .map_err(Into::into)
             })
             .collect::<RailResult<Vec<_>>>()?;
-        let mut metadata = BackupMetadata::new("cargo rail surface")
+        let metadata = BackupMetadata::new("cargo rail surface")
             .with_description(format!("original source for surface operation {}", plan.operation_id));
-        if let Some(config) = ctx.config() {
-            metadata = metadata.with_config(config.as_ref().clone());
-        }
         Some(backup_manager.create_backup(&paths, metadata, 3)?)
     } else {
         None

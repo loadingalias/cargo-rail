@@ -834,17 +834,6 @@ impl ManifestAnalyzer {
         unique_users.len()
     }
 
-    /// Get all dep keys that refer to a specific package (including renamed)
-    ///
-    /// Used to find all renamed variants of a package
-    /// Uses package_index for O(1) lookup instead of O(n) scan.
-    pub fn dep_keys_for_package(&self, package_name: &str) -> Vec<&DepKey> {
-        self.package_index
-            .get(package_name)
-            .map(|keys| keys.iter().collect())
-            .unwrap_or_default()
-    }
-
     /// Get aggregated usage sites for a package (all renamed and non-renamed usages)
     ///
     /// Used when include_renamed = true to merge features across all usages
@@ -862,13 +851,6 @@ impl ManifestAnalyzer {
         }
 
         all_usages
-    }
-
-    /// Get unique package names from all dependencies
-    ///
-    /// Used to iterate by package rather than by dep key
-    pub fn unique_packages(&self) -> HashSet<Arc<str>> {
-        self.usage_index.keys().map(|k| Arc::clone(&k.name)).collect()
     }
 }
 

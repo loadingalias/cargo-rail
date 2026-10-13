@@ -676,9 +676,9 @@ impl InstallationReceipt {
 
     fn validate(&self) -> RailResult<()> {
         if self.version != INSTALLATION_VERSION
-            || !valid_hex_digest(&self.authority)
-            || !valid_sha256(&self.wrapper_digest)
-            || !valid_sha256(&self.worker_digest)
+            || !crate::source::ContentDigest::is_sha256_hex(&self.authority)
+            || !crate::source::ContentDigest::is_sha256_text(&self.wrapper_digest)
+            || !crate::source::ContentDigest::is_sha256_text(&self.worker_digest)
             || self.wrapper_generation.is_empty()
             || self.wrapper_generation.len() > 512
             || self.worker_generation.is_empty()
@@ -707,7 +707,7 @@ impl InstallationReceipt {
             && (!matches!(
                 distributed.mode.as_str(),
                 "local_process_qualification_v1" | "mutual_tls_direct_v1"
-            ) || !valid_sha256(&distributed.worker_digest)
+            ) || !crate::source::ContentDigest::is_sha256_text(&distributed.worker_digest)
                 || distributed.worker_generation.is_empty()
                 || distributed.worker_generation.len() > 512
                 || !distributed.worker_path.is_absolute()
@@ -737,7 +737,7 @@ impl InstallationReceipt {
                         Some(name) if name == crate::compiler::driver::compiler_driver_file_name()
                             || name == crate::compiler::driver::COMPILER_DRIVER_SOURCE_FILE_NAME
                     )
-                    || !valid_sha256(&component.digest)
+                    || !crate::source::ContentDigest::is_sha256_text(&component.digest)
                     || component.generation.is_empty()
                     || component.generation.len() > 512
             })
@@ -761,7 +761,7 @@ fn valid_installed_worker_capability(value: &str) -> bool {
         .parse::<u32>()
         .ok()
         .is_some_and(|number| number > 0 && number.to_string() == version)
-        && valid_sha256(digest)
+        && crate::source::ContentDigest::is_sha256_text(digest)
 }
 
 fn valid_installed_mutual_tls(mutual_tls: &InstalledMutualTlsDirect, worker_path: &Path) -> bool {
@@ -796,7 +796,7 @@ fn valid_installed_mutual_tls(mutual_tls: &InstalledMutualTlsDirect, worker_path
             path.is_absolute()
                 && path.parent() == Some(directory)
                 && path.file_name() == Some(std::ffi::OsStr::new(file_name))
-                && valid_sha256(digest)
+                && crate::source::ContentDigest::is_sha256_text(digest)
                 && !generation.is_empty()
                 && generation.len() <= 512
         })
@@ -3530,7 +3530,7 @@ fn parse_legacy_receipt(bytes: &[u8], cargo_home: &Path, config_path: &Path) -> 
     let receipt: LegacyInstallationReceipt = serde_json::from_slice(bytes)?;
     let install_directory = cargo_home.join("cargo-rail").join(INSTALLATION_DIRECTORY);
     if receipt.version == INSTALLATION_VERSION
-        || !valid_hex_digest(&receipt.authority)
+        || !crate::source::ContentDigest::is_sha256_hex(&receipt.authority)
         || receipt.cargo_home != cargo_home
         || receipt.config_path != config_path
         || receipt.wrapper_path != install_directory.join(WRAPPER_FILE)
@@ -3640,17 +3640,6 @@ pub(super) fn random_authority() -> RailResult<String> {
     getrandom::fill(&mut bytes)
         .map_err(|error| RailError::message(format!("failed to acquire installation authority randomness: {error}")))?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
-}
-
-fn valid_hex_digest(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn valid_sha256(value: &str) -> bool {
-    value.strip_prefix("sha256:").is_some_and(valid_hex_digest)
 }
 
 #[cfg(test)]

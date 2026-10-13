@@ -34,6 +34,17 @@ pub(crate) fn reconcile(git: &SystemGit, state: &mut ReleaseState, path: &Path) 
                 )?;
             }
             let id = git.run_git_stdout(&["rev-parse", "--verify", &reference])?;
+            // A tag left by an interrupted run is adopted; one naming another commit is not ours.
+            let target = git.run_git_stdout(&["rev-parse", "--verify", &format!("{reference}^{{commit}}")])?;
+            if target != source {
+                return Err(RailError::with_help(
+                    format!(
+                        "local tag '{}' points to {target}, not release commit {source}",
+                        package.tag_name
+                    ),
+                    "delete or rename the conflicting local tag after confirming it is not this release, then resume",
+                ));
+            }
             let content = String::from_utf8(git.run_git(&["cat-file", "tag", &id])?.stdout)
                 .map_err(|_| RailError::message("release tag object is not UTF-8"))?;
             verify_signature(git, &reference, state.intent.release_config.sign_tags)?;

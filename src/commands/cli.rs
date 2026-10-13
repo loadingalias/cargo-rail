@@ -5,9 +5,7 @@
 //!
 //! **Note:** This is not part of the stable public API.
 
-use super::common::{
-    ChangeOutputFormat, SplitOutputFormat, SurfaceOutputFormat, TextJsonOutputFormat, UnifyOutputFormat,
-};
+use super::common::{ChangeOutputFormat, SplitOutputFormat, SurfaceOutputFormat, TextJsonOutputFormat};
 use crate::output::OutputProtocol;
 use crate::sync::ConflictStrategy;
 use clap::{Args, CommandFactory, Parser, Subcommand, error::ErrorKind};
@@ -80,10 +78,11 @@ Without comparison flags, use changes since the default-branch merge base.
 
   cargo rail plan --from abc --to def        # Compare two commits
   cargo rail plan --explain-work cargo.test  # Explain one decision, even when skipped
-  cargo rail plan --json > plan.json         # Save the exact plan
-  cargo rail plan --verify plan.json         # Validate the saved plan and checkout without execution
+  cargo rail plan --json > target/plan.json  # Save the exact plan outside tracked files
+  cargo rail plan --verify target/plan.json  # Validate the saved plan and checkout without execution
   cargo rail plan --cases routes.toml        # Compare reviewed path cases with planner decisions
 
+An untracked plan file inside the checkout is itself drift; keep it in an ignored directory or elsewhere.
 Use --verify - to read the saved plan from standard input.";
 
 const PLAN_EVIDENCE_HELP: &str = "\
@@ -339,7 +338,7 @@ pub enum Commands {
     },
 
     /// Analyze and repair workspace dependency coherence
-    #[command(after_long_help = UNIFY_HELP)]
+    #[command(after_long_help = UNIFY_HELP, args_conflicts_with_subcommands = true)]
     Unify {
         /// Explicit mutation, diagnostics, or recovery operation
         #[command(subcommand)]
@@ -349,7 +348,7 @@ pub enum Commands {
         check: bool,
         /// Output format
         #[arg(long, short = 'f', default_value_t, value_enum)]
-        format: UnifyOutputFormat,
+        format: TextJsonOutputFormat,
         /// Generate the dependency report
         #[arg(long)]
         report: bool,
@@ -507,20 +506,16 @@ impl Commands {
     /// Return whether this command consumes one authoritative workspace snapshot.
     #[doc(hidden)]
     pub fn requires_workspace_snapshot(&self) -> bool {
-        match self {
+        matches!(
+            self,
             Self::Doctor { .. }
-            | Self::Unify { .. }
-            | Self::Split { .. }
-            | Self::Sync { .. }
-            | Self::Surface { schema: false, .. }
-            | Self::Release { .. }
-            | Self::Change { .. }
-            | Self::Config {
-                command: Some(ConfigCommand::Migrate { .. }),
-            } => true,
-            Self::Plan { .. } => false,
-            _ => false,
-        }
+                | Self::Unify { .. }
+                | Self::Split { .. }
+                | Self::Sync { .. }
+                | Self::Surface { schema: false, .. }
+                | Self::Release { .. }
+                | Self::Change { .. }
+        )
     }
 
     /// Return whether dispatch needs sparse planning state captured before metadata loading.
@@ -528,15 +523,6 @@ impl Commands {
     pub fn requires_planning_source_capture(&self) -> bool {
         match self {
             Self::Plan { from, to, schema, .. } => !(*schema || from.is_some() && to.is_some()),
-            _ => false,
-        }
-    }
-
-    /// Return whether dispatch needs source captured before metadata loading.
-    #[doc(hidden)]
-    pub fn requires_worktree_source_capture(&self) -> bool {
-        match self {
-            Self::Doctor { .. } | Self::Surface { .. } => false,
             _ => false,
         }
     }
@@ -875,6 +861,7 @@ pub enum ConfigCommand {
     /// policy unchanged, which also removes older spellings of a default. A file that contains
     /// only defaults is deleted when no other configuration file would take its place.
     /// Comments and every other setting are kept.
+    #[command(args_conflicts_with_subcommands = true)]
     Migrate {
         #[command(subcommand)]
         command: Option<ConfigMigrateCommand>,
@@ -920,13 +907,13 @@ pub enum UnifyCommand {
         report_path: Option<PathBuf>,
         /// Output format
         #[arg(long, short = 'f', default_value_t, value_enum)]
-        format: UnifyOutputFormat,
+        format: TextJsonOutputFormat,
     },
     /// Inspect Cargo resolution semantics without changing files
     Doctor {
         /// Output format
         #[arg(long, short = 'f', default_value_t, value_enum)]
-        format: UnifyOutputFormat,
+        format: TextJsonOutputFormat,
     },
     /// Restore manifests from a previous backup
     Undo {
@@ -1400,12 +1387,12 @@ impl Commands {
             Commands::Unify {
                 command: Some(UnifyCommand::Doctor { format } | UnifyCommand::Apply { format, .. }),
                 ..
-            } => *format = UnifyOutputFormat::Json,
+            } => *format = TextJsonOutputFormat::Json,
             Commands::Unify {
                 command: Some(UnifyCommand::Undo { format, .. }),
                 ..
             } => *format = TextJsonOutputFormat::Json,
-            Commands::Unify { format, .. } => *format = UnifyOutputFormat::Json,
+            Commands::Unify { format, .. } => *format = TextJsonOutputFormat::Json,
             Commands::Split {
                 command: SplitCommand::Run { format, .. },
             } => *format = SplitOutputFormat::Json,

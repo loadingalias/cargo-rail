@@ -448,29 +448,6 @@ impl MultiTargetMetadata {
         features
     }
 
-    /// Check which targets include a specific dependency (sorted for deterministic output)
-    pub fn targets_with_dep(&self, dep_name: &str) -> Vec<String> {
-        let mut targets = Vec::with_capacity(self.cache.len());
-
-        for (target, entry) in &self.cache {
-            let metadata = &entry.metadata;
-            if let Some(resolve) = &metadata.resolve {
-                // Check if any node matches - clone target only once when found
-                let has_dep = resolve
-                    .nodes
-                    .iter()
-                    .any(|node| entry.package_by_id(&node.id).is_some_and(|pkg| pkg.name == dep_name));
-
-                if has_dep {
-                    targets.push(target.clone());
-                }
-            }
-        }
-
-        targets.sort_unstable();
-        targets
-    }
-
     /// Detect transitive dependencies with fragmented features
     /// These are candidates for explicit host-owned pinning.
     pub fn find_fragmented_transitives(&self) -> Vec<FragmentedTransitive> {
@@ -863,12 +840,7 @@ pub struct FragmentedTransitive {
     pub unified_features: Vec<String>,
 }
 
-impl FragmentedTransitive {
-    /// Calculate the compilation overhead from fragmentation
-    pub fn overhead_factor(&self) -> usize {
-        self.feature_sets.len()
-    }
-}
+impl FragmentedTransitive {}
 
 /// Manifest/dependency MSRV candidate that has not necessarily been compiler-probed.
 #[derive(Debug, Clone)]

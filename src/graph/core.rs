@@ -580,12 +580,6 @@ impl WorkspaceGraph {
         Ok(dependencies)
     }
 
-    /// Get transitive workspace dependents of one exact package.
-    pub fn transitive_dependents_by_id(&self, package_id: &PackageId) -> RailResult<Vec<String>> {
-        let start_node = self.find_node_by_id(package_id)?;
-        Ok(self.transitive_dependents_from(start_node))
-    }
-
     fn transitive_dependents_from(&self, start_node: NodeIndex) -> Vec<String> {
         // DFS in reverse direction (incoming edges)
         let mut visited = HashSet::new();
@@ -620,14 +614,6 @@ impl WorkspaceGraph {
         result
     }
 
-    /// Get direct workspace dependents for a crate.
-    ///
-    /// Returns only workspace members with an immediate dependency edge to `crate_name`.
-    pub fn direct_dependents(&self, crate_name: &str) -> RailResult<Vec<String>> {
-        let node = self.find_node(crate_name)?;
-        Ok(self.direct_dependents_from(node))
-    }
-
     /// Get direct workspace dependents of one exact package.
     pub fn direct_dependents_by_id(&self, package_id: &PackageId) -> RailResult<Vec<String>> {
         let node = self.find_node_by_id(package_id)?;
@@ -653,14 +639,6 @@ impl WorkspaceGraph {
             .collect();
         result.sort();
         result
-    }
-
-    /// Get transitive reverse dependencies for multiple crates in a single traversal.
-    ///
-    /// Uses one O(V + E) traversal instead of one traversal per input crate.
-    pub fn transitive_dependents_of_set(&self, crate_names: &HashSet<String>) -> RailResult<HashSet<String>> {
-        let package_ids = self.resolve_package_names(crate_names)?;
-        self.transitive_dependents_of_ids(&package_ids)
     }
 
     /// Get transitive workspace dependents of exact packages in one traversal.
@@ -709,19 +687,6 @@ impl WorkspaceGraph {
         crate::instrumentation::record_graph_traversal(node_visits, edge_visits);
 
         Ok(dependents)
-    }
-
-    /// Get `(depends_on, dependent)` pairs for transitive reverse dependencies of multiple crates.
-    ///
-    /// Returns one pair for each workspace dependent reachable from each input crate.
-    /// If a dependent is reachable from multiple input crates, one pair is returned per
-    /// originating crate. Output is sorted lexicographically by `(depends_on, dependent)`.
-    pub fn transitive_dependent_pairs_of_set(
-        &self,
-        crate_names: &HashSet<String>,
-    ) -> RailResult<Vec<(String, String)>> {
-        let package_ids = self.resolve_package_names(crate_names)?;
-        self.transitive_dependent_pairs_of_ids(&package_ids)
     }
 
     /// Get exact-package reverse dependency pairs in one traversal.
@@ -861,14 +826,6 @@ impl WorkspaceGraph {
         self.ownership_index.owner(file_path)
     }
 
-    /// Map multiple files to owning crates.
-    pub fn files_to_crates(&self, file_paths: &[impl AsRef<Path>]) -> HashSet<String> {
-        file_paths
-            .iter()
-            .filter_map(|p| self.file_to_crate(p.as_ref()))
-            .collect()
-    }
-
     /// Find node index by crate name.
     fn find_node(&self, crate_name: &str) -> RailResult<NodeIndex> {
         let Some(matches) = self.workspace_name_index.get(crate_name) else {
@@ -914,13 +871,6 @@ impl WorkspaceGraph {
             .get(package_id)
             .copied()
             .ok_or_else(|| RailError::message(format!("Package ID '{}' not found in the resolved graph", package_id)))
-    }
-
-    fn resolve_package_names(&self, package_names: &HashSet<String>) -> RailResult<HashSet<PackageId>> {
-        package_names
-            .iter()
-            .map(|name| self.find_node(name).map(|node| self.graph[node].id.clone()))
-            .collect()
     }
 }
 

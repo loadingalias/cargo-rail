@@ -61,6 +61,36 @@ fn test_unify_doctor_reports_exact_resolution_domains_in_text_and_json() {
 }
 
 #[test]
+fn test_unify_rejects_parent_options_before_a_subcommand() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_named("unify-check-apply")?;
+        workspace.add_crate("crate-a", "0.1.0", &[("serde", r#""1.0""#)])?;
+        workspace.add_crate("crate-b", "0.1.0", &[("serde", r#""1.0""#)])?;
+        workspace.commit("Add crates with a pending unification")?;
+        let manifests = ["Cargo.toml", "crates/crate-a/Cargo.toml", "crates/crate-b/Cargo.toml"]
+            .map(|path| std::fs::read(workspace.path.join(path)))
+            .into_iter()
+            .collect::<std::io::Result<Vec<_>>>()?;
+
+        // The apply path never reads the parent `--check`, so clap must reject the combination.
+        for arguments in [
+            &["rail", "unify", "--check", "apply"][..],
+            &["rail", "unify", "-f", "json", "apply"][..],
+        ] {
+            let output = run_cargo_rail(&workspace.path, arguments)?;
+            assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+        }
+        let current = ["Cargo.toml", "crates/crate-a/Cargo.toml", "crates/crate-b/Cargo.toml"]
+            .map(|path| std::fs::read(workspace.path.join(path)))
+            .into_iter()
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(current, manifests, "a rejected invocation must not write manifests");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_unify_check_json_emits_versioned_feature_target_coverage_views() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new_named("unify-coverage-views")?;
@@ -1035,22 +1065,22 @@ exclude = ["tokio"]
         let output_config = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
         let stdout_config = String::from_utf8_lossy(&output_config.stdout);
 
-        // Should show anyhow and serde, but NOT tokio
-        assert!(
-            stdout_config.contains("anyhow") || stdout_config.contains("serde"),
-            "Non-excluded deps should show (config test).\nOutput:\n{}",
-            stdout_config
+        assert_eq!(
+            output_config.status.code(),
+            Some(1),
+            "unify must have pending work: {stdout_config}"
         );
 
         // Run apply to verify config exclusion persists
         let apply_output = run_cargo_rail(&workspace.path, &["rail", "unify", "apply"])?;
         assert!(apply_output.status.success(), "Apply should succeed");
 
-        // Workspace should have anyhow and serde, but NOT tokio
-        let workspace_toml = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+        // The fixture already declares anyhow and serde; only the excluded tokio must stay out.
+        let workspace_toml: toml_edit::DocumentMut =
+            std::fs::read_to_string(workspace.path.join("Cargo.toml"))?.parse()?;
         assert!(
-            workspace_toml.contains("anyhow") || workspace_toml.contains("serde"),
-            "Should have non-excluded deps in workspace.dependencies"
+            workspace_toml["workspace"]["dependencies"].get("tokio").is_none(),
+            "excluded tokio must not enter workspace.dependencies:\n{workspace_toml}"
         );
 
         // Verify member conversion - check that tokio was NOT converted (excluded)

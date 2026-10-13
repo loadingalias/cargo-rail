@@ -155,7 +155,7 @@ pub(crate) fn analyze_result(
                 || read
                     .value_digest
                     .as_deref()
-                    .is_some_and(|digest| !valid_sha256_digest(digest))
+                    .is_some_and(|digest| !ContentDigest::is_sha256_text(digest))
             {
                 reasons.insert("build_script_environment_read_invalid".to_string());
             }
@@ -332,8 +332,10 @@ pub(crate) enum RerunDeclaration<'a> {
 }
 
 /// Parse one stdout line as a rerun declaration in either instruction syntax.
+///
+/// Cargo trims each output line before it matches an instruction prefix.
 pub(crate) fn rerun_declaration(line: &str) -> Option<RerunDeclaration<'_>> {
-    match instruction_parts(line)? {
+    match instruction_parts(line.trim())? {
         (_, "rerun-if-changed", path) => Some(RerunDeclaration::Changed(path)),
         (_, "rerun-if-env-changed", name) => Some(RerunDeclaration::EnvironmentChanged(name)),
         _ => None,
@@ -396,12 +398,6 @@ fn summarize_rustc_flags(value: &str, summary: &mut BuildScriptInstructionSummar
         }
     }
     true
-}
-
-fn valid_sha256_digest(digest: &str) -> bool {
-    digest
-        .strip_prefix("sha256:")
-        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
 }
 
 fn valid_environment_name(name: &str) -> bool {
@@ -491,6 +487,24 @@ mod tests {
     use crate::source::SourceTreeEntry;
 
     use super::*;
+
+    #[test]
+    fn rerun_declarations_match_cargo_line_trimming() {
+        // Cargo's build-output parser trims every line before matching `cargo:` or `cargo::`.
+        assert_eq!(
+            rerun_declaration("  cargo:rerun-if-changed=/opt/x.h"),
+            Some(RerunDeclaration::Changed("/opt/x.h"))
+        );
+        assert_eq!(
+            rerun_declaration("cargo::rerun-if-changed=build.rs \t"),
+            Some(RerunDeclaration::Changed("build.rs"))
+        );
+        assert_eq!(
+            rerun_declaration("\tcargo:rerun-if-env-changed=PROFILE_INPUT"),
+            Some(RerunDeclaration::EnvironmentChanged("PROFILE_INPUT"))
+        );
+        assert_eq!(rerun_declaration("note: cargo:rerun-if-changed=x"), None);
+    }
 
     fn output_tree(bytes: &[u8], executable: bool) -> SourceTree {
         SourceTree::new(vec![

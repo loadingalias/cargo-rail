@@ -711,6 +711,31 @@ struct JsonError<'a> {
     warnings: Vec<&'a str>,
 }
 
+/// A failure that a lazy cache retains and returns on every access.
+///
+/// [`RailError`] is not `Clone`; replay keeps the message and help, not the failure class or source.
+#[derive(Debug, Clone)]
+pub(crate) struct ReplayedError {
+    message: String,
+    help: Option<String>,
+}
+
+impl ReplayedError {
+    pub(crate) fn capture(error: RailError) -> Self {
+        Self {
+            message: error.to_string(),
+            help: error.help_message(),
+        }
+    }
+
+    pub(crate) fn to_error(&self) -> RailError {
+        self.help.as_ref().map_or_else(
+            || RailError::message(self.message.clone()),
+            |help| RailError::with_help(self.message.clone(), help.clone()),
+        )
+    }
+}
+
 /// Print an error to stderr with optional help text
 ///
 /// In JSON mode, outputs a structured JSON error object instead of text.

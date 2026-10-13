@@ -63,6 +63,20 @@ const CREDENTIAL_IDENTITY_ENVIRONMENT: &[&str] = &[
     "AWS_METADATA_SERVICE_NUM_ATTEMPTS",
     "AWS_SDK_LOAD_CONFIG",
     "AWS_LOGIN_CACHE_DIRECTORY",
+    "AZURE_AUTHORITY_HOST",
+    "AZURE_CLIENT_ID",
+    "AZURE_CLIENT_SECRET",
+    "AZURE_CLIENT_CERTIFICATE_PATH",
+    "AZURE_CLIENT_CERTIFICATE_PASSWORD",
+    "AZURE_CONFIG_DIR",
+    "AZURE_FEDERATED_TOKEN_FILE",
+    "AZURE_TENANT_ID",
+    "IDENTITY_ENDPOINT",
+    "IDENTITY_HEADER",
+    "IDENTITY_SERVER_THUMBPRINT",
+    "IMDS_ENDPOINT",
+    "MSI_ENDPOINT",
+    "MSI_SECRET",
 ];
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1078,6 +1092,36 @@ fn io_unavailable(error: std::io::Error) -> RemoteStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_identity_covers_every_scrubbed_credential_selector() {
+        // The selection and marker are bound separately; regions, account and subscription
+        // identifiers, and rejected endpoint overrides do not choose a principal.
+        let not_credential_selectors = [
+            super::super::REMOTE_URL_ENV,
+            super::super::REMOTE_MODE_ENV,
+            super::super::REMOTE_ENVIRONMENT_ENV,
+            MARKER_ENV,
+            "AWS_ACCOUNT_ID",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_ENDPOINT_URL",
+            "AWS_ENDPOINT_URL_S3",
+            "AWS_ENDPOINT_URL_STS",
+            "AWS_ENDPOINT_URL_SSO",
+            "AWS_ENDPOINT_URL_SSO_OIDC",
+            "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS",
+            "AZURE_SUBSCRIPTION_ID",
+        ];
+        let missing = super::super::PRIVATE_REMOTE_ENVIRONMENT
+            .iter()
+            .filter(|name| !not_credential_selectors.contains(name) && !CREDENTIAL_IDENTITY_ENVIRONMENT.contains(name))
+            .collect::<Vec<_>>();
+        assert!(
+            missing.is_empty(),
+            "credential selectors outside the coordinator identity: {missing:?}"
+        );
+    }
 
     #[test]
     fn coordinator_tokens_are_independent_fixed_hex_capabilities() {

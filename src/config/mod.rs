@@ -16,6 +16,7 @@ pub use release::{
     GroupSpec, Pre1BreakingBump, ReleaseArtifacts, ReleaseAsset, ReleaseConfig, ReleaseRegistryPublication,
     ReleaseRemoteEffects, ReleaseSource, RequireChangeFiles, SemverCheckPolicy,
 };
+pub(crate) use split::validate_remote_argument;
 pub use split::{CrateSplitConfig, SplitConfig, SplitMode, WorkspaceMode};
 pub use surface::{
     SurfaceConfig, SurfaceConsumerScope, SurfaceCrateVisibility, SurfaceDoctest, SurfaceDoctestCoverage,
@@ -461,14 +462,6 @@ impl RailConfig {
                 message: error.to_string(),
             },
         }
-    }
-
-    /// Get all crates that have split configuration
-    pub fn get_split_crates(&self) -> Vec<(&str, &CrateSplitConfig)> {
-        self.crates
-            .iter()
-            .filter_map(|(name, config)| config.split.as_ref().map(|split| (name.as_str(), split)))
-            .collect()
     }
 
     /// Build all SplitConfigs from unified crate config

@@ -51,6 +51,8 @@ pub(crate) struct ImpactPropagation {
     pub(crate) development_origins: FxHashMap<PackageId, PackageId>,
     /// Deterministically ordered semantic propagation evidence.
     pub(crate) steps: Vec<ImpactStep>,
+    /// Changed packages that depend on another changed package through any declared edge.
+    pub(crate) reached_seeds: BTreeSet<PackageId>,
 }
 
 impl ImpactPropagation {
@@ -86,7 +88,7 @@ fn sort_steps(steps: &mut Vec<ImpactStep>) {
     steps.dedup();
 }
 
-const fn dependency_kind_rank(kind: DependencyKind) -> u8 {
+pub(super) const fn dependency_kind_rank(kind: DependencyKind) -> u8 {
     match kind {
         DependencyKind::Normal => 0,
         DependencyKind::Development => 1,

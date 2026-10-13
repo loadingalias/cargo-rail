@@ -520,16 +520,6 @@ impl FeatureScanner {
 
         None
     }
-
-    /// Get total count of dead features across workspace
-    pub fn count_dead_features(results: &[FeatureScanResult]) -> usize {
-        results.iter().map(|r| r.dead_features.len()).sum()
-    }
-
-    /// Get total count of optional features across workspace
-    pub fn count_optional_features(results: &[FeatureScanResult]) -> usize {
-        results.iter().map(|r| r.optional_features.len()).sum()
-    }
 }
 
 #[cfg(test)]

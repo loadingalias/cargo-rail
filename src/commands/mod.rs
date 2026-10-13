@@ -131,11 +131,7 @@ impl PreparedContext {
         } else if self.command.requires_planning_source_capture() {
             WorkspaceContext::build_with_planning_capture_and_config(workspace_root, self.config_override.as_deref())
         } else {
-            WorkspaceContext::build_with_source_capture_and_config(
-                workspace_root,
-                self.command.requires_worktree_source_capture(),
-                self.config_override.as_deref(),
-            )
+            WorkspaceContext::build_with_config(workspace_root, self.config_override.as_deref())
         };
         Ok((*self.command, context?, self.plan_options))
     }

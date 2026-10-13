@@ -2041,7 +2041,7 @@ impl<'a> SyncEngine<'a> {
         remote_git: &SystemGit,
         remote_commit: &str,
     ) -> RailResult<Option<String>> {
-        let remote_history = remote_git.get_commits_touching_path(Path::new("."), None, remote_commit)?;
+        let remote_history = remote_git.get_commits_touching_path(Path::new("."), remote_commit)?;
         Ok(remote_history
             .iter()
             .rev()
@@ -2723,7 +2723,7 @@ impl<'a> SyncEngine<'a> {
                 .path_capabilities
                 .authorize_source_mutation(transition.path())?;
             let index = git.index_entry(transition.path())?;
-            if !git_entry_matches_image(index.as_ref(), transition.old()) {
+            if !transition.old().matches(index.as_ref()) {
                 return Err(crate::error::RailError::with_help(
                     format!(
                         "conflict materialization index path '{}' changed after preparation",
@@ -2733,9 +2733,7 @@ impl<'a> SyncEngine<'a> {
                 ));
             }
             let worktree = git.worktree_entry(transition.path())?;
-            if !git_entry_matches_image(worktree.as_ref(), transition.old())
-                && !git_entry_matches_image(worktree.as_ref(), transition.new_image())
-            {
+            if !transition.old().matches(worktree.as_ref()) && !transition.new_image().matches(worktree.as_ref()) {
                 return Err(crate::error::RailError::with_help(
                     format!(
                         "conflict materialization path '{}' changed to a third state",
@@ -2764,7 +2762,7 @@ impl<'a> SyncEngine<'a> {
         }
         for transition in &prepared.transitions {
             let worktree = git.worktree_entry(transition.path())?;
-            if !git_entry_matches_image(worktree.as_ref(), transition.new_image()) {
+            if !transition.new_image().matches(worktree.as_ref()) {
                 return Err(crate::error::RailError::message(format!(
                     "conflict materialization path '{}' did not converge to its recorded image",
                     transition.path().display()
@@ -3134,10 +3132,10 @@ fn validate_sync_path_images(git: &SystemGit, journal: &GitEffectJournal, requir
     for transition in journal.paths() {
         let index = git.index_entry(transition.path())?;
         let worktree = git.worktree_entry(transition.path())?;
-        let index_old = git_entry_matches_image(index.as_ref(), transition.old());
-        let worktree_old = git_entry_matches_image(worktree.as_ref(), transition.old());
-        let index_new = git_entry_matches_image(index.as_ref(), transition.new_image());
-        let worktree_new = git_entry_matches_image(worktree.as_ref(), transition.new_image());
+        let index_old = transition.old().matches(index.as_ref());
+        let worktree_old = transition.old().matches(worktree.as_ref());
+        let index_new = transition.new_image().matches(index.as_ref());
+        let worktree_new = transition.new_image().matches(worktree.as_ref());
         let accepted = if require_old {
             index_old && worktree_old
         } else {
@@ -3160,9 +3158,7 @@ fn validate_sync_terminal_path_images(git: &SystemGit, journal: &GitEffectJourna
     for transition in journal.paths() {
         let index = git.index_entry(transition.path())?;
         let worktree = git.worktree_entry(transition.path())?;
-        if !git_entry_matches_image(index.as_ref(), transition.new_image())
-            || !git_entry_matches_image(worktree.as_ref(), transition.new_image())
-        {
+        if !transition.new_image().matches(index.as_ref()) || !transition.new_image().matches(worktree.as_ref()) {
             return Err(crate::error::RailError::with_help(
                 format!(
                     "terminal prepared sync path '{}' no longer has its exact result image",
@@ -3210,9 +3206,7 @@ fn validate_sync_journal_tree_images(git: &SystemGit, journal: &GitEffectJournal
             .as_deref()
             .map_or(Ok(None), |expected| git.tree_entry(expected, transition.path()))?;
         let new = git.tree_entry(&repository.result_oid, transition.path())?;
-        if !git_entry_matches_image(old.as_ref(), transition.old())
-            || !git_entry_matches_image(new.as_ref(), transition.new_image())
-        {
+        if !transition.old().matches(old.as_ref()) || !transition.new_image().matches(new.as_ref()) {
             return Err(crate::error::RailError::message(format!(
                 "prepared sync journal path '{}' disagrees with its exact old or result tree",
                 transition.path().display()
@@ -3220,14 +3214,6 @@ fn validate_sync_journal_tree_images(git: &SystemGit, journal: &GitEffectJournal
         }
     }
     Ok(())
-}
-
-fn git_entry_matches_image(entry: Option<&GitTreeEntry>, image: &GitPathImage) -> bool {
-    match (entry, image.entry_parts()) {
-        (None, None) => true,
-        (Some(entry), Some((mode, oid))) => entry.mode == mode && entry.object_id == oid,
-        _ => false,
-    }
 }
 
 fn sync_mapping_authority_changed_error() -> crate::error::RailError {

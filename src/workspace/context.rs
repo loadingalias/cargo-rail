@@ -189,30 +189,6 @@ impl CargoState {
             .as_ref()
             .is_none_or(|registries| registries.iter().any(|candidate| candidate == registry))
     }
-
-    /// Return whether a member has a binary target but no `lib` or `proc-macro` target.
-    ///
-    /// Returns `false` for an unknown member.
-    pub fn is_binary_only(&self, crate_name: &str) -> bool {
-        let Some(pkg) = self.get_package(crate_name) else {
-            return false;
-        };
-
-        let mut has_bin = false;
-        let mut has_lib_like = false;
-
-        for target in &pkg.targets {
-            for kind in &target.kind {
-                match kind {
-                    cargo_metadata::TargetKind::Bin => has_bin = true,
-                    cargo_metadata::TargetKind::Lib | cargo_metadata::TargetKind::ProcMacro => has_lib_like = true,
-                    _ => {}
-                }
-            }
-        }
-
-        has_bin && !has_lib_like
-    }
 }
 
 /// Git state for the workspace
@@ -323,6 +299,9 @@ pub struct WorkspaceContext {
     /// Exact discovered configuration path for planning deltas.
     config_path: Option<PathBuf>,
 
+    /// Whether `--config` selected the configuration instead of discovery.
+    config_explicit: bool,
+
     /// Root used to make captured repository paths portable. Historical object
     /// planning owns a temporary materialization rather than the live Git root.
     authority_source_root: PathBuf,
@@ -357,28 +336,8 @@ impl WorkspaceContext {
         Self::build_inner(workspace_root, ContextCapture::None, None)
     }
 
-    /// Build a context and optionally capture WORKTREE source before metadata loading.
-    #[doc(hidden)]
-    pub fn build_with_source_capture(workspace_root: &Path, capture_source: bool) -> RailResult<Self> {
-        let capture = if capture_source {
-            ContextCapture::Worktree
-        } else {
-            ContextCapture::None
-        };
-        Self::build_inner(workspace_root, capture, None)
-    }
-
-    pub(crate) fn build_with_source_capture_and_config(
-        workspace_root: &Path,
-        capture_source: bool,
-        config_override: Option<&Path>,
-    ) -> RailResult<Self> {
-        let capture = if capture_source {
-            ContextCapture::Worktree
-        } else {
-            ContextCapture::None
-        };
-        Self::build_inner(workspace_root, capture, config_override)
+    pub(crate) fn build_with_config(workspace_root: &Path, config_override: Option<&Path>) -> RailResult<Self> {
+        Self::build_inner(workspace_root, ContextCapture::None, config_override)
     }
 
     pub(crate) fn build_with_planning_capture_and_config(
@@ -613,7 +572,7 @@ impl WorkspaceContext {
         };
 
         let initial_generated_roots = [super::cargo_rail_state_root(workspace_root)];
-        let mut source_capture = if matches!(capture, ContextCapture::Worktree | ContextCapture::Snapshot) {
+        let mut source_capture = if capture == ContextCapture::Snapshot {
             git.as_ref()
                 .map(|state| GitWorktreeCapture::capture_excluding(state.git(), &initial_generated_roots))
                 .transpose()?
@@ -840,6 +799,7 @@ impl WorkspaceContext {
             snapshot,
             config,
             config_path: captured_config_path,
+            config_explicit: config_override.is_some(),
             authority_source_root,
             historical_planning: None,
         })
@@ -867,6 +827,11 @@ impl WorkspaceContext {
 
     pub(crate) fn config_path(&self) -> Option<&Path> {
         self.config_path.as_deref()
+    }
+
+    /// Whether `--config` selected the configuration; discovery never replaces such a file.
+    pub(crate) const fn config_is_explicit(&self) -> bool {
+        self.config_explicit
     }
 
     /// Return Cargo state paired with the authoritative snapshot metadata.
@@ -1016,7 +981,10 @@ impl WorkspaceContext {
         )
     }
 
-    /// Return current non-generated source paths that differ from `HEAD`.
+    /// Return non-generated source paths that differ from `HEAD`.
+    ///
+    /// Tracked changes are read now; untracked files come from the context's source capture, so a file created
+    /// after capture is absent. Use [`Self::live_changed_source_paths`] to observe changes made since capture.
     pub(crate) fn changed_source_paths(&self) -> RailResult<Vec<PathBuf>> {
         let git = self.git()?.git();
         let owned_capture;
@@ -1025,6 +993,23 @@ impl WorkspaceContext {
         } else {
             owned_capture = self.capture_worktree_source()?;
             &owned_capture
+        };
+        Ok(capture
+            .changes_from(git, "HEAD")?
+            .entries()
+            .iter()
+            .map(|change| change.path.as_path().to_path_buf())
+            .collect())
+    }
+
+    /// Return the paths that differ from `HEAD` in the live worktree, under the captured exclusions.
+    ///
+    /// Unlike [`Self::changed_source_paths`], this also sees untracked files created after capture.
+    pub(crate) fn live_changed_source_paths(&self) -> RailResult<Vec<PathBuf>> {
+        let git = self.git()?.git();
+        let capture = match self.source_capture() {
+            Some(capture) => capture.recapture(git)?,
+            None => self.capture_worktree_source()?,
         };
         Ok(capture
             .changes_from(git, "HEAD")?
@@ -1252,7 +1237,6 @@ impl WorkspaceContext {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ContextCapture {
     None,
-    Worktree,
     Planning,
     PlanningVerification,
     Snapshot,

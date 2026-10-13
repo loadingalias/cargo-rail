@@ -287,11 +287,17 @@ pub fn run_config_explain(
     let configured = flatten_json(&configured);
     let effective = flatten_json(&effective);
     let defaults = flatten_json(&defaults);
+    // Serialization omits some unset fields, so every static field is listed from the schema too.
+    let static_fields = schema::FIELD_SPECS
+        .iter()
+        .filter(|field| !field.path.contains('<'))
+        .map(|field| schema::ConfigPath::from_dotted(field.path));
     let paths: BTreeSet<_> = effective
         .keys()
         .chain(configured.keys())
         .filter(|path| schema::field_spec_path(path).is_some())
         .cloned()
+        .chain(static_fields)
         .collect();
 
     let mut fields: Vec<_> = paths
@@ -865,7 +871,8 @@ fn planned_migration(ctx: &crate::workspace::WorkspaceContext) -> RailResult<Opt
     let (Some(file), Some(path)) = (snapshot.rail_config(), snapshot.rail_config_path()) else {
         return Ok(None);
     };
-    let migration = config::migration::plan(file.bytes(), deletion_keeps_defaults(path))?;
+    let deletable = !ctx.config_is_explicit() && deletion_keeps_defaults(path);
+    let migration = config::migration::plan(file.bytes(), deletable)?;
     Ok(Some(PlannedMigration {
         path: path.to_path_buf(),
         migration,

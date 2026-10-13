@@ -1846,7 +1846,7 @@ impl LocalCas {
         match fs::symlink_metadata(&destination) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.reserve_result_capacity(expected_bytes, None, CapacityReservationSource::Staging)?;
-                rename_committed(&staging.path, &destination, false).map_err(|error| {
+                rename_committed(&staging.path, &destination).map_err(|error| {
                     RailError::message(format!(
                         "failed to publish packed native action '{}': {error}",
                         destination.display()
@@ -4460,7 +4460,7 @@ impl LocalCas {
                 sync_directory_before_commit(shard)?;
             }
         }
-        match rename_committed(&payload, &destination, false) {
+        match rename_committed(&payload, &destination) {
             Ok(()) => {
                 if commit_durability {
                     sync_directory_before_commit(&self.root.join("results"))?;
@@ -4567,7 +4567,7 @@ impl LocalCas {
         sync_directory(&payload.join("validations"))?;
         sync_directory(&payload)?;
 
-        match rename_committed(&payload, &destination, false) {
+        match rename_committed(&payload, &destination) {
             Ok(()) => {
                 sync_directory(&self.root.join("results"))?;
                 crate::instrumentation::record_cas_write(stats.bytes_written, stats.objects_written);
@@ -4978,12 +4978,12 @@ fn persist_noclobber_committed(
 }
 
 #[cfg(windows)]
-fn rename_committed(source: &Path, destination: &Path, replace: bool) -> std::io::Result<()> {
-    crate::windows_fs::rename_write_through(source, destination, replace)
+fn rename_committed(source: &Path, destination: &Path) -> std::io::Result<()> {
+    crate::windows_fs::rename_write_through(source, destination, false)
 }
 
 #[cfg(not(windows))]
-fn rename_committed(source: &Path, destination: &Path, _replace: bool) -> std::io::Result<()> {
+fn rename_committed(source: &Path, destination: &Path) -> std::io::Result<()> {
     fs::rename(source, destination)
 }
 
@@ -5662,7 +5662,7 @@ fn publish_shared_blob(root: &Path, blob: &StagedBlob, staged: &Path) -> RailRes
         Err(error) => return Err(error.into()),
     }
     validate_real_directory(shard, "local CAS blob shard")?;
-    rename_committed(staged, &shared, false)?;
+    rename_committed(staged, &shared)?;
     Ok(blob.bytes)
 }
 

@@ -173,12 +173,7 @@ impl<'a> ReleaseValidator<'a> {
         plan: &ReleasePlan,
         skip_publish: bool,
         skip_tag: bool,
-        require_clean: bool,
     ) -> RailResult<()> {
-        if require_clean {
-            self.check_clean_working_directory()?;
-        }
-
         if !skip_tag {
             for crate_plan in &plan.crates {
                 if self.ctx.git()?.git().tag_exists(&crate_plan.tag_name)? {
@@ -385,26 +380,6 @@ impl<'a> ReleaseValidator<'a> {
         None
     }
 
-    /// Filter workspace members to only publishable crates
-    ///
-    /// Produces `(publishable_crates, skipped_with_reason)` for workspace members.
-    pub fn publishable_members(&self) -> (Vec<String>, Vec<(String, String)>) {
-        let all_members = self.ctx.graph().workspace_members();
-        let member_count = all_members.len();
-        let mut publishable = Vec::with_capacity(member_count);
-        let mut skipped = Vec::with_capacity(member_count / 4); // Most crates are publishable
-
-        for name in all_members {
-            if let Some(reason) = self.unpublishable_reason(name) {
-                skipped.push((name.clone(), reason));
-            } else {
-                publishable.push(name.clone());
-            }
-        }
-
-        (publishable, skipped)
-    }
-
     /// Run `cargo publish --dry-run` to validate package can be published
     ///
     /// This catches issues like:
@@ -424,7 +399,7 @@ impl<'a> ReleaseValidator<'a> {
         };
 
         // Run cargo publish --dry-run
-        let output = process::run(
+        let output = process::run_without_release_credentials(
             "cargo",
             &["publish", "--dry-run", "--locked"],
             Some(crate_dir.as_std_path()),
@@ -495,7 +470,7 @@ impl<'a> ReleaseValidator<'a> {
         }
 
         // Run cargo check with the MSRV toolchain
-        let output = process::run(
+        let output = process::run_without_release_credentials(
             "cargo",
             &[&toolchain, "check", "--lib", "--quiet", "--locked"],
             Some(crate_dir.as_std_path()),

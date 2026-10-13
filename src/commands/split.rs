@@ -154,7 +154,7 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
                         let authority = &mapping_snapshots[&config.crate_name].origin_authority;
                         serde_json::json!({
                           "crate_name": config.crate_name,
-                          "mode": split_mode_name(&config.mode),
+                          "mode": config.mode.as_str(),
                           "target_repo": config.target_repo_path,
                           "branch": config.branch,
                           "remote_url": config.remote_url,
@@ -192,7 +192,7 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
                     let pending_publication = pending_publications[index];
                     let obj = serde_json::json!({
                       "crate_name": config.crate_name,
-                      "mode": split_mode_name(&config.mode),
+                      "mode": config.mode.as_str(),
                       "target_repo": config.target_repo_path.display().to_string(),
                       "branch": config.branch,
                       "remote_url": config.remote_url,
@@ -213,7 +213,7 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
                         config.target_repo_path.display(),
                         pending_commits[index],
                         pending_publications[index],
-                        split_mode_name(&config.mode)
+                        config.mode.as_str()
                     );
                     if crate::output::is_verbose() {
                         println!("  Members: {}", config.ownership.members.join(", "));
@@ -300,7 +300,7 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
                 Ok(SplitAppliedCrate {
                     crate_name: config.crate_name,
                     target_repo: config.target_repo_path,
-                    mode: split_mode_name(&config.mode),
+                    mode: config.mode.as_str(),
                     pending_commits,
 
                     status: if pending_commits == 0 { "current" } else { "applied" },
@@ -323,7 +323,7 @@ pub fn run_split(ctx: &WorkspaceContext, args: SplitRunArgs) -> RailResult<()> {
             output_crates.push(SplitAppliedCrate {
                 crate_name: config.crate_name,
                 target_repo: config.target_repo_path,
-                mode: split_mode_name(&config.mode),
+                mode: config.mode.as_str(),
                 pending_commits,
 
                 status: if pending_commits == 0 { "current" } else { "applied" },
@@ -420,13 +420,6 @@ fn collect_split_effect_audits(output: &[SplitAppliedCrate]) -> RailResult<Vec<(
     }
     acknowledgements.sort_by(|left, right| left.1.effect_id.cmp(&right.1.effect_id));
     Ok(acknowledgements)
-}
-
-fn split_mode_name(mode: &crate::config::SplitMode) -> &'static str {
-    match mode {
-        crate::config::SplitMode::Single => "single",
-        crate::config::SplitMode::Combined => "combined",
-    }
 }
 
 fn render_empty_all(format: SplitOutputFormat) -> RailResult<()> {

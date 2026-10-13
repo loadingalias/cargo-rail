@@ -56,10 +56,9 @@ pub(crate) fn validate_record(state: &ReleaseState) -> RailResult<()> {
             && (prepared.is_none() || review.pushed.object.as_ref() != prepared)
         || review.pushed.status == StepStatus::Pending && review.pushed.object.is_some()
         || review.request.is_some_and(|id| id == 0 || !review.pushed.is_complete())
-        || review
-            .merge
-            .as_ref()
-            .is_some_and(|merge| review.request.is_none() || !oid(&merge.commit) || !oid(&merge.tree))
+        || review.merge.as_ref().is_some_and(|merge| {
+            review.request.is_none() || !super::storage::oid(&merge.commit) || !super::storage::oid(&merge.tree)
+        })
         || review.merge.is_none()
             && (state.package_seal.is_some() || !state.validation.is_empty() || state.phase >= ReleasePhase::Ready)
     {
@@ -88,13 +87,6 @@ pub(crate) fn require_successor(previous: &ReleaseState, next: &ReleaseState) ->
         }
     }
     Ok(())
-}
-
-fn oid(value: &str) -> bool {
-    matches!(value.len(), 40 | 64)
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub(crate) fn prepare_branch(git: &SystemGit, state: &ReleaseState) -> RailResult<()> {
@@ -321,7 +313,7 @@ fn merged_commit<'a>(state: &ReleaseState, pull: &'a Value) -> RailResult<Option
     }
     let commit = pull["merge_commit_sha"]
         .as_str()
-        .filter(|sha| oid(sha))
+        .filter(|sha| super::storage::oid(sha))
         .ok_or_else(|| RailError::message("review has no exact merged commit"))?;
     if retained.is_some_and(|merge| merge.commit != commit) {
         return Err(RailError::message("release review changed its retained merged commit"));
@@ -364,7 +356,7 @@ pub(crate) fn remote_head(git: &SystemGit, reference: &str) -> RailResult<Option
     let (head, actual_ref) = response
         .split_once('\t')
         .ok_or_else(|| RailError::message("remote review ref is malformed"))?;
-    if actual_ref != reference || !oid(head) {
+    if actual_ref != reference || !super::storage::oid(head) {
         return Err(RailError::message("remote review ref is ambiguous"));
     }
     Ok(Some(head.to_owned()))

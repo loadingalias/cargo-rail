@@ -2,7 +2,6 @@
 //!
 //! Stores information about what was backed up, when, and why.
 
-use crate::config::RailConfig;
 use crate::error::{RailError, RailResult};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -22,10 +21,6 @@ pub struct BackupMetadata {
     /// Files that were backed up (relative to workspace root)
     pub files_modified: Vec<PathBuf>,
 
-    /// Snapshot of rail.toml config at time of backup (optional)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub config_snapshot: Option<RailConfig>,
-
     /// Optional description of what this backup contains
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -38,7 +33,6 @@ impl BackupMetadata {
             timestamp: chrono::Local::now().to_rfc3339(),
             command: command.into(),
             files_modified: Vec::new(),
-            config_snapshot: None,
             description: None,
         }
     }
@@ -46,12 +40,6 @@ impl BackupMetadata {
     /// Add a file to the backup
     pub fn add_file(&mut self, path: impl Into<PathBuf>) {
         self.files_modified.push(path.into());
-    }
-
-    /// Set the config snapshot
-    pub fn with_config(mut self, config: RailConfig) -> Self {
-        self.config_snapshot = Some(config);
-        self
     }
 
     /// Set a description
@@ -135,7 +123,6 @@ mod tests {
         let mut metadata = BackupMetadata::new("cargo rail unify");
         assert_eq!(metadata.command, "cargo rail unify");
         assert!(metadata.files_modified.is_empty());
-        assert!(metadata.config_snapshot.is_none());
 
         metadata.add_file("Cargo.toml");
         metadata.add_file("crates/foo/Cargo.toml");
@@ -155,7 +142,6 @@ mod tests {
             timestamp: "2024-01-15T14:30:22+00:00".to_owned(),
             command: "cargo rail unify".to_owned(),
             files_modified: vec![PathBuf::from("Cargo.toml")],
-            config_snapshot: None,
             description: None,
         };
         metadata.save(dir.path()).unwrap();
@@ -183,7 +169,20 @@ mod tests {
             [PathBuf::from("Cargo.toml"), PathBuf::from("crates/foo/Cargo.toml")]
         );
         assert_eq!(metadata.description.as_deref(), Some("Before unify"));
-        assert!(metadata.config_snapshot.is_none());
+    }
+
+    /// Earlier Surface backups embedded the whole configuration; a key that a later
+    /// release retires must not make the backup unreadable.
+    #[test]
+    fn metadata_load_ignores_an_embedded_configuration() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("metadata.json"),
+            r#"{"timestamp":"2024-01-15T14:30:22+00:00","command":"cargo rail surface","files_modified":["src/lib.rs"],"config_snapshot":{"surface":{"retired_field":true}}}"#,
+        )
+        .unwrap();
+        let metadata = BackupMetadata::load(dir.path()).unwrap();
+        assert_eq!(metadata.files_modified, [PathBuf::from("src/lib.rs")]);
     }
 
     #[test]
@@ -192,7 +191,6 @@ mod tests {
             timestamp: "2024-01-15T14:30:22+00:00".to_string(),
             command: "test".to_string(),
             files_modified: vec![],
-            config_snapshot: None,
             description: None,
         };
 

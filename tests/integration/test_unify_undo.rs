@@ -38,9 +38,10 @@ fn test_unify_undo_restores_latest_backup() {
             "Undo should succeed.\nOutput:\n{}",
             undo_stdout
         );
+        let lines = undo_stdout.lines().collect::<Vec<_>>();
         assert!(
-            undo_stdout.contains("Restoring") || undo_stdout.contains("restored"),
-            "Should mention restoration in output"
+            lines.len() == 1 && lines[0].starts_with("Restored backup "),
+            "stdout must report the restore once.\nOutput:\n{undo_stdout}"
         );
 
         // Verify files were restored
@@ -55,6 +56,30 @@ fn test_unify_undo_restores_latest_backup() {
             "Cargo.lock should be restored with the manifests"
         );
 
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_unify_undo_json_restore_is_one_complete_value() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new()?;
+        workspace.add_crate("crate-a", "0.1.0", &[("serde", r#""1.0""#)])?;
+        workspace.add_crate("crate-b", "0.1.0", &[("serde", r#""1.0""#)])?;
+        workspace.commit("Add test crates")?;
+        let original = std::fs::read_to_string(workspace.path.join("Cargo.toml"))?;
+        let apply = run_cargo_rail(&workspace.path, &["rail", "unify", "apply", "--backup"])?;
+        assert!(apply.status.success(), "unify apply failed: {apply:?}");
+
+        let undo = run_cargo_rail(&workspace.path, &["rail", "--json", "unify", "undo"])?;
+        assert!(undo.status.success(), "undo failed: {undo:?}");
+        let value: serde_json::Value = serde_json::from_slice(&undo.stdout)?;
+        assert_eq!(value["command"], "unify");
+        assert_eq!(value["mode"], "undo");
+        assert_eq!(value["result"], "restored");
+        assert!(value["backup_id"].as_str().is_some_and(|id| !id.is_empty()));
+        assert_eq!(std::fs::read_to_string(workspace.path.join("Cargo.toml"))?, original);
         Ok(())
     })();
     super::helpers::finish_test(result);

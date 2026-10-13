@@ -4944,7 +4944,7 @@ fn test_release_publication_is_default_deny() {
         assert_eq!(missing_remote_authority.status.code(), Some(2));
         assert!(
             String::from_utf8_lossy(&missing_remote_authority.stderr)
-                .contains("--publish cannot be combined with release.remote_effects = \"none\"")
+                .contains("--publication cannot be combined with release.remote_effects = \"none\"")
         );
 
         ws.write_release_config("remote_effects = \"push\"\n")?;
@@ -4960,9 +4960,15 @@ fn test_release_publication_is_default_deny() {
         assert_eq!(missing_config_authority.status.code(), Some(2));
         let check_error = String::from_utf8_lossy(&missing_check_config_authority.stderr);
         let run_error = String::from_utf8_lossy(&missing_config_authority.stderr);
-        let authority_error = "--publish requires release.registry_publication = \"crates-io\"";
-        assert!(check_error.contains(authority_error), "{check_error}");
-        assert!(run_error.contains(authority_error), "{run_error}");
+        let authority_error = "requires release.registry_publication = \"crates-io\"";
+        assert!(
+            check_error.contains(&format!("--publication {authority_error}")),
+            "{check_error}"
+        );
+        assert!(
+            run_error.contains(&format!("--publish {authority_error}")),
+            "{run_error}"
+        );
 
         Ok(())
     })();
@@ -8380,6 +8386,46 @@ done
             String::from_utf8(git(remote.path(), &["rev-parse", "refs/tags/v0.1.1"])?.stdout)?.trim(),
             tag["id"].as_str().unwrap()
         );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(unix)]
+#[test]
+fn release_resume_rejects_a_local_tag_on_another_commit() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_single_crate("resume-tag-owner", "0.1.0")?;
+        ws.write_release_config("tag_format = 'v{version}'\nsemver_check = 'off'\nsign_tags = false\n")?;
+        write_test_change(&ws.path, &["resume-tag-owner"])?;
+        let initial = ws.commit("Review local release")?;
+        let interrupted = run_with_lost_git_acknowledgment(
+            &ws.path,
+            &["rail", "release", "run", "--all", "--bump", "patch", "--yes"],
+            "tag",
+        )?;
+        assert!(!interrupted.status.success());
+        git(
+            &ws.path,
+            &[
+                "tag",
+                "-f",
+                "-a",
+                "v0.1.1",
+                &initial,
+                "-m",
+                "Independent tag replacement",
+            ],
+        )?;
+        let replacement = git(&ws.path, &["rev-parse", "refs/tags/v0.1.1"])?.stdout;
+
+        let resumed = run_cargo_rail(&ws.path, &["rail", "release", "resume"])?;
+        assert!(!resumed.status.success(), "{resumed:?}");
+        assert!(
+            String::from_utf8_lossy(&resumed.stderr).contains("not release commit"),
+            "{resumed:?}"
+        );
+        assert_eq!(git(&ws.path, &["rev-parse", "refs/tags/v0.1.1"])?.stdout, replacement);
         Ok(())
     })();
     super::helpers::finish_test(result);

@@ -7,6 +7,7 @@ use cargo_metadata::{Dependency, DependencyKind, Metadata, Package, PackageId, T
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 
+use super::impact::dependency_kind_rank;
 use super::{ImpactDomain, ImpactFallback, ImpactPropagation, ImpactStep};
 use crate::error::{RailError, RailResult};
 use crate::source::ContentDigest;
@@ -281,6 +282,9 @@ impl DependencyUniverse {
             };
             for edge in edges {
                 edge_visits += 1;
+                if seeds.contains(&edge.dependent) {
+                    impact.reached_seeds.insert(edge.dependent.clone());
+                }
                 let domain = match edge.kind {
                     DependencyKind::Development => ImpactDomain::Development,
                     DependencyKind::Normal | DependencyKind::Build | DependencyKind::Unknown => ImpactDomain::Build,
@@ -420,15 +424,6 @@ fn declared_edge_order(left: &DeclaredEdge, right: &DeclaredEdge) -> std::cmp::O
             right.uses_default_features,
             &right.features,
         ))
-}
-
-const fn dependency_kind_rank(kind: DependencyKind) -> u8 {
-    match kind {
-        DependencyKind::Normal => 0,
-        DependencyKind::Development => 1,
-        DependencyKind::Build => 2,
-        DependencyKind::Unknown => 3,
-    }
 }
 
 #[cfg(test)]

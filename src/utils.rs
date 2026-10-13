@@ -517,6 +517,10 @@ pub(crate) fn normalize_line_endings(bytes: &[u8]) -> Cow<'_, [u8]> {
 /// The temporary file is created exclusively in the destination directory, so
 /// a concurrent process cannot pre-create a symlink at the chosen path and the
 /// final rename stays on the same filesystem.
+/// Replace `path` with `contents` so readers see either the old file or the complete new one.
+///
+/// Writes and syncs a temporary file in the same directory, keeps an existing regular file's permissions,
+/// renames it over `path`, and syncs the directory, so the replacement survives a crash after return.
 pub(crate) fn write_file_atomic(path: &Path, contents: &[u8]) -> RailResult<()> {
     let parent = destination_parent(path);
     let mut temporary = tempfile::Builder::new()

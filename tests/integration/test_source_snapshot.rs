@@ -461,7 +461,7 @@ fn generated_root_filter_drops_cross_boundary_rename_relations() {
         std::fs::create_dir_all(ws.path.join("target/debug"))?;
         git(&ws.path, &["mv", "crates/demo/moved.txt", "target/debug/moved.txt"])?;
 
-        let ctx = WorkspaceContext::build_with_source_capture(&ws.path, true)?;
+        let ctx = WorkspaceContext::build_with_snapshot(&ws.path)?;
         let capture = ctx.source_capture().expect("source capture should be present");
         let changes = capture.changes_from(ctx.git()?.git(), &base)?;
         assert_eq!(changes.entries().len(), 1);

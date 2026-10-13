@@ -200,6 +200,25 @@ fn test_closed_stdout_pipe_is_a_clean_process_boundary() {
     super::helpers::finish_test(result);
 }
 
+/// Exit 1 means pending work; a failed stdout write is an operational error.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_full_stdout_is_an_operational_error() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("full-stdout")?;
+        ws.add_crate("demo", "0.1.0", &[])?;
+        std::fs::write(ws.path.join(".config/rail.toml"), "")?;
+        let output = cargo_rail_command(&ws.path)?
+            .args(["rail", "config", "explain", "--all"])
+            .stdout(std::fs::OpenOptions::new().write(true).open("/dev/full")?)
+            .stderr(Stdio::piped())
+            .output()?;
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 #[test]
 fn test_config_explain_default_is_compact_and_selection_is_complete() {
     let result: Result<()> = (|| {

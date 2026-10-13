@@ -640,7 +640,8 @@ impl SystemGit {
         }
 
         let mut cmd = git_cmd_for_path(&self.worktree_root);
-        cmd.args(["add", "-A", "--"]);
+        // Planned paths are exact names, never glob patterns.
+        cmd.args(["--literal-pathspecs", "add", "-A", "--"]);
         for path in paths {
             cmd.arg(self.normalize_repo_path(path)?);
         }
@@ -668,12 +669,6 @@ impl SystemGit {
                 error
             ))
         })
-    }
-
-    /// Check if there are staged changes
-    pub fn has_staged_changes(&self) -> RailResult<bool> {
-        // git diff --cached --quiet returns 1 if there are changes
-        Ok(!self.run_git_check(&["diff", "--cached", "--quiet"]))
     }
 
     /// Create a commit with the given message
@@ -739,15 +734,11 @@ impl SystemGit {
         }
     }
 
-    /// Check if a remote URL has content (branches)
-    pub fn ls_remote_has_content(&self, url: &str) -> RailResult<bool> {
-        Ok(!self.run_git(&["ls-remote", "--heads", url])?.stdout.is_empty())
-    }
-
     /// Resolve one exact remote branch without mutating local refs.
     pub(crate) fn remote_branch_head(&self, remote: &str, branch: &str) -> RailResult<Option<String>> {
         let reference = format!("refs/heads/{branch}");
-        let output = self.run_git(&["ls-remote", "--heads", remote, &reference])?;
+        // A configured remote is a repository argument, never an option such as `--upload-pack`.
+        let output = self.run_git(&["ls-remote", "--heads", "--", remote, &reference])?;
         let stdout = String::from_utf8(output.stdout)?;
         let mut lines = stdout.lines().filter(|line| !line.trim().is_empty());
         let Some(line) = lines.next() else {
@@ -773,20 +764,6 @@ impl SystemGit {
             return Err(RailError::message("remote branch response has an invalid object ID"));
         }
         Ok(Some(sha.to_ascii_lowercase()))
-    }
-
-    /// Get formatted git log output
-    ///
-    /// Returns commit data in the specified format between the given refs.
-    pub fn log_formatted(&self, format: &str, from: Option<&str>, to: &str) -> RailResult<String> {
-        let format_arg = format!("--format={}", format);
-        let range = if let Some(from_ref) = from {
-            format!("{}..{}", from_ref, to)
-        } else {
-            to.to_string()
-        };
-
-        self.run_git_stdout(&["log", &format_arg, &range])
     }
 
     /// Check if signing is configured (GPG or SSH)
@@ -893,6 +870,21 @@ mod tests {
             }),
             "authority reads must not lazily hydrate promisor objects"
         );
+    }
+
+    #[test]
+    fn test_stage_paths_treats_glob_characters_literally() {
+        let temp = tempfile::TempDir::new().unwrap();
+        init_repo(temp.path(), "main").unwrap();
+        let git = SystemGit::open(temp.path()).unwrap();
+        for directory in ["a[1]", "a1"] {
+            fs::create_dir(temp.path().join(directory)).unwrap();
+            fs::write(temp.path().join(directory).join("CHANGELOG.md"), "new\n").unwrap();
+        }
+        git.stage_paths(&[PathBuf::from("a[1]/CHANGELOG.md")]).unwrap();
+
+        let staged = git.run_git_stdout(&["diff", "--cached", "--name-only"]).unwrap();
+        assert_eq!(staged, "a[1]/CHANGELOG.md");
     }
 
     #[test]
@@ -1023,12 +1015,7 @@ mod tests {
         let verbatim_root = fs::canonicalize(temp.path()).unwrap();
         let verbatim_file = fs::canonicalize(&file).unwrap();
         let git = SystemGit::open(&verbatim_root).unwrap();
-        assert_eq!(
-            git.get_commits_touching_path(&verbatim_file, None, "HEAD")
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(git.get_commits_touching_path(&verbatim_file, "HEAD").unwrap().len(), 1);
 
         fs::write(&file, "after\n").unwrap();
         git.stage_paths(&[verbatim_file]).unwrap();

@@ -1205,9 +1205,10 @@ pub(crate) fn resolve_program(selection: &OsStr, current_dir: &Path) -> RailResu
 fn search_path(selection: &OsStr, path: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path).find_map(|directory| {
         let directory = directory.components().collect::<PathBuf>();
-        program_candidates(&directory, selection)
-            .into_iter()
-            .find(|candidate| candidate.is_file())
+        // The Unix exec family skips a match that is not executable and keeps searching.
+        program_candidates(&directory, selection).into_iter().find(|candidate| {
+            fs::metadata(candidate).is_ok_and(|metadata| metadata.is_file() && is_executable(&metadata))
+        })
     })
 }
 
@@ -1239,15 +1240,16 @@ fn program_candidates(directory: &Path, selection: &OsStr) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Whether a file may run as a program; Windows has no executable mode bit.
 #[cfg(unix)]
-fn is_executable(metadata: &fs::Metadata) -> bool {
+pub(crate) fn is_executable(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
 
     metadata.permissions().mode() & 0o111 != 0
 }
 
 #[cfg(not(unix))]
-fn is_executable(_metadata: &fs::Metadata) -> bool {
+pub(crate) fn is_executable(_metadata: &fs::Metadata) -> bool {
     true
 }
 
@@ -1293,7 +1295,7 @@ mod tests {
         let root = tempfile::tempdir().expect("root");
         std::fs::create_dir(root.path().join("bin")).expect("bin directory");
         let file_name = if cfg!(windows) { "tool.exe" } else { "tool" };
-        std::fs::write(root.path().join("bin").join(file_name), b"tool").expect("tool");
+        write_executable(&root.path().join("bin").join(file_name));
         let separator = std::path::MAIN_SEPARATOR_STR;
         let spellings = [
             root.path().join("bin").into_os_string(),
@@ -1312,6 +1314,31 @@ mod tests {
             resolved.iter().all(|path| path.as_os_str() == expected.as_os_str()),
             "{resolved:?}"
         );
+    }
+
+    fn write_executable(path: &Path) {
+        std::fs::write(path, b"tool").expect("tool");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("tool mode");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_search_skips_a_non_executable_match_like_the_exec_family() {
+        let root = tempfile::tempdir().expect("root");
+        let [shadow, tool] = ["shadow", "tool"].map(|directory| {
+            let directory = root.path().join(directory);
+            std::fs::create_dir(&directory).expect("PATH directory");
+            directory
+        });
+        std::fs::write(shadow.join("tool"), b"data").expect("non-executable match");
+        write_executable(&tool.join("tool"));
+        let path = std::env::join_paths([&shadow, &tool]).expect("PATH");
+
+        assert_eq!(search_path(OsStr::new("tool"), &path), Some(tool.join("tool")));
     }
 
     #[test]

@@ -119,11 +119,6 @@ impl TomlFormatter {
         output
     }
 
-    /// Format section header with box comment
-    pub fn section_header(&self, title: &str, description: &str) -> String {
-        format!("# {}\n# {}\n[{}]\n", title.to_uppercase(), description, title)
-    }
-
     /// Format inline table
     pub fn inline_table(&self, pairs: &[(String, TomlValue)]) -> String {
         if pairs.is_empty() {

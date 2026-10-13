@@ -1296,8 +1296,8 @@ impl CompilerCacheIdentity {
             {
                 let version = package.version.to_string();
                 if let (Some(fingerprint), Some(closure)) = (
-                    lockfile.closure_fingerprint(&package.name, &version, None),
-                    lockfile.closure(&package.name, &version, None),
+                    lockfile.closure_fingerprint(&package.name, &version),
+                    lockfile.closure(&package.name, &version),
                 ) {
                     lock_closures.insert(package.id.clone(), fingerprint);
                     lock_closure_packages.insert(package.id.clone(), closure);
@@ -6419,8 +6419,8 @@ fn load_sysroot_identity_memo(
     if memo.version != SYSROOT_MEMO_VERSION
         || memo.sysroot != sysroot
         || memo.host_target != host_target
-        || !valid_sha256_identity(&memo.fingerprint)
-        || !valid_sha256_identity(&memo.memo_digest)
+        || !crate::source::ContentDigest::is_sha256_text(&memo.fingerprint)
+        || !crate::source::ContentDigest::is_sha256_text(&memo.memo_digest)
         || memo.memo_digest != sysroot_identity_memo_digest(&memo)
         || memo.volume_identifier.is_empty()
         || memo.volume_identifier.len() > MAX_GENERATION_IDENTIFIER_BYTES
@@ -6507,15 +6507,6 @@ fn sysroot_identity_memo_digest(memo: &SysrootIdentityMemo) -> String {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-fn valid_sha256_identity(identity: &str) -> bool {
-    identity.strip_prefix("sha256:").is_some_and(|digest| {
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    })
-}
-
 #[cfg(windows)]
 fn rustc_driver_library(name: &str) -> bool {
     name.starts_with("rustc_driver-") && name.ends_with(".dll")

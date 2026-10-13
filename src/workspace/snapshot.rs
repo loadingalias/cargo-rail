@@ -18,7 +18,7 @@ use crate::cargo::resolution::{
 };
 use crate::compiler::cfg_eval::{TargetCfgSet, load_target_cfg_sets};
 use crate::config::RailConfig;
-use crate::error::{RailError, RailResult};
+use crate::error::{RailError, RailResult, ReplayedError};
 use crate::executable::ToolchainExecutableIdentities;
 use crate::source::{ContentDigest, RepositoryPath, SourceEntryKind, SourceSnapshot};
 use crate::workspace::context::CargoState;
@@ -130,11 +130,13 @@ impl LockfileSnapshot {
     /// Indices of the locked packages reachable from one package, including itself.
     ///
     /// Returns `None` when the package or an edge cannot be resolved exactly.
-    pub(crate) fn closure(&self, name: &str, version: &str, source: Option<&str>) -> Option<BTreeSet<usize>> {
+    pub(crate) fn closure(&self, name: &str, version: &str) -> Option<BTreeSet<usize>> {
         let edges = self.edges.as_ref()?;
-        let root = self.packages.iter().position(|package| {
-            package.name == name && package.version == version && package.source.as_deref() == source
-        })?;
+        // Workspace packages are the locked entries without a source.
+        let root = self
+            .packages
+            .iter()
+            .position(|package| package.name == name && package.version == version && package.source.is_none())?;
         let mut reached = BTreeSet::from([root]);
         let mut pending = vec![root];
         while let Some(index) = pending.pop() {
@@ -153,9 +155,9 @@ impl LockfileSnapshot {
     /// closure contains everything any build of the package can compile. A lockfile
     /// change outside it cannot change that package's compilation. Returns `None` when
     /// the package or an edge cannot be resolved exactly; callers then bind the whole file.
-    pub(crate) fn closure_fingerprint(&self, name: &str, version: &str, source: Option<&str>) -> Option<String> {
+    pub(crate) fn closure_fingerprint(&self, name: &str, version: &str) -> Option<String> {
         let edges = self.edges.as_ref()?;
-        let reached = self.closure(name, version, source)?;
+        let reached = self.closure(name, version)?;
         let mut identity = Vec::from(&b"lock-closure-v1\0"[..]);
         let mut frame = |bytes: &[u8]| {
             identity.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
@@ -268,7 +270,7 @@ pub struct WorkspaceSnapshot {
     targets: Vec<TargetIdentity>,
     base_resolution: Arc<ResolutionView>,
     /// `None` when the base resolution already contains every locked package.
-    feature_complete_packages: OnceLock<Result<Option<Arc<FeatureCompletePackages>>, SnapshotViewError>>,
+    feature_complete_packages: OnceLock<Result<Option<Arc<FeatureCompletePackages>>, ReplayedError>>,
     derived: Arc<DerivedViews>,
 }
 
@@ -310,8 +312,8 @@ pub(crate) struct DerivedViews {
     workspace_root: PathBuf,
     analysis_targets: Vec<String>,
     resolutions: Arc<ResolutionViews>,
-    multi_target_metadata: OnceLock<Result<Arc<MultiTargetMetadata>, SnapshotViewError>>,
-    target_cfg_sets: OnceLock<Result<Arc<std::collections::HashMap<String, TargetCfgSet>>, SnapshotViewError>>,
+    multi_target_metadata: OnceLock<Result<Arc<MultiTargetMetadata>, ReplayedError>>,
+    target_cfg_sets: OnceLock<Result<Arc<std::collections::HashMap<String, TargetCfgSet>>, ReplayedError>>,
 }
 
 impl DerivedViews {
@@ -365,7 +367,7 @@ impl DerivedViews {
             }
             MultiTargetMetadata::load_parallel(&self.resolutions, &self.analysis_targets)
                 .map(Arc::new)
-                .map_err(SnapshotViewError::capture)
+                .map_err(ReplayedError::capture)
         }))
     }
 
@@ -376,30 +378,8 @@ impl DerivedViews {
             targets.extend(self.analysis_targets.iter().map(String::as_str));
             load_target_cfg_sets(&self.workspace_root, &targets)
                 .map(Arc::new)
-                .map_err(SnapshotViewError::capture)
+                .map_err(ReplayedError::capture)
         }))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct SnapshotViewError {
-    message: String,
-    help: Option<String>,
-}
-
-impl SnapshotViewError {
-    fn capture(error: RailError) -> Self {
-        Self {
-            message: error.to_string(),
-            help: error.help_message(),
-        }
-    }
-
-    fn to_error(&self) -> RailError {
-        self.help.as_ref().map_or_else(
-            || RailError::message(self.message.clone()),
-            |help| RailError::with_help(self.message.clone(), help.clone()),
-        )
     }
 }
 
@@ -718,12 +698,9 @@ impl WorkspaceSnapshot {
     pub(crate) fn evidence_packages(&self) -> RailResult<EvidencePackages<'_>> {
         let complete = self
             .feature_complete_packages
-            .get_or_init(|| {
-                self.capture_feature_complete_packages()
-                    .map_err(SnapshotViewError::capture)
-            })
+            .get_or_init(|| self.capture_feature_complete_packages().map_err(ReplayedError::capture))
             .as_ref()
-            .map_err(SnapshotViewError::to_error)?;
+            .map_err(ReplayedError::to_error)?;
         Ok(match complete.as_deref() {
             Some(complete) => EvidencePackages {
                 metadata: complete.resolution.metadata(),
@@ -1119,8 +1096,8 @@ fn capture_generated_lockfile(
     })
 }
 
-fn cached_snapshot_view<T>(value: &Result<Arc<T>, SnapshotViewError>) -> RailResult<Arc<T>> {
-    value.as_ref().map(Arc::clone).map_err(SnapshotViewError::to_error)
+fn cached_snapshot_view<T>(value: &Result<Arc<T>, ReplayedError>) -> RailResult<Arc<T>> {
+    value.as_ref().map(Arc::clone).map_err(ReplayedError::to_error)
 }
 fn compute_snapshot_id(inputs: SnapshotIdentityInputs<'_>) -> RailResult<SnapshotId> {
     let SnapshotIdentityInputs {
@@ -1696,8 +1673,7 @@ mod tests {
             ("a", "1.0.0", "a1", &[][..]),
             ("b", "1.0.0", "b1", &[][..]),
         ];
-        let closure =
-            |packages: &[(&str, &str, &str, &[&str])]| locked(packages).closure_fingerprint("app", "0.1.0", None);
+        let closure = |packages: &[(&str, &str, &str, &[&str])]| locked(packages).closure_fingerprint("app", "0.1.0");
         let original = closure(&base).expect("exact closure");
 
         let mut unrelated = base;
@@ -1734,14 +1710,14 @@ mod tests {
             None,
             "an ambiguous reference falls back to the whole file"
         );
-        assert_eq!(locked(&base).closure_fingerprint("missing", "0.1.0", None), None);
+        assert_eq!(locked(&base).closure_fingerprint("missing", "0.1.0"), None);
 
         let legacy = LockfileSnapshot::from_file(lockfile(
             b"[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\n[metadata]\n\"checksum x 1.0.0 (registry+https://example.invalid/index)\" = \"abc\"\n",
         ))
         .expect("v1 lockfile");
         assert_eq!(
-            legacy.closure_fingerprint("app", "0.1.0", None),
+            legacy.closure_fingerprint("app", "0.1.0"),
             None,
             "v1 checksums live outside package entries"
         );
