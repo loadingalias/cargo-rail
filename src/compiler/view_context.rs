@@ -112,15 +112,20 @@ impl Drop for ViewContext {
 
 fn stage_wrapper(wrapper: &Path, directory: &Path, stem: &str) -> RailResult<PathBuf> {
     let staged = directory.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX));
-    fs::hard_link(wrapper, &staged)
-        .or_else(|_| fs::copy(wrapper, &staged).map(|_| ()))
-        .map_err(|error| {
-            RailError::message(format!(
-                "staging compiler-observation wrapper '{}' as '{}': {error}",
-                wrapper.display(),
-                staged.display()
-            ))
-        })?;
+    // macOS scans a new executable on its first launch, at the path that the kernel resolves for the file.
+    // A file with several names can resolve to another command's staged name, which that command deletes
+    // when it finishes, and the failed scan kills the launch. An APFS clone is a file with one name.
+    #[cfg(target_os = "macos")]
+    let result = fs::copy(wrapper, &staged).map(|_| ());
+    #[cfg(not(target_os = "macos"))]
+    let result = fs::hard_link(wrapper, &staged).or_else(|_| fs::copy(wrapper, &staged).map(|_| ()));
+    result.map_err(|error| {
+        RailError::message(format!(
+            "staging compiler-observation wrapper '{}' as '{}': {error}",
+            wrapper.display(),
+            staged.display()
+        ))
+    })?;
     Ok(staged)
 }
 
@@ -282,6 +287,19 @@ mod tests {
         assert_eq!(rustdoc.get(RUSTDOC_WRAPPER_MARKER), Some(&OsString::from("1")));
 
         assert!(load(&wrapper).expect("unstaged wrapper").is_none());
+        // Gatekeeper's first-launch scan of a staged wrapper must not resolve to another command's name.
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            for path in [&wrapper, &staged.rustc, &staged.rustdoc] {
+                assert_eq!(
+                    fs::metadata(path).expect("staged file").nlink(),
+                    1,
+                    "{}",
+                    path.display()
+                );
+            }
+        }
         assert!(
             load(Path::new("cargo-rail-rustc-observer"))
                 .expect("bare name")

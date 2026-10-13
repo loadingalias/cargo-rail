@@ -48,6 +48,7 @@ mod fact_protocol;
 #[path = "../../../src/compiler/native_input_protocol.rs"]
 mod native_input_protocol;
 
+mod bundling;
 mod codegen;
 mod collection;
 mod digest;
@@ -74,6 +75,7 @@ struct CompilerCallbacks {
     native_observation: Option<native_input_protocol::NativeInputObservation>,
     dependency_requests: Option<std::sync::Arc<std::sync::Mutex<native_inputs::DependencyRequests>>>,
     codegen: std::sync::Arc<std::sync::Mutex<native_input_protocol::NativeCodegenObservation>>,
+    bundles: std::sync::Arc<std::sync::Mutex<bundling::BundleCheck>>,
 }
 
 impl Callbacks for CompilerCallbacks {
@@ -83,7 +85,7 @@ impl Callbacks for CompilerCallbacks {
         rustc_driver::TimePassesCallbacks::default().config(config);
         if let Some(invocation) = &self.native_invocation {
             if invocation.phase == native_input_protocol::NativeInputPhase::Compilation {
-                codegen::configure(config, self.codegen.clone());
+                codegen::configure(config, self.codegen.clone(), self.bundles.clone());
             }
             self.dependency_requests = Some(native_inputs::observe_dependency_requests());
         }
@@ -134,6 +136,10 @@ impl Callbacks for CompilerCallbacks {
                 .dependency_requests
                 .as_ref()
                 .and_then(|requests| native_inputs::collect(tcx, invocation, requests).ok());
+            // Rustc links after this callback; the backend checks its archives against these libraries.
+            if let (Some(observation), Ok(mut bundles)) = (&self.native_observation, self.bundles.lock()) {
+                bundles.reported = bundling::selected_libraries(&observation.native_libraries);
+            }
         }
         Compilation::Continue
     }
@@ -172,6 +178,7 @@ fn main() -> ExitCode {
             codegen: std::sync::Arc::new(std::sync::Mutex::new(
                 native_input_protocol::NativeCodegenObservation::NotRun,
             )),
+            bundles: std::sync::Arc::default(),
         };
         return rustc_driver::catch_with_exit_code(move || compiler_entrypoint(&arguments, &mut callbacks));
     }
@@ -227,11 +234,17 @@ fn main() -> ExitCode {
         codegen: std::sync::Arc::new(std::sync::Mutex::new(
             native_input_protocol::NativeCodegenObservation::NotRun,
         )),
+        bundles: std::sync::Arc::default(),
     };
     rustc_driver::catch_with_exit_code(move || {
         compiler_entrypoint(&arguments, &mut callbacks);
+        // An archive member that the reported searches cannot explain leaves the observation unpublished.
         if let (Some(invocation), Some(mut observation)) = (callbacks.native_invocation, callbacks.native_observation)
             && let Ok(codegen) = callbacks.codegen.lock()
+            && callbacks
+                .bundles
+                .lock()
+                .is_ok_and(|bundles| bundles.unexplained.is_none())
         {
             observation.codegen = *codegen;
             let _ = native_inputs::publish(&invocation, &observation);

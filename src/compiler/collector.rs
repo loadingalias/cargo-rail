@@ -1140,7 +1140,12 @@ fn target_library_inventory(root: &Path) -> RailResult<CompilerSysrootInventory>
     })
 }
 
-const TRANSPARENT_SESSION_MEMO_VERSION: u32 = 3;
+const TRANSPARENT_SESSION_MEMO_VERSION: u32 = 4;
+
+/// The compiler environments one memo keeps. Cargo runs build-script probes with other library
+/// search paths than its ordinary units, so one build alternates between a few environments.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const TRANSPARENT_SESSION_ENVIRONMENTS: usize = 8;
 
 /// Regenerable, receipt-private proof that a direct compiler session remains
 /// exact without launching two identity probes for every rustc unit.
@@ -1155,9 +1160,17 @@ pub(crate) struct TransparentNativeSessionMemo {
     rustc_sysroot: String,
     host_target: String,
     sysroot_evidence: ExactSysrootEvidence,
+    /// One session per compiler environment, most recently captured first.
+    sessions: Vec<TransparentEnvironmentSession>,
+    digest: String,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransparentEnvironmentSession {
     compiler_environment_identity: String,
     session: NativeCompilerSession,
-    digest: String,
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -1549,8 +1562,10 @@ pub(crate) fn capture_transparent_native_session(
             .to_string(),
         host_target: host_target.to_string(),
         sysroot_evidence,
-        compiler_environment_identity: compiler_environment,
-        session: session.clone(),
+        sessions: vec![TransparentEnvironmentSession {
+            compiler_environment_identity: compiler_environment,
+            session: session.clone(),
+        }],
         digest: String::new(),
     };
     memo.digest = transparent_session_memo_digest(&memo)?;
@@ -1586,10 +1601,17 @@ pub(crate) fn reuse_transparent_native_session(
     if memo.version != TRANSPARENT_SESSION_MEMO_VERSION
         || memo.digest != transparent_session_memo_digest(memo)?
         || memo.source_root != source_root.to_string_lossy()
-        || memo.compiler_environment_identity != transparent_native_compiler_process_env_fingerprint(target_root)?
     {
         return Ok(None);
     }
+    let environment = transparent_native_compiler_process_env_fingerprint(target_root)?;
+    let Some(selected) = memo
+        .sessions
+        .iter()
+        .find(|session| session.compiler_environment_identity == environment)
+    else {
+        return Ok(None);
+    };
     let resolved_rustc = crate::executable::resolve_executable_path(rustc_program, &source_root)?;
     if memo.rustc_program != resolved_rustc.to_string_lossy()
         || crate::utils::stable_file_generation(&resolved_rustc).as_ref() != Some(&memo.rustc_program_generation)
@@ -1608,8 +1630,8 @@ pub(crate) fn reuse_transparent_native_session(
     {
         return Ok(None);
     }
-    memo.session.validate_for_source_root(&source_root)?;
-    Ok(Some((memo.session.clone(), guard)))
+    selected.session.validate_for_source_root(&source_root)?;
+    Ok(Some((selected.session.clone(), guard)))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -1628,11 +1650,60 @@ impl TransparentNativeSessionMemo {
         if serde_json::to_vec(&memo)? != bytes {
             return Err(RailError::message("transparent compiler session memo is not canonical"));
         }
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        if memo.sessions.is_empty()
+            || memo.sessions.len() > TRANSPARENT_SESSION_ENVIRONMENTS
+            || memo.sessions.iter().enumerate().any(|(index, session)| {
+                memo.sessions[..index]
+                    .iter()
+                    .any(|earlier| earlier.compiler_environment_identity == session.compiler_environment_identity)
+            })
+        {
+            return Err(RailError::message(
+                "transparent compiler session memo has invalid compiler environments",
+            ));
+        }
         Ok(memo)
     }
 
     pub(crate) fn encode(&self) -> RailResult<Vec<u8>> {
         serde_json::to_vec(self).map_err(Into::into)
+    }
+
+    /// Keep the sessions that `previous` holds for other environments of the same exact compiler,
+    /// after this memo's own and within the environment bound. The oldest sessions are dropped.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    pub(crate) fn retain_environments(&mut self, previous: &Self) -> RailResult<()> {
+        let same_compiler = previous.version == self.version
+            && previous.source_root == self.source_root
+            && previous.rustc_program == self.rustc_program
+            && previous.rustc_program_generation == self.rustc_program_generation
+            && previous.rustc_sysroot == self.rustc_sysroot
+            && previous.host_target == self.host_target
+            && previous.sysroot_evidence == self.sysroot_evidence
+            && previous.digest == transparent_session_memo_digest(previous)?;
+        if !same_compiler {
+            return Ok(());
+        }
+        for session in &previous.sessions {
+            if self.sessions.len() == TRANSPARENT_SESSION_ENVIRONMENTS {
+                break;
+            }
+            if self
+                .sessions
+                .iter()
+                .all(|kept| kept.compiler_environment_identity != session.compiler_environment_identity)
+            {
+                self.sessions.push(session.clone());
+            }
+        }
+        self.digest = transparent_session_memo_digest(self)?;
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    pub(crate) fn retain_environments(&mut self, _previous: &Self) -> RailResult<()> {
+        Ok(())
     }
 }
 
@@ -8597,13 +8668,12 @@ mod tests {
         }
     }
 
+    /// A shell-script compiler under `root` that answers rustc's identity queries for a minimal sysroot.
+    /// Returns the program, its script, and one sysroot library.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn returned_transparent_session_guard_rejects_compiler_and_sysroot_aba() {
+    fn fake_transparent_compiler(root: &Path) -> (PathBuf, String, PathBuf) {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().canonicalize().unwrap();
         fs::create_dir(root.join("target")).unwrap();
         let sysroot = root.join("sysroot");
         let target = sysroot.join("lib/rustlib/test-host/lib");
@@ -8620,6 +8690,85 @@ mod tests {
         );
         fs::write(&program, &script).unwrap();
         fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        (program, script, library)
+    }
+
+    /// Cargo alternates compiler environments within one build. The memo keeps a session for each of the
+    /// eight most recently captured, and only for the exact compiler that captured them.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn transparent_session_memo_keeps_recent_environments_of_one_compiler() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let (program, _, _) = fake_transparent_compiler(&root);
+        let cache = LocalCacheSelection::new(root.join("cache"), 1024 * 1024, None).unwrap();
+        let (_, _, current, _) = capture_transparent_native_session(
+            &root,
+            &root.join("target"),
+            program.as_os_str(),
+            &cache,
+            crate::cache::installation::InstalledRootPortability::Physical,
+        )
+        .unwrap();
+        let other = |identity: &str| {
+            let mut memo = current.clone();
+            memo.sessions[0].compiler_environment_identity = identity.into();
+            memo.digest = transparent_session_memo_digest(&memo).unwrap();
+            memo
+        };
+        let identities = |memo: &TransparentNativeSessionMemo| {
+            memo.sessions
+                .iter()
+                .map(|session| session.compiler_environment_identity.clone())
+                .collect::<Vec<_>>()
+        };
+        let reuse = |memo: &TransparentNativeSessionMemo| {
+            reuse_transparent_native_session(memo, &root, &root.join("target"), program.as_os_str())
+                .unwrap()
+                .map(|(session, _)| session)
+        };
+
+        // The current environment's session is found behind another environment's.
+        let mut memo = other("first");
+        memo.retain_environments(&current).unwrap();
+        assert_eq!(
+            identities(&memo),
+            ["first", current.sessions[0].compiler_environment_identity.as_str()]
+        );
+        let decoded = TransparentNativeSessionMemo::decode(&memo.encode().unwrap()).unwrap();
+        assert_eq!(reuse(&decoded), Some(current.sessions[0].session.clone()));
+
+        // Recapturing an environment moves it first; the oldest drop beyond the bound.
+        for index in 0..TRANSPARENT_SESSION_ENVIRONMENTS {
+            let mut next = other(&index.to_string());
+            next.retain_environments(&memo).unwrap();
+            memo = next;
+        }
+        let mut next = other("3");
+        next.retain_environments(&memo).unwrap();
+        assert_eq!(identities(&next), ["3", "7", "6", "5", "4", "2", "1", "0"]);
+        assert_eq!(reuse(&next), None, "the current environment was evicted");
+        TransparentNativeSessionMemo::decode(&next.encode().unwrap()).expect("a full memo decodes");
+
+        // Another compiler generation keeps none of the earlier sessions.
+        let mut changed = other("changed");
+        changed.rustc_program_generation.push(0);
+        changed.retain_environments(&next).unwrap();
+        assert_eq!(identities(&changed), ["changed"]);
+
+        // A repeated environment is not a memo.
+        let mut duplicated = next.clone();
+        duplicated.sessions[1] = duplicated.sessions[0].clone();
+        duplicated.digest = transparent_session_memo_digest(&duplicated).unwrap();
+        TransparentNativeSessionMemo::decode(&duplicated.encode().unwrap()).expect_err("a repeated environment");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn returned_transparent_session_guard_rejects_compiler_and_sysroot_aba() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let (program, script, library) = fake_transparent_compiler(&root);
         let cache = LocalCacheSelection::new(root.join("cache"), 1024 * 1024, None).unwrap();
         let (_, _, memo, guard) = capture_transparent_native_session(
             &root,

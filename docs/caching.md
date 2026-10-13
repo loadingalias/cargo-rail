@@ -392,6 +392,9 @@ including libraries that `#[link]` attributes and macro output name.
 Each candidate before the match must stay absent, and the match keeps its spelling,
 canonical target, and bytes.
 A new library in an earlier directory, a changed archive, and a retargeted link each miss.
+After rustc writes an rlib or staticlib, the driver checks each member of the archive.
+A member that the compilation did not generate, and that no reported library or upstream rlib holds,
+leaves the search unbound, so the action compiles without reuse (`compiler_native_input_evidence_unavailable`).
 
 A directory that selects no such library binds only its spelling,
 which the compiler arguments carry.

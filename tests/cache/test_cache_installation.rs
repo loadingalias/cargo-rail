@@ -6138,6 +6138,50 @@ fn an_unreadable_compiler_session_bypasses_and_reports_its_cause() {
     super::helpers::finish_test(result);
 }
 
+/// Cargo runs build-script probes with other library search paths than its ordinary units. Each compiler
+/// environment keeps its session, so alternating between two reuses both without a recapture.
+#[test]
+fn alternating_compiler_environments_reuse_their_sessions() {
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_single_crate("session-environments", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        assert!(setup.status.success(), "{setup:?}");
+        let memo = selected_profile_state_root(&workspace.path, cargo_home.path())?.join("session.json");
+        let mut revision = 0;
+        let mut check = |library_path: &str| -> Result<(Vec<u8>, std::time::SystemTime)> {
+            // A new source revision makes Cargo run the compiler again.
+            revision += 1;
+            fs::write(
+                workspace.path.join("src/lib.rs"),
+                format!("pub const REVISION: u32 = {revision};\n"),
+            )?;
+            let compiled = Command::new("cargo")
+                .current_dir(&workspace.path)
+                .args(["check", "--quiet"])
+                .env("CARGO_HOME", cargo_home.path())
+                .env("CARGO_INCREMENTAL", "0")
+                .env("LD_LIBRARY_PATH", library_path)
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .output()?;
+            assert!(compiled.status.success(), "{compiled:?}");
+            Ok((fs::read(&memo)?, fs::metadata(&memo)?.modified()?))
+        };
+        let first = check("/first")?;
+        let both = check("/second")?;
+        assert_ne!(first.0, both.0, "the second environment did not capture its session");
+        assert_eq!(check("/first")?, both, "the first environment's session was recaptured");
+        assert_eq!(
+            check("/second")?,
+            both,
+            "the second environment's session was recaptured"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn cross_windows_link_restores_the_exact_dll_pdb_and_import_library() {

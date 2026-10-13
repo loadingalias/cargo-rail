@@ -50,7 +50,13 @@ impl Driver {
         #[cfg(unix)]
         std::os::unix::fs::symlink(sysroot.join("lib"), root.join("lib")).expect("runtime libraries");
         let program = bin.join(format!("cargo-rail-fact-driver{}", std::env::consts::EXE_SUFFIX));
+        // On macOS, the first launch of a new executable waits for a Gatekeeper scan of the path that the kernel
+        // resolves for the file. A file with several names can resolve to another test's name, and when that
+        // test deletes it first, the failed scan kills the launch. An APFS clone is a file with one name.
+        #[cfg(target_os = "macos")]
+        fs::copy(built, &program).expect("stage driver as a clone");
         // Keep the immutable executable free of writable handles during concurrent process launches.
+        #[cfg(not(target_os = "macos"))]
         fs::hard_link(built, &program).expect("stage driver on the same filesystem");
         Self {
             _temporary: temporary,
@@ -1322,4 +1328,73 @@ unsafe extern "C" {
             },
         ]
     );
+}
+
+/// An `ar` archive whose members have short names, as a C toolchain writes a static library.
+#[cfg(unix)]
+fn write_archive(path: &Path, members: &[(&str, &[u8])]) {
+    let mut archive = b"!<arch>\n".to_vec();
+    for (name, data) in members {
+        archive.extend(format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n", 0, 0, 0, 644, data.len()).into_bytes());
+        archive.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            archive.push(b'\n');
+        }
+    }
+    fs::write(path, archive).unwrap();
+}
+
+/// Rustc copies each member of a static library that it bundles into the rlib or staticlib it writes. Every
+/// member of those archives is explained by the compilation or by a reported search, so the observation is
+/// published.
+#[cfg(unix)]
+#[test]
+fn bundled_library_members_are_explained_by_the_reported_search() {
+    use native_input_protocol::NativeLibraryProbe;
+
+    let driver = Driver::new();
+    let directory = driver.root.join("native");
+    fs::create_dir(&directory).unwrap();
+    fs::write(
+        driver.root.join("bar.rs"),
+        "#![no_std]\n#[unsafe(no_mangle)]\npub extern \"C\" fn bar() -> u32 { 7 }\n",
+    )
+    .unwrap();
+    let object = driver.root.join("bar.o");
+    let compiled = driver
+        .command(false)
+        .args(["bar.rs", "--crate-type=lib", "--emit=obj", "--edition=2024", "-o"])
+        .arg(&object)
+        .output()
+        .unwrap();
+    assert_success(&compiled);
+    write_archive(&directory.join("libbar.a"), &[("bar.o", &fs::read(&object).unwrap())]);
+    fs::write(
+        driver.root.join("consumer.rs"),
+        "#[link(name = \"bar\", kind = \"static\")]\nunsafe extern \"C\" {\n    pub fn bar() -> u32;\n}\n\
+         pub fn call() -> u32 {\n    unsafe { bar() }\n}\n",
+    )
+    .unwrap();
+    for (crate_type, output) in [("rlib", "libconsumer.rlib"), ("staticlib", "libconsumer.a")] {
+        let mut args = arguments("consumer.rs", output, "--emit=link");
+        args[1] = format!("--crate-type={crate_type}");
+        args.extend(["-L".into(), format!("native={}", directory.display())]);
+        let (observed, observation) = driver.run(&format!("bundled-{crate_type}"), &args);
+        assert_success(&observed);
+        let observation = observation.unwrap_or_else(|| panic!("{crate_type}: every archive member is explained"));
+        assert_eq!(
+            observation.native_libraries[0].probes,
+            [NativeLibraryProbe {
+                directory: directory.display().to_string(),
+                file: "libbar.a".into(),
+                present: true,
+            }],
+            "{crate_type}"
+        );
+        let archive = fs::read(driver.root.join(output)).unwrap();
+        assert!(
+            archive.windows(5).any(|window| window == b"bar.o"),
+            "{crate_type}: rustc bundled the library"
+        );
+    }
 }

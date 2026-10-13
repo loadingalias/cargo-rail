@@ -18,11 +18,13 @@ use rustc_session::{
 use rustc_span::Symbol;
 
 use crate::CrateType;
+use crate::bundling::{BundleCheck, BundleExpectation};
 use crate::native_input_protocol::NativeCodegenObservation;
 
 pub(crate) fn configure(
     config: &mut rustc_interface::interface::Config,
     observation: Arc<Mutex<NativeCodegenObservation>>,
+    bundles: Arc<Mutex<BundleCheck>>,
 ) {
     config.make_codegen_backend = Some(Box::new(move |sess| {
         let diagnostics = rustc_session::EarlyDiagCtxt::new(sess.opts.error_format);
@@ -32,13 +34,18 @@ pub(crate) fn configure(
             sess.opts.unstable_opts.codegen_backend.as_deref(),
             &sess.target,
         );
-        Box::new(ObservedBackend { inner, observation })
+        Box::new(ObservedBackend {
+            inner,
+            observation,
+            bundles,
+        })
     }));
 }
 
 struct ObservedBackend {
     inner: Box<dyn CodegenBackend>,
     observation: Arc<Mutex<NativeCodegenObservation>>,
+    bundles: Arc<Mutex<BundleCheck>>,
 }
 
 impl CodegenBackend for ObservedBackend {
@@ -141,7 +148,15 @@ impl CodegenBackend for ObservedBackend {
         metadata: EncodedMetadata,
         outputs: &OutputFilenames,
     ) {
-        self.inner.link(sess, modules, info, metadata, outputs)
+        // Gather what this compilation generates before rustc consumes it; check the archives it writes.
+        let expected = BundleExpectation::new(sess, &modules, &info, outputs);
+        self.inner.link(sess, modules, info, metadata, outputs);
+        if let Ok(mut check) = self.bundles.lock()
+            && let Err(error) =
+                expected.and_then(|expected| expected.map_or(Ok(()), |expected| expected.verify(&check.reported)))
+        {
+            check.unexplained = Some(error);
+        }
     }
 
     fn join_codegen(

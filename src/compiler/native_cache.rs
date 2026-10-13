@@ -5141,6 +5141,19 @@ fn native_relative_path(path: &Path) -> RailResult<String> {
     Ok(normalized)
 }
 
+/// Files this process hashed, by path, with the guard each had when it was read. One wrapper captures some
+/// files more than once: a static library in `OUT_DIR` that rustc also selects, a capture repeated after
+/// the compiler ran, and a candidate revalidated before the restore commit. The guard binds the change
+/// time, and every write after the settled read advances it, so an equal guard proves the same bytes.
+#[cfg(unix)]
+static HASHED_FILES: std::sync::Mutex<BTreeMap<PathBuf, (NativeMetadataGuard, String)>> =
+    std::sync::Mutex::new(BTreeMap::new());
+/// Smaller files cost less to hash again than to remember.
+#[cfg(unix)]
+const HASHED_FILE_REUSE_MIN_BYTES: u64 = 64 * 1024;
+#[cfg(unix)]
+const MAX_HASHED_FILES: usize = 4096;
+
 fn capture_guarded_file(
     path: &Path,
     started: Instant,
@@ -5152,6 +5165,18 @@ fn capture_guarded_file(
     }
     crate::utils::settle_change_time(&before_metadata);
     let before = native_metadata_guard(path, &before_metadata)?;
+    #[cfg(unix)]
+    if before.len >= HASHED_FILE_REUSE_MIN_BYTES
+        && let Some(content_digest) = HASHED_FILES.lock().ok().and_then(|hashed| {
+            hashed
+                .get(path)
+                .filter(|(guard, _)| *guard == before)
+                .map(|(_, digest)| digest.clone())
+        })
+    {
+        let bytes = before.len;
+        return Ok((content_digest, before, bytes));
+    }
     let memo = crate::cache::digest_memo::active();
     let generation = memo.and_then(|_| crate::utils::stable_metadata_generation(&before_metadata));
     if let Some(generation) = generation.as_deref()
@@ -5198,6 +5223,13 @@ fn capture_guarded_file(
     crate::instrumentation::record_hash_input_bytes(usize::try_from(bytes).unwrap_or(usize::MAX));
     crate::instrumentation::record_hashed_file_bytes_read(usize::try_from(bytes).unwrap_or(usize::MAX));
     let content_digest = format!("sha256:{}", ContentDigest::from_sha256_bytes(hasher.finalize()));
+    #[cfg(unix)]
+    if bytes >= HASHED_FILE_REUSE_MIN_BYTES
+        && let Ok(mut hashed) = HASHED_FILES.lock()
+        && (hashed.len() < MAX_HASHED_FILES || hashed.contains_key(path))
+    {
+        hashed.insert(path.to_path_buf(), (before.clone(), content_digest.clone()));
+    }
     if let (Some(memo), Some(generation)) = (memo, generation)
         && crate::utils::stable_file_generation(path).as_deref() == Some(generation.as_slice())
         && let Some(changed) = crate::utils::change_time(&after_metadata)
@@ -5795,21 +5827,27 @@ fn installed_native_session(
     target_root: &Path,
     rustc_program: &OsStr,
 ) -> RailResult<(NativeCompilerSession, CompilerInputGuard)> {
+    use crate::compiler::collector::TransparentNativeSessionMemo;
+
     fn load(
+        receipt: &crate::cache::installation::InstallationReceipt,
+    ) -> RailResult<Option<TransparentNativeSessionMemo>> {
+        Ok(crate::cache::installation::load_session_memo(receipt)?
+            .and_then(|bytes| TransparentNativeSessionMemo::decode(&bytes).ok()))
+    }
+
+    fn reuse(
+        memo: Option<&TransparentNativeSessionMemo>,
         receipt: &crate::cache::installation::InstallationReceipt,
         source_root: &Path,
         target_root: &Path,
         rustc_program: &OsStr,
     ) -> RailResult<Option<(NativeCompilerSession, CompilerInputGuard)>> {
-        let Some(bytes) = crate::cache::installation::load_session_memo(receipt)? else {
+        let Some(memo) = memo else {
             return Ok(None);
         };
-        let memo = match crate::compiler::collector::TransparentNativeSessionMemo::decode(&bytes) {
-            Ok(memo) => memo,
-            Err(_) => return Ok(None),
-        };
         let session = crate::compiler::collector::reuse_transparent_native_session(
-            &memo,
+            memo,
             source_root,
             target_root,
             rustc_program,
@@ -5819,20 +5857,27 @@ fn installed_native_session(
 
     // A concurrent wrapper can replace the memo during this unlocked read. Every writer
     // holds the session lock, so a failed read retries under it.
-    if let Ok(Some(session)) = load(receipt, source_root, target_root, rustc_program) {
+    if let Ok(Some(session)) =
+        load(receipt).and_then(|memo| reuse(memo.as_ref(), receipt, source_root, target_root, rustc_program))
+    {
         return Ok(session);
     }
     let _lock = crate::cache::installation::lock_session(receipt)?;
-    if let Some(session) = load(receipt, source_root, target_root, rustc_program)? {
+    let previous = load(receipt)?;
+    if let Some(session) = reuse(previous.as_ref(), receipt, source_root, target_root, rustc_program)? {
         return Ok(session);
     }
-    let (session, _, memo, guard) = crate::compiler::collector::capture_transparent_native_session(
+    let (session, _, mut memo, guard) = crate::compiler::collector::capture_transparent_native_session(
         source_root,
         target_root,
         rustc_program,
         receipt.cache()?,
         receipt.root_portability(),
     )?;
+    // Cargo alternates compiler environments within one build; keep the sessions of the others.
+    if let Some(previous) = &previous {
+        memo.retain_environments(previous)?;
+    }
     crate::cache::installation::store_session_memo(receipt, &memo.encode()?)?;
     Ok((session, guard))
 }
@@ -23136,6 +23181,36 @@ pub(crate) mod tests {
         );
         revalidate_link_file(&original, generation.as_deref(), started, &mut budget)
             .expect_err("the original alias binding cannot authorize publication after retargeting");
+    }
+
+    /// A `-sys` crate's static library sits in its `OUT_DIR`, which the action captures, and rustc also selects
+    /// it. One process hashes it once until a write changes it.
+    #[cfg(unix)]
+    #[test]
+    fn one_process_hashes_an_unchanged_file_once() {
+        let root = tempfile::tempdir().expect("input directory");
+        let path = root.path().join("libinput.a");
+        let mut content = vec![7u8; 128 * 1024];
+        fs::write(&path, &content).expect("input");
+        let started = Instant::now();
+        let mut first = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
+        let captured = capture_guarded_file(&path, started, &mut first).expect("first capture");
+        assert_eq!(first.bytes_hashed, captured.2);
+        let mut second = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
+        assert_eq!(
+            capture_guarded_file(&path, started, &mut second).expect("unchanged capture"),
+            captured
+        );
+        assert_eq!(second.bytes_hashed, 0, "an unchanged file is hashed once");
+        content[0] = 8;
+        fs::write(&path, &content).expect("same-size change in place");
+        let mut third = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
+        let changed = capture_guarded_file(&path, started, &mut third).expect("changed capture");
+        assert_ne!(changed.0, captured.0);
+        assert_eq!(
+            third.bytes_hashed, captured.2,
+            "a write after the read requires fresh bytes"
+        );
     }
 
     #[test]
