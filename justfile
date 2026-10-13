@@ -22,20 +22,13 @@ rail-cache-setup *args:
 cache-status:
     cargo rail cache status --scope local --format json
 
-# Validate reviewed release intent before heavy source-surface analysis.
+# Preview the next release and run its checks without any effect.
 release-check bump="auto":
-    #!/usr/bin/env bash
-    status=0
-    cargo rail release check --all --bump {{quote(bump)}} || status=$?
-    (( status <= 1 )) || exit "$status"
+    cargo rail release --dry-run --bump {{quote(bump)}}
 
-# Run the heavy source-surface gate only after release intent is valid.
+# Run the heavy source-surface gate only after the release preview passes.
 pre-release bump="auto": (release-check bump)
     cargo rail surface --check --explain
-
-# Execute the checked release transaction locally without publication authority.
-release bump="auto": (pre-release bump)
-    cargo rail release run --all --local --bump {{quote(bump)}}
 
 # Shared nonmutating checks, also run by the local check recipe.
 ci-check: check-format check-markdown check-clippy check-dependencies check-docs check-compiler-driver

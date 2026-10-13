@@ -7,8 +7,8 @@ for command in python3 shellcheck actionlint bash rg; do
   command -v "$command" >/dev/null || { echo "missing tooling check prerequisite: $command" >&2; exit 127; }
 done
 python3 scripts/tooling/catalog.py validate
-for script in scripts/check*.sh scripts/prepare-cranelift.sh scripts/tooling/*.sh scripts/update-all.sh; do bash -n "$script"; done
-shellcheck -x scripts/check*.sh scripts/prepare-cranelift.sh scripts/tooling/*.sh scripts/update-all.sh
+for script in scripts/check*.sh scripts/prepare-cranelift.sh scripts/release.sh scripts/tooling/*.sh scripts/update-all.sh; do bash -n "$script"; done
+shellcheck -x scripts/check*.sh scripts/prepare-cranelift.sh scripts/release.sh scripts/tooling/*.sh scripts/update-all.sh
 actionlint
 
 temporary="$(mktemp -d)"

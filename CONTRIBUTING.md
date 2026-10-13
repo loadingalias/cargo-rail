@@ -14,7 +14,7 @@ Start with the smallest lane that reaches the changed behavior:
 | Planning                  | `just test`, then `just plan` |
 | Compiler                  | `just test`; add `just check-compiler-driver` for driver changes |
 | Cache                     | `just test-cache-host` |
-| Release                   | `just test`; add `just release-check` for current release intent |
+| Release                   | `just test`; add `just release-check` to preview the next release |
 | Cross-target compilation  | `just check-cross` |
 | Tooling or GitHub Actions | `just check-tooling` |
 
@@ -100,7 +100,7 @@ The same cases remain in `just test`; the cache-only lane does not run doctests 
 
 IBM Z, IBM POWER, and RISC-V have no release archives.
 Their runners prove native caching on the real architecture, not a Cargo-Rail release for it.
-On every push to `main` and every dispatched run, which release validation uses,
+On every push to `main` and every dispatched run, whose checks gate a release,
 an x86-64 runner cross-builds each one's test archive and the runner's `cargo-nextest`,
 and runs the target's Clippy and documentation checks.
 The native runner installs only its compiler, Clippy, and `rustc-dev`
@@ -185,11 +185,11 @@ Use `none` when an entry needs tracking but no version bump.
 Keep breaking-contract migration and recovery instructions together.
 
 The [release workflow](.github/workflows/release.yml) runs the source-built Cargo-Rail engine.
-One request prepares versions, changelogs, and consumed change files,
-then explicitly requests validation and [native packaging](.github/workflows/package.yml) for the exact release commit.
-The retained transaction owns publication and recovery.
-See [releasing a workspace](docs/releases.md) for reviewed merges, failed-run recovery,
-and the Cargo-Rail/Action bootstrap order.
+Its first job commits versions, changelogs, and consumed change files, tags, pushes,
+and opens the draft release; [native packaging](.github/workflows/package.yml) then builds, attests,
+and attaches each archive from the tag; the last job verifies the assets and publishes.
+Rerun the workflow to finish an interrupted release.
+See [releasing a workspace](docs/releases.md) for recovery and the Cargo-Rail/Action bootstrap order.
 
 ## Open a pull request
 

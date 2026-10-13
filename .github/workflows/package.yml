@@ -1,6 +1,22 @@
 name: Release packages
 on:
+  workflow_call:
+    inputs:
+      release-tag:
+        description: Package this release tag and attach every asset to its draft release
+        type: string
+        required: true
+    secrets:
+      CARGO_RAIL_R2_ACCESS_KEY_ID:
+        required: false
+      CARGO_RAIL_R2_SECRET_ACCESS_KEY:
+        required: false
   workflow_dispatch:
+    inputs:
+      release-tag:
+        description: Release tag to package; empty packages the selected ref without attaching anything
+        type: string
+        default: ''
 permissions:
   contents: read
 defaults:
@@ -36,6 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.release-tag }}
           persist-credentials: false
       - name: Install Windows tooling
         if: runner.os == 'Windows'
@@ -103,13 +120,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      contents: read
+      contents: write # Attach the assets to the draft release.
       id-token: write # Mint the Sigstore signing certificate.
       attestations: write # Persist the signed provenance.
       artifact-metadata: write # Record the attested artifact subjects.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.release-tag }}
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -123,13 +141,19 @@ jobs:
           cp LICENSE "$RUNNER_TEMP/assets/LICENSE"
           python3 scripts/package-archive-hosts.py "$RUNNER_TEMP/assets"
           (cd "$RUNNER_TEMP/assets"; sha256sum --check --strict SHA256SUMS)
-      - name: Attest component archives
+      # `cargo rail release` publishes only assets attested by this repository's release run.
+      - name: Attest release assets
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: |
-            ${{ runner.temp }}/assets/cargo-rail-*.zip
-            ${{ runner.temp }}/assets/cargo-rail-archive-hosts-v1.json
+          subject-path: ${{ runner.temp }}/assets/*
+      - name: Attach release assets
+        if: inputs.release-tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: gh release upload "$RELEASE_TAG" "$RUNNER_TEMP"/assets/* --clobber --repo "$GITHUB_REPOSITORY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: inputs.release-tag == ''
         with:
           name: release-cargo-rail-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/assets/*

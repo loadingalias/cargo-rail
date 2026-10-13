@@ -144,21 +144,20 @@ else:
             ['cargo', 'rail', 'plan', '--explain', '--all'],
         ])
 
-        check = ['cargo', 'rail', 'release', 'check', '--all', '--bump', 'patch']
-        self.environment['CHECK_FAIL_ARGS'] = json.dumps(check)
-        self.environment['CHECK_FAIL_CODE'] = '1'
-        calls = self.run_recipe('release', 'patch')
+        preview = ['cargo', 'rail', 'release', '--dry-run', '--bump', 'patch']
+        calls = self.run_recipe('pre-release', 'patch')
         self.assertEqual([call['args'] for call in calls], [
-            check,
+            preview,
             ['cargo', 'rail', 'surface', '--check', '--explain'],
-            ['cargo', 'rail', 'release', 'run', '--all', '--local', '--bump', 'patch'],
         ])
 
-        self.environment['CHECK_FAIL_CODE'] = '2'
-        calls = self.run_recipe('release', 'patch', success=False)
-        self.assertEqual([call['args'] for call in calls], [
-            check,
-        ])
+        # Pending checks (exit 1) and errors (exit 2) both stop the heavy surface gate.
+        self.environment['CHECK_FAIL_ARGS'] = json.dumps(preview)
+        for code in ['1', '2']:
+            with self.subTest(code=code):
+                self.environment['CHECK_FAIL_CODE'] = code
+                calls = self.run_recipe('pre-release', 'patch', success=False)
+                self.assertEqual([call['args'] for call in calls], [preview])
 
     def test_shared_check_failure_stops_later_checks(self):
         self.environment['CHECK_FAIL_COMMAND'] = 'clippy'

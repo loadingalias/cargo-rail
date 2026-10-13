@@ -68,17 +68,17 @@ JSON output reports this in `evidence`.
 
 The current Cargo-Rail release accepts only current configuration fields.
 Configuration inspection leaves the input file unchanged;
-unsupported keys fail before planning or mutation.
-The retired no-op field `release.require_changelog_entries` is no longer accepted.
-Use `release.require_release_notes` to require nonempty release prose before publication or tagging.
-Historical comparisons apply the same decoder and identify the revision and configuration path
-when decoding fails.
+unsupported keys fail before planning or mutation,
+and a retired key names the release that removed it.
+Historical comparisons read retired keys with their current meaning,
+and identify the revision and configuration path when decoding fails.
 
-Review existing policy against `config explain --all` from a workspace with supported configuration.
-Update the configuration file explicitly, then run `cargo rail config validate --strict`;
-Cargo-Rail does not rewrite unsupported fields automatically.
-For supported configuration, `config migrate` removes settings that only restate current defaults;
-see [Start sparse](#start-sparse).
+`cargo rail config migrate` previews the update; `config migrate apply` writes it.
+It replaces each retired `[release]` key from Cargo-Rail 0.31 with its successor and keeps what the key did:
+a file without registry publication gets `publish = "none"`, one without GitHub effects gets `github_release = false` and `checks = "none"`,
+`{prefix}` in a tag format becomes the prefix itself, and an artifact inventory becomes `release.assets`.
+It also removes settings that only restate current defaults; see [Start sparse](#start-sparse).
+Run `cargo rail config validate --strict` afterward.
 
 Plans use contract v9 and variant catalogs use v2.
 Regenerate older saved plans and validate catalogs against the current schemas before execution.
@@ -108,6 +108,8 @@ so the migration removes them first and names the release that removed each one;
 the JSON preview marks them with `removed_in`.
 Every other command rejects such a key, names its release and replacement,
 and points to this migration.
+Retired `[release]` keys are first replaced by their successors, listed under `added` in the JSON preview,
+so the release behaves as before.
 A removed key that needs a manual edit, such as a split's `paths`, is reported but never changed.
 The JSON preview includes `mutation_plan`.
 `apply --plan` accepts that plan, saved to a file, only while the configuration and checkout are unchanged.
@@ -125,7 +127,7 @@ major_version_conflict = "bump"
 enabled = true
 
 [release]
-remote_effects = "auto"
+tag_format = "v{version}"
 
 [plan.work.verification]
 scope = "repository"
@@ -244,81 +246,70 @@ Without `--explain`, the counterfactual is `null` and Surface performs only its 
 
 ### Release policy
 
+`cargo rail release` needs no configuration; set `[release]` keys only to change its defaults.
 Reviewed `.changes/*.md` files are the default source for bumps and release prose.
-`cargo rail release check` previews the local plan and exits `1` when a release is pending.
-It performs no mutation or external effect.
+See [releasing a workspace](releases.md) for the command, its effects, and recovery.
 
-The default `release.tag_format` is `{crate}-{prefix}{version}`.
-With the default `tag_prefix = "v"`, it produces tags such as `my-crate-v1.2.3` for both single-crate and multi-crate repositories.
-Repositories that use unqualified tags such as `v1.2.3` must set `tag_format = "{prefix}{version}"` explicitly.
-Override the format for one package with `[crates.NAME.release].tag_format`.
-The effective format controls both previous-tag lookup and new tags:
+| Key                         | Default                                          | Effect |
+| --------------------------- | ------------------------------------------------ | ------ |
+| `crates`                    | every member                                     | Crates a release manages; `change check` requires change files only for these. |
+| `publish`                   | `"crates-io"`                                    | Registry that receives releases: `"crates-io"`, `"none"`, or a registry in Cargo's `[registries]`. Each crate's Cargo `package.publish` still decides whether it may publish there. |
+| `github_release`            | `true` on a GitHub `origin`                      | Create a GitHub release for each tag. |
+| `checks`                    | `"all"` on a GitHub `origin`, otherwise `"none"` | Require every check GitHub reports on the source commit to pass before the first effect. |
+| `tag_format`                | `"{crate}-v{version}"`                           | Tag template; `{crate}` and `{version}` are its only placeholders. |
+| `sign_tags`                 | `false`                                          | Sign release tags with the configured Git signing key. |
+| `assets`                    | none                                             | Per-crate GitHub release files the draft must hold before publication. |
+| `asset_attestations`        | `"required"`                                     | `"off"` accepts assets without GitHub artifact attestations. |
+| `aliases`                   | none                                             | Per-crate mutable tags, such as `"v{major}"`, moved to each new release. |
+| `auxiliary_cargo_manifests` | none                                             | Standalone workspaces whose lockfiles a release rewrites. |
+
+`config explain --all` lists every key, including changelog shape, version groups, and semver policy.
+
+The effective tag format controls both previous-tag lookup and new tags.
+Repositories that use unqualified tags such as `v1.2.3` set `tag_format = "v{version}"`.
+Override the format for one crate with `[crates.NAME.release].tag_format`:
 
 ```toml
 [release]
-tag_format = "{prefix}{version}"
+tag_format = "v{version}"
 
 [crates.provider.release]
-tag_format = "{crate}-{prefix}{version}"
+tag_format = "{crate}-v{version}"
 ```
 
-The other package keeps `v<version>` tags; `provider` looks up and creates only `provider-v<version>` tags.
-Without an override, the global format retains its current behavior.
-Text and JSON release output include the same configuration warnings,
-including colliding effective tag formats.
+The other crates keep `v<version>` tags; `provider` looks up and creates only `provider-v<version>` tags.
+Release output includes configuration warnings, including colliding effective tag formats.
 
-`remote_effects` controls Git and forge effects.
-Registry publication is separate and requires both `registry_publication = "crates-io"` and `--publish` on the exact release invocation.
+Aliases move only forward and only after the crate's GitHub release is published.
+`{major}` and `{minor}` follow the released version, so `"v{major}"` needs no edit for a new major release.
 
-GitHub releases also require explicit validation workflows and job names:
+Asset names may use `{crate}` and `{version}`:
 
 ```toml
-[release.validation]
-".github/workflows/ci.yml" = ["tests", "lint"]
+[release.assets]
+my-cli = ["{crate}-{version}-x86_64-unknown-linux-gnu.zip", "SHA256SUMS"]
 ```
 
-Use the jobs' displayed names, including matrix values where applicable.
-Cargo-Rail requires successful jobs from one exact workflow run and attempt for the release commit.
-Missing, skipped, failed, ambiguous, or unavailable required jobs block publication.
-The release executor cannot authorize itself as validation.
-Retained validation attempts cannot be replaced on retry.
-Each workflow query and job inventory is bounded to 100 results;
-a larger or incomplete response blocks release.
-Set `release.hosted_workflow` to submit durable requests to a separate GitHub workflow.
-The hosted executor dispatches validation explicitly and waits for its exact runs.
-Without that setting, execution is local; `--local` overrides it for a new request.
-`release run --pr` adds a review boundary to the same transaction.
-The merged tree must match preparation,
-and the merge event continues validation and publication on its exact commit.
-See [releasing a workspace](releases.md) for the workflow contract and recovery behavior.
-
-Optional `release.aliases = { my-action = "v10" }` authorizes a mutable tag for a package.
-Cargo-Rail captures its prior object in the intent and promotes it with a Git lease only
-after verifying the immutable forge release.
-Aliases require tags and forge publication.
-
 Standalone tools or fuzz workspaces
-that depend on released packages by path must declare their exact manifests with `auxiliary_cargo_manifests`
+that depend on released crates by path must declare their exact manifests with `auxiliary_cargo_manifests`
 when their independent lockfiles are tracked in Git.
-Normal and extended release checks inspect captured tracked lockfiles
-and use Cargo metadata to identify workspaces
-that resolve a selected release package by its manifest path.
+A release inspects captured tracked lockfiles and uses Cargo metadata to identify workspaces
+that resolve a released crate by its manifest path.
 Discovery follows Cargo-declared path dependencies, including inactive optional dependencies.
-An omitted workspace blocks planning before release mutation.
-A matching local lockfile identity that Cargo cannot attribute also blocks planning
+An omitted workspace blocks the release before any effect.
+A matching local lockfile identity that Cargo cannot attribute also blocks it
 until the workspace is declared.
 Packages with the same name and version
 that Cargo attributes to another manifest remain independent.
 Cargo-Rail resolves each manifest's committed `Cargo.lock`,
 computes its post-release bytes in an isolated copy of the captured workspace,
-binds exact manifest and lockfile contents plus their before/after digests into the release plan,
-and applies those frozen writes during release preparation.
+and writes those bytes into the release commit.
 The primary workspace uses the same projection.
-Compatible path requirements of unselected packages and path-only dependencies stay unchanged.
+Compatible path requirements of unreleased crates and path-only dependencies stay unchanged.
 Released members retain the minimum-version refresh for their released local dependencies;
 shared workspace declarations used by those members refresh with them.
-An incompatible caret, tilde, or exact requirement on a local released package is retargeted to its
-new version; compound and inequality requirements that need editing are rejected before mutation.
+An incompatible caret, tilde, or exact requirement on a local released crate is retargeted to its
+new version; compound and inequality requirements that need editing are rejected before any effect.
 Each manifest and lockfile must be a regular file whose index identity,
 filter-cleaned worktree content, and executable mode exactly match `HEAD`;
 every local Cargo package must resolve inside the captured Git source.
@@ -328,14 +319,6 @@ This is a Cargo-only projection, not a general command hook.
 [release]
 auxiliary_cargo_manifests = ["fuzz/Cargo.toml", "tools/check/Cargo.toml"]
 ```
-
-Release changelogs use a small fixed-placeholder formatter for commit sourced releases.
-Reviewed change files remain the default release source and may carry optional presentation metadata
-for authored Markdown.
-When an existing GitHub changelog uses linked `/compare/` version headings,
-Cargo-Rail preserves that style and links the previous tag to the planned tag.
-Configure section order, labels, filters, links, and per-crate changelog paths under `[release.changelog]` or `[crates.NAME.changelog]`;
-configure an independently authored forge body with files in `release_notes_dir`.
 
 ### Repository work
 
@@ -416,29 +399,3 @@ and register only their positive inputs under `[plan.work.NAME]`.
 
 `config validate` enables strict mode in common CI environments.
 Use `--no-strict` only when warnings are deliberately non-blocking.
-
-### Native release assets
-
-Declare optional assets per package and name their producer in `release.validation`.
-A target is an assertion made by the authorized packaging job;
-that job must validate the product it builds.
-The executor verifies byte identity and producer authority.
-Use `source` to require an asset to match a regular committed file, including a license.
-
-```toml
-[release.validation]
-".github/workflows/build.yml" = ["package", "assemble"]
-
-[release.artifacts.my-cli]
-workflow = ".github/workflows/build.yml"
-
-[release.artifacts.my-cli.files."{crate}-{version}-x86_64-unknown-linux-gnu.zip"]
-target = "x86_64-unknown-linux-gnu"
-
-[release.artifacts.my-cli.files.LICENSE]
-source = "LICENSE"
-```
-
-Upload exactly these files in the producer's `release-my-cli-<run-id>-<attempt>` artifact.
-See [native asset verification and recovery](release-records.md#native-assets) for the transport contract and bounds.
-This integration requires GitHub release effects and tags.

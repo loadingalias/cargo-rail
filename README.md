@@ -2,7 +2,7 @@
 
 Cargo-Rail makes Rust workspaces faster to change and safer to release.
 It selects required work, reuses verified compiler results, repairs dependency drift,
-and carries reviewed per-crate intent through durable releases.
+and carries reviewed per-crate intent through one-command releases.
 Cargo, nextest, Just, and CI remain the executors.
 
 [![Crates.io](https://img.shields.io/crates/v/cargo-rail.svg)](https://crates.io/crates/cargo-rail)
@@ -15,7 +15,7 @@ Cargo, nextest, Just, and CI remain the executors.
 | Compiler reuse               | Restore verified results across ordinary Cargo, nextest, Just, IDE, and CI work |
 | Affected-work planning       | Select exact jobs, packages, targets, and variants from one captured workspace |
 | Dependency coherence         | Review one dependency, feature, and MSRV repair before explicit apply |
-| Rust changesets and releases | Record per-crate intent in `.changes/` and resume the exact release transaction |
+| Rust changesets and releases | Record per-crate intent in `.changes/`, then release it with one command that finishes on rerun |
 | Surface analysis             | Derive product reachability and proven visibility reductions from compiler facts |
 | Split and sync               | Extract Cargo-aware Git history and synchronize later changes in both directions |
 
@@ -149,12 +149,11 @@ cargo rail unify apply --backup
 ```bash
 cargo rail change add my-crate --bump patch --message "Fixed connection retries"
 cargo rail change check --merge-base
-cargo rail release check --all --publication
+cargo rail release --dry-run
 ```
 
 `change add` writes the crate bump and release note to `.changes/` for review.
-`release check` validates the release plan without publishing.
-Publication still requires explicit `--publish` authority.
+`release --dry-run` previews the release and runs every check without changing anything.
 
 ### Check product reachability
 
@@ -280,11 +279,11 @@ See [Planning](docs/planning.md).
 
 ### GitHub Actions
 
-The native v10 Action installs the exact Cargo-Rail release in its lock, runs the planner once,
+The native v12 Action installs the exact Cargo-Rail release in its lock, runs the planner once,
 and exposes the validated plan plus exact required-work selectors:
 
 ```yaml
-- uses: loadingalias/cargo-rail-action@v10
+- uses: loadingalias/cargo-rail-action@v12
   id: rail
 
 - name: Test affected packages
@@ -301,7 +300,7 @@ and exposes the validated plan plus exact required-work selectors:
     cargo nextest run "${CARGO_ARGS[@]}" --locked
 ```
 
-Use `loadingalias/cargo-rail-action/cache@v10` separately in each execution job that needs remote compiler reuse.
+Use `loadingalias/cargo-rail-action/cache@v12` separately in each execution job that needs remote compiler reuse.
 Both actions install the exact Cargo-Rail release recorded by the Action by default.
 Set an exact `version` only when the workflow needs a reproducible pin.
 Its `mode` input is required.
@@ -316,14 +315,15 @@ as shown in [installation paths](#installation-paths).
 
 ## Carry release intent through the workflow
 
-See [Releasing a workspace](docs/releases.md) for hosted execution, review, and recovery.
+See [Releasing a workspace](docs/releases.md) for CI, protected branches, binaries, and recovery.
 
 - `cargo rail unify --check` derives one reviewable dependency repair from the captured workspace;
   `cargo rail unify apply --backup` applies it with backups for recovery.
 - `cargo rail change` records bump and release-note intent in `.changes/` during the change itself.
-- `cargo rail release` carries that intent through versioning, changelogs, exact auxiliary Cargo lockfiles,
-  exact-SHA validation and native assets, tags, publication, and durable resume state.
-  Configured hosted requests survive terminal closure; reviewed merges continue the same intent.
+- `cargo rail release` carries that intent through versions, changelogs, exact auxiliary Cargo lockfiles, tags,
+  registry publication, attested GitHub release assets, and GitHub releases, after one preview.
+  It keeps no state: run it again after any interruption, locally or in CI,
+  and it finishes the release.
 - `cargo rail split` moves relevant crate history into an OSS repository;
   `cargo rail sync` maps later changes in both directions and stops with a resumable receipt
   when Git three-way merge needs a human.

@@ -1,15 +1,12 @@
-//! Integration tests for the release check command
+//! Integration tests for `cargo rail release --dry-run` selection and preconditions
 
-use super::helpers::{TestWorkspace, run_cargo_rail};
+use super::helpers::{TestWorkspace, cargo_command, run_cargo_rail};
 use anyhow::Result;
 
-fn write_publication_config(ws: &TestWorkspace) -> Result<()> {
+fn write_release_config(ws: &TestWorkspace, extras: &str) -> Result<()> {
     std::fs::write(
         ws.path.join(".config/rail.toml"),
-        r#"[release]
-remote_effects = "push"
-registry_publication = "crates-io"
-"#,
+        format!("[release]\nsemver_check = \"off\"\n{extras}"),
     )?;
     Ok(())
 }
@@ -28,6 +25,17 @@ fn add_release_intent(ws: &TestWorkspace, crate_names: &[&str], bump: &str) -> R
     Ok(())
 }
 
+/// Commit the fixture with its Cargo.lock and publish the branch and tags to `origin`.
+fn publish_to_origin(ws: &TestWorkspace, message: &str) -> Result<()> {
+    let lockfile = cargo_command(&ws.path)
+        .args(["generate-lockfile", "--offline"])
+        .output()?;
+    anyhow::ensure!(lockfile.status.success(), "{lockfile:?}");
+    ws.commit(message)?;
+    ws.with_origin()?;
+    Ok(())
+}
+
 /// Assert one exact stdout line, so a crate name in an unrelated line cannot satisfy it.
 fn assert_line(stdout: &str, expected: &str) {
     assert!(
@@ -36,23 +44,18 @@ fn assert_line(stdout: &str, expected: &str) {
     );
 }
 
-/// Test check command validates crate exists
+/// Test that a release validates the named crate exists
 #[test]
 fn test_check_validates_crate_exists() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("check-exists")?;
+        ws.add_crate("real-crate", "0.1.0", &[])?;
+        write_release_config(&ws, "publish = \"none\"\n")?;
+        publish_to_origin(&ws, "Add real-crate with release config")?;
 
-        // Add a crate without path deps (use workspace deps)
-        ws.add_crate("real-crate", "0.1.0", &[("anyhow", "{ workspace = true }")])?;
-
-        // Configure release
-        write_publication_config(&ws)?;
-
-        ws.commit("Add real-crate with release config")?;
-
-        // Check for non-existent crate should fail
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "nonexistent"])?;
-        assert!(!output.status.success(), "check for nonexistent crate should fail");
+        // A dry run for a non-existent crate should fail
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "--dry-run", "nonexistent"])?;
+        assert!(!output.status.success(), "a release of a nonexistent crate should fail");
 
         assert_eq!(output.status.code(), Some(2), "{output:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -67,85 +70,15 @@ fn test_check_validates_crate_exists() {
     super::helpers::finish_test(result);
 }
 
-/// Test check command passes for valid crate
+/// A dry run runs every precondition of a release, including a clean worktree.
 #[test]
-fn test_check_passes_for_valid_crate() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("check-valid")?;
-
-        // Add a simple publishable crate using workspace deps (no path deps)
-        ws.add_crate("valid-crate", "0.1.0", &[("anyhow", "{ workspace = true }")])?;
-
-        // Configure release
-        write_publication_config(&ws)?;
-
-        add_release_intent(&ws, &["valid-crate"], "patch")?;
-        ws.commit("Add valid-crate with release config")?;
-
-        // A pending release that passes publication validation exits 1.
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "valid-crate"])?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        assert_eq!(
-            output.status.code(),
-            Some(1),
-            "check should report a pending release. stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_line(&stdout, "valid-crate: ready for crates-io publication");
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-/// Test check command with --all flag
-#[test]
-fn test_check_all_crates() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("check-all")?;
-
-        // Add multiple simple crates with workspace deps
-        ws.add_crate("crate-a", "0.1.0", &[("anyhow", "{ workspace = true }")])?;
-        ws.add_crate("crate-b", "0.1.0", &[("serde", "{ workspace = true }")])?;
-
-        // Configure release
-        write_publication_config(&ws)?;
-
-        add_release_intent(&ws, &["crate-a", "crate-b"], "patch")?;
-        ws.commit("Add crates with release config")?;
-
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "--all"])?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        assert_eq!(
-            output.status.code(),
-            Some(1),
-            "check --all should report a pending release. stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_line(&stdout, "crate-a: ready for crates-io publication");
-        assert_line(&stdout, "crate-b: ready for crates-io publication");
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-/// Test check remains a read-only preview when the worktree is dirty.
-#[test]
-fn test_check_tolerates_dirty_preview() {
+fn test_dry_run_requires_a_clean_worktree() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("check-dirty")?;
-
-        // Add a crate
-        ws.add_crate("dirty-crate", "0.1.0", &[("anyhow", "{ workspace = true }")])?;
-
-        // Configure release policy.
-        write_publication_config(&ws)?;
-
-        add_release_intent(&ws, &["dirty-crate"], "none")?;
-        ws.commit("Add dirty-crate with config")?;
+        ws.add_crate("dirty-crate", "0.1.0", &[])?;
+        write_release_config(&ws, "publish = \"none\"\n")?;
+        add_release_intent(&ws, &["dirty-crate"], "patch")?;
+        publish_to_origin(&ws, "Add dirty-crate with config")?;
 
         // Create uncommitted change
         std::fs::write(
@@ -153,14 +86,13 @@ fn test_check_tolerates_dirty_preview() {
             "pub fn hello() { /* modified */ }",
         )?;
 
-        // Preview should succeed. Exact dirt is enforced against the bound release
-        // plan at the first write, not by this read-only command.
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "dirty-crate"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "--dry-run", "dirty-crate"])?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
         assert!(
-            output.status.success(),
-            "read-only release check should tolerate dirt.\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            stderr.contains("a release starts from a clean worktree")
+                && stderr.contains("crates/dirty-crate/src/lib.rs"),
+            "a dry run must name the uncommitted change.\nstderr:\n{stderr}"
         );
 
         Ok(())
@@ -168,10 +100,10 @@ fn test_check_tolerates_dirty_preview() {
     super::helpers::finish_test(result);
 }
 
-/// Test check reports status for crate with publish = false
+/// Test a dry run reports an unpublishable crate without publishing it
 ///
-/// When explicitly checking an unpublishable crate, the command succeeds
-/// but reports the crate as "not publishable" rather than erroring.
+/// When explicitly naming an unpublishable crate, the release succeeds
+/// and reports that the crate is not published rather than erroring.
 #[test]
 fn test_check_reports_unpublishable_crate_status() {
     let result: Result<()> = (|| {
@@ -195,93 +127,79 @@ publish = false
         )?;
         std::fs::write(crate_path.join("src/lib.rs"), "pub fn hello() {}")?;
 
-        // Configure release
-        write_publication_config(&ws)?;
-
-        ws.commit("Add private-crate with config")?;
+        // Crates.io is the default registry; Cargo's publish = false keeps this crate off it.
+        write_release_config(&ws, "")?;
         std::fs::create_dir_all(ws.path.join(".changes"))?;
         std::fs::write(
             ws.path.join(".changes/private-crate.md"),
             "---\n\"private-crate\" = \"patch\"\n---\n\nRelease the private crate.\n",
         )?;
+        publish_to_origin(&ws, "Add private-crate with config")?;
 
-        // Check should succeed and report the crate as not publishable
-        let output = run_cargo_rail(
-            &ws.path,
-            &["rail", "release", "check", "--publication", "private-crate"],
-        )?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "--dry-run", "private-crate"])?;
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert_eq!(
             output.status.code(),
-            Some(1),
-            "pending release check should exit 1.\nstdout:\n{}\nstderr:\n{}",
+            Some(0),
+            "a dry run exits 0 when every check passes.\nstdout:\n{}\nstderr:\n{}",
             stdout,
             String::from_utf8_lossy(&output.stderr)
         );
-
-        // Should report crate as not publishable
-        assert_line(
-            &stdout,
-            "private-crate: not publishable (publish = false in Cargo.toml)",
-        );
+        assert_line(&stdout, "    registry       not published");
         assert!(
-            stdout.contains("no selected crate publishes to crates.io"),
-            "a plan that publishes nothing must not claim publication readiness.\nstdout:\n{stdout}"
+            !stdout.contains("publishes to"),
+            "a plan that publishes nothing must not claim publication.\nstdout:\n{stdout}"
         );
+
+        let json = run_cargo_rail(
+            &ws.path,
+            &["rail", "release", "--dry-run", "private-crate", "--format", "json"],
+        )?;
+        assert_eq!(json.status.code(), Some(0), "{json:?}");
+        let json: serde_json::Value = serde_json::from_slice(&json.stdout)?;
+        assert_eq!(json["crates"][0]["name"], "private-crate");
+        assert_eq!(json["crates"][0]["registry"], "skipped");
 
         Ok(())
     })();
     super::helpers::finish_test(result);
 }
 
-/// Publication readiness requires explicit remote-effect authority in configuration.
+/// Without crate names, a release selects every crate with release-worthy changes
 #[test]
-fn test_check_requires_release_config() {
-    let result: Result<()> = (|| {
-        let ws = TestWorkspace::new_named("check-no-config")?;
-        ws.add_crate("some-crate", "0.1.0", &[])?;
-        add_release_intent(&ws, &["some-crate"], "patch")?;
-        ws.commit("Add some-crate without release authority")?;
-
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication", "some-crate"])?;
-        assert_eq!(output.status.code(), Some(2), "{output:?}");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("--publication cannot be combined with release.remote_effects = \"none\""),
-            "the error must name the flag the user passed. stderr: {stderr}"
-        );
-
-        Ok(())
-    })();
-    super::helpers::finish_test(result);
-}
-
-/// Test check command requires crate name or --all
-#[test]
-fn test_check_requires_crate_or_all() {
+fn test_dry_run_without_crate_names_selects_every_changed_crate() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("check-no-args")?;
-
-        // Add a crate
         ws.add_crate("any-crate", "0.1.0", &[])?;
+        ws.add_crate("other-crate", "0.1.0", &[])?;
+        write_release_config(&ws, "publish = \"none\"\n")?;
+        publish_to_origin(&ws, "Add crates with config")?;
+        ws.tag("any-crate-v0.1.0", "Release any-crate")?;
+        ws.tag("other-crate-v0.1.0", "Release other-crate")?;
+        ws.push()?;
 
-        // Configure release
-        write_publication_config(&ws)?;
-
-        ws.commit("Add any-crate with config")?;
-
-        // Check with no args should fail
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "--publication"])?;
-        assert!(!output.status.success(), "check with no args should fail");
-
-        assert_eq!(output.status.code(), Some(2), "{output:?}");
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "--dry-run"])?;
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
         assert!(
-            stderr.contains("must specify crate name(s) or --all"),
-            "Should require a crate name or --all. stderr: {}",
-            stderr
+            String::from_utf8_lossy(&output.stdout).contains("nothing to release"),
+            "{output:?}"
         );
+
+        add_release_intent(&ws, &["any-crate"], "patch")?;
+        ws.commit("Review any-crate")?;
+        ws.push()?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "--dry-run", "--format", "json"])?;
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        let names = json["crates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["any-crate"], "{json}");
+        assert_eq!(json["skipped"][0]["name"], "other-crate", "{json}");
 
         Ok(())
     })();

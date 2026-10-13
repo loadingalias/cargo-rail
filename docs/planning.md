@@ -27,9 +27,8 @@ toolchain, targets, and compatible evidence.
 Missing or incomplete evidence requires only the work item that owns the gap.
 
 The work plan does not authorize release publication.
-The [release transaction](release-records.md) retains its own exact source, validation attempts,
-package and artifact digests, and external effects.
-A skipped planner item cannot substitute for required release validation.
+A [release](releases.md) requires the checks GitHub reports on its own source commit,
+and a skipped planner item cannot substitute for them.
 
 ## Register repository work
 

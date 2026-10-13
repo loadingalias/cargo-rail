@@ -49,7 +49,7 @@ fn current_configuration_loads_without_writes() {
         ws.add_crate("test-crate", "0.1.0", &[])?;
         ws.commit("fixture")?;
         let path = ws.path.join(".config/rail.toml");
-        let original = b"# retain comments and spelling\n[unify]\nmsrv_policy = { mode = 'disabled' }\n[release]\nsource = 'commits'\nremote_effects = 'none'\n";
+        let original = b"# retain comments and spelling\n[unify]\nmsrv_policy = { mode = 'disabled' }\n[release]\nsource = 'commits'\npublish = 'none'\n";
         fs::write(&path, original)?;
         let writable = fs::metadata(&path)?.permissions();
         let mut readonly = writable.clone();
@@ -76,7 +76,7 @@ fn current_configuration_loads_without_writes() {
                 if value["action"] == "print" {
                     assert_eq!(value["config"]["unify"]["msrv_policy"]["mode"], "disabled");
                     assert_eq!(value["config"]["release"]["source"], "commits");
-                    assert_eq!(value["config"]["release"]["remote_effects"], "none");
+                    assert_eq!(value["config"]["release"]["publish"], "none");
                 }
                 if value["action"] == "explain" {
                     let schema: serde_json::Value =
@@ -501,9 +501,10 @@ selector = "warnings"
 level = "warn"
 
 [release]
-tag_prefix = "release-"
-tag_format = "{crate}-{version}"
-remote_effects = "push"
+tag_format = "release-{crate}-{version}"
+publish = "none"
+github_release = false
+checks = "none"
 sign_tags = true
 change_dir = ".release-intent"
 pre_1_breaking_bump = "major"
@@ -1164,7 +1165,7 @@ fn removed_release_changelog_entry_gate_is_rejected() {
         assert!(
             combined.contains(
                 "configuration key 'release.require_changelog_entries' was removed in Cargo-Rail 0.29.0; \
-                 `release.require_release_notes` remains the release-prose gate; \
+                 a GitHub release requires release notes; nothing else needs a key; \
                  `cargo rail config migrate` previews its removal"
             ),
             "{combined}"
@@ -1729,7 +1730,7 @@ fn removed_configuration_keys_name_their_release_everywhere_and_migrate_away() {
 
         let expected = [
             "configuration key 'release.require_changelog_entries' was removed in Cargo-Rail 0.29.0; \
-             `release.require_release_notes` remains the release-prose gate; \
+             a GitHub release requires release notes; nothing else needs a key; \
              `cargo rail config migrate` previews its removal",
             "configuration key 'run' was removed in Cargo-Rail 0.22.0",
         ];

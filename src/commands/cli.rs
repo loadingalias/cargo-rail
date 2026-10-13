@@ -141,12 +141,15 @@ modifying either repository. Apply is bidirectional unless a direction is select
 Use --resume RECEIPT after resolving a recorded conflict.";
 
 const RELEASE_HELP: &str = "\
-Publication requires explicit --publish authority. Interrupted transactions
-retain a state path for `release resume`; `release status` shows recovery actions.
+Releases every crate with release-worthy changes, or the named crates and the dependents
+they need. The preview lists versions, tags, registry publication, and GitHub releases,
+then asks once. Run the same command again after any interruption to finish the release;
+completed steps are read from Git, the registry, and GitHub and never repeated.
 
-  cargo rail release check --all --publication # Validate publication authority
-  cargo rail release run my-crate --bump minor # Execute a release transaction
-  cargo rail release run --all --publish --yes # Submit a configured hosted release";
+  cargo rail release --dry-run           # Preview and check everything, change nothing
+  cargo rail release                     # Commit, tag, push, publish, and create GitHub releases
+  cargo rail release my-crate --bump minor
+  cargo rail release --pr                # Open a release pull request for a protected branch";
 
 const CHANGE_HELP: &str = "\
 Record a user-facing entry and its release intent:
@@ -167,11 +170,9 @@ lane still needs its own installed Rust target, SDK, linker, and host tooling.
   cargo rail init --target wasm32-wasip1 # Declare a target";
 
 const CLEAN_HELP: &str = "\
-Select an artifact class explicitly. --all covers eligible workspace artifacts;
---release-journal selects one terminal transaction by ID or state path.
+Select an artifact class explicitly. --all covers eligible workspace artifacts.
 
-  cargo rail clean --all --check         # Preview workspace cleanup (exit 1 if pending)
-  cargo rail clean --release-journal ID  # Delete one terminal journal";
+  cargo rail clean --all --check         # Preview workspace cleanup (exit 1 if pending)";
 
 const CACHE_HELP: &str = "\
 Cache setup enrolls this workspace for ordinary Cargo commands.
@@ -439,13 +440,9 @@ pub enum Commands {
         format: TextJsonOutputFormat,
     },
 
-    /// Plan and execute exact-SHA releases
+    /// Release changed crates: version, changelog, tag, push, publish, and GitHub release
     #[command(after_long_help = RELEASE_HELP)]
-    Release {
-        /// Release subcommand
-        #[command(subcommand)]
-        command: ReleaseCommand,
-    },
+    Release(ReleaseArgs),
 
     /// Manage pending release intent files
     #[command(after_long_help = CHANGE_HELP)]
@@ -459,7 +456,7 @@ pub enum Commands {
     #[command(after_long_help = CLEAN_HELP)]
     Clean {
         /// Clean every eligible workspace-owned artifact class.
-        #[arg(long, conflicts_with_all = ["cache", "prune_backups", "all_backups", "reports", "release_journal"])]
+        #[arg(long, conflicts_with_all = ["cache", "prune_backups", "all_backups", "reports"])]
         all: bool,
         /// Clean cache state owned by this workspace
         #[arg(long)]
@@ -473,9 +470,6 @@ pub enum Commands {
         /// Clean generated reports
         #[arg(long)]
         reports: bool,
-        /// Delete exactly one terminal release journal by transaction ID or state path.
-        #[arg(long, value_name = "ID_OR_PATH")]
-        release_journal: Option<String>,
         /// Check for pending cleanup without deleting files (exit 1 when pending)
         #[arg(long, short = 'c')]
         check: bool,
@@ -970,171 +964,27 @@ pub enum SplitCommand {
     },
 }
 
-/// Subcommands for `cargo rail release`
-#[derive(Debug, Subcommand)]
-pub enum ReleaseCommand {
-    /// Transport a bound release record between executors
-    #[command(hide = true)]
-    Record {
-        /// Record transport operation
-        #[command(subcommand)]
-        command: ReleaseRecordCommand,
-    },
-    /// Configure release settings
-    Init {
-        /// Crate name(s) to configure (optional)
-        #[arg(value_name = "CRATE")]
-        crate_names: Vec<String>,
-        /// Preview generated config without writing
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Execute a durable release transaction
-    Run {
-        /// Crate name(s) to release (mutually exclusive with --all)
-        #[arg(conflicts_with = "all", value_name = "CRATE")]
-        crate_names: Vec<String>,
-        /// Release all workspace crates
-        #[arg(short, long)]
-        all: bool,
-        /// Version bump: auto, major, minor, patch, prerelease, release, or x.y.z
-        #[arg(long, default_value = "auto")]
-        bump: String,
-        /// Apply from a previously generated mutation plan file
-        #[arg(long, value_name = "PATH")]
-        plan: Option<PathBuf>,
-        /// Authorize irreversible publication to crates.io
-        #[arg(long)]
-        publish: bool,
-        /// Skip git tag creation
-        #[arg(long)]
-        skip_tag: bool,
-        /// Review the preparation in a PR before continuing the same transaction
-        #[arg(long)]
-        pr: bool,
-        /// Stop after retaining the exact preparation commit
-        #[arg(long, hide = true, conflicts_with = "pr")]
-        prepare: bool,
-        /// Retain execution records in the bound Git repository before effects
-        #[arg(long, hide = true)]
-        retain_remote: bool,
-        /// Execute locally instead of submitting to the configured hosted workflow
-        #[arg(long, conflicts_with = "executor")]
-        local: bool,
-        /// Continue inside the configured GitHub workflow
-        #[arg(long, hide = true)]
-        executor: bool,
-        /// Expand explicit crate selection to include the full dependent closure
-        #[arg(long)]
-        include_dependents: bool,
-        /// Skip the interactive confirmation prompt.
-        #[arg(short = 'y', long)]
-        yes: bool,
-        /// Authorize release execution from a non-default branch.
-        #[arg(long)]
-        allow_non_default_branch: bool,
-        /// Output format
-        #[arg(long, short = 'f', default_value_t, value_enum)]
-        format: TextJsonOutputFormat,
-    },
-    /// Validate the local release plan or publication readiness
-    Check {
-        /// Crate name(s) to check (mutually exclusive with --all)
-        #[arg(conflicts_with = "all", value_name = "CRATE")]
-        crate_names: Vec<String>,
-        /// Check all workspace crates (mutually exclusive with crate names)
-        #[arg(short, long)]
-        all: bool,
-        /// Version bump: auto, major, minor, patch, prerelease, release, or x.y.z
-        #[arg(long, default_value = "auto")]
-        bump: String,
-        /// Validate publication authority for the same release plan
-        #[arg(long)]
-        publication: bool,
-        /// Run extended local validation (package dry-run, MSRV, and semver checks)
-        #[arg(long, short = 'e')]
-        extended: bool,
-        /// Exclude git tag creation from the release plan
-        #[arg(long)]
-        skip_tag: bool,
-        /// Expand explicit crate selection to include the full dependent closure
-        #[arg(long)]
-        include_dependents: bool,
-        /// Output format
-        #[arg(long, short = 'f', default_value_t, value_enum)]
-        format: TextJsonOutputFormat,
-    },
-    /// Resume the unique active release or one exact transaction
-    Resume {
-        /// Transaction identity; omit when exactly one release is active
-        #[arg(value_name = "TRANSACTION")]
-        transaction: Option<String>,
-        /// Execute inside the configured GitHub workflow
-        #[arg(long, hide = true)]
-        executor: bool,
-    },
-    /// Show durable release state and the safe recovery command
-    Status {
-        /// Inspect one state file instead of every known release transaction
-        #[arg(value_name = "STATE")]
-        state: Option<PathBuf>,
-        /// Include terminal and reconstructed transaction history
-        #[arg(long)]
-        history: bool,
-        /// Output format
-        #[arg(long, short = 'f', default_value_t, value_enum)]
-        format: TextJsonOutputFormat,
-    },
-    /// Abort an active release before publication
-    Abort {
-        /// Transaction identity; omit when exactly one release is active
-        #[arg(value_name = "TRANSACTION")]
-        transaction: Option<String>,
-        /// Retain an exact pushed preparation that is an ancestor of the current branch
-        #[arg(long)]
-        retain_preparation: bool,
-        /// Confirm the abort operation
-        #[arg(short = 'y', long)]
-        yes: bool,
-    },
-}
-
-/// Machine release record transport for hosted executors.
-#[derive(Debug, Subcommand)]
-pub enum ReleaseRecordCommand {
-    /// Read the complete original release record
-    Inspect {
-        /// Exact transaction identity
-        transaction: String,
-    },
-    /// Persist execution records with an atomic repository lease
-    Store {
-        /// Exact transaction identity
-        transaction: String,
-    },
-    /// Recover the active remote execution record
-    Fetch {
-        /// Exact transaction identity; omit to discover the active request
-        transaction: Option<String>,
-    },
-    /// Export the original transaction and retained archives
-    Export {
-        /// Exact transaction identity
-        transaction: String,
-        /// New output directory
-        directory: PathBuf,
-    },
-    /// Import evidence bound by the invoking executor
-    Import {
-        /// Received record directory
-        directory: PathBuf,
-        /// Independently authorized immutable intent identity
-        #[arg(long)]
-        intent: String,
-        /// Independently authorized checkout commit
-        #[arg(long)]
-        source: String,
-    },
+/// Arguments for `cargo rail release`.
+#[derive(Debug, clap::Args)]
+pub struct ReleaseArgs {
+    /// Crates to release, with the dependents they need (default: every crate with release-worthy changes)
+    #[arg(value_name = "CRATE")]
+    pub crate_names: Vec<String>,
+    /// Version bump: auto, major, minor, patch, prerelease, release, or x.y.z
+    #[arg(long, default_value = "auto")]
+    pub bump: String,
+    /// Land the release commit through a pull request instead of pushing it
+    #[arg(long)]
+    pub pr: bool,
+    /// Skip the confirmation prompt
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+    /// Preview and run every check without any effect
+    #[arg(long, conflicts_with = "yes")]
+    pub dry_run: bool,
+    /// Output format
+    #[arg(long, short = 'f', default_value_t, value_enum)]
+    pub format: TextJsonOutputFormat,
 }
 
 /// Subcommands for `cargo rail change`
@@ -1241,16 +1091,7 @@ impl Commands {
                     SplitOutputFormat::NamesOnly | SplitOutputFormat::JsonLines => OutputProtocol::Raw,
                 },
             },
-            Commands::Release { command } => match command {
-                ReleaseCommand::Record { .. } => OutputProtocol::Json,
-                ReleaseCommand::Init { .. } | ReleaseCommand::Resume { .. } | ReleaseCommand::Abort { .. } => {
-                    OutputProtocol::Text
-                }
-                ReleaseCommand::Status { format, .. } => text_json_protocol(format.is_json()),
-                ReleaseCommand::Run { format, .. } | ReleaseCommand::Check { format, .. } => {
-                    text_json_protocol(format.is_json())
-                }
-            },
+            Commands::Release(args) => text_json_protocol(args.format.is_json()),
             Commands::Change { command } => match command {
                 ChangeCommand::Add { format, .. }
                 | ChangeCommand::Status { format }
@@ -1312,15 +1153,6 @@ impl Commands {
             Commands::Split {
                 command: SplitCommand::Init { .. },
             } => Some("split init"),
-            Commands::Release {
-                command: ReleaseCommand::Init { .. },
-            } => Some("release init"),
-            Commands::Release {
-                command: ReleaseCommand::Resume { .. },
-            } => Some("release resume"),
-            Commands::Release {
-                command: ReleaseCommand::Abort { .. },
-            } => Some("release abort"),
             Commands::Completions { .. } => Some("completions"),
             Commands::Plan { cases: Some(_), .. } => Some("plan --cases"),
             _ => None,
@@ -1397,13 +1229,7 @@ impl Commands {
                 command: SplitCommand::Run { format, .. },
             } => *format = SplitOutputFormat::Json,
             Commands::Split { .. } => {}
-            Commands::Release {
-                command:
-                    ReleaseCommand::Run { format, .. }
-                    | ReleaseCommand::Check { format, .. }
-                    | ReleaseCommand::Status { format, .. },
-            } => *format = TextJsonOutputFormat::Json,
-            Commands::Release { .. } => {}
+            Commands::Release(args) => args.format = TextJsonOutputFormat::Json,
             Commands::Change {
                 command:
                     ChangeCommand::Add { format, .. }

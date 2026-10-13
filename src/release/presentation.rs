@@ -1,22 +1,11 @@
 //! Captured changelog and forge presentation for a release plan.
 
-use crate::config::ReleaseConfig;
 use crate::error::{RailError, RailResult};
 use crate::release::planner::CrateReleasePlan;
 use crate::source::ContentDigest;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-/// A captured manual release-note input.
-pub struct ReleaseNoteInput {
-    /// Workspace-relative source path.
-    pub path: PathBuf,
-    /// SHA-256 digest of the source bytes.
-    pub digest: String,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,10 +29,8 @@ pub struct PlannedPresentation {
     pub date: String,
     /// Optional exact changelog mutation.
     pub changelog: Option<PlannedChangelog>,
-    /// Forge release body.
+    /// GitHub release body: the changelog section for this version.
     pub release_notes: String,
-    /// Manual inputs used for the body.
-    pub note_inputs: Vec<ReleaseNoteInput>,
 }
 
 pub(crate) fn read_optional(root: &Path, path: &Path) -> RailResult<Option<String>> {
@@ -118,7 +105,6 @@ pub(crate) fn validate_entry(body: &str) -> RailResult<()> {
 
 pub(crate) fn capture(
     root: &Path,
-    config: &ReleaseConfig,
     plan: &CrateReleasePlan,
     date: &str,
     github: Option<&(String, String)>,
@@ -160,81 +146,11 @@ pub(crate) fn capture(
     } else {
         None
     };
-    let mut release_notes = plan.changelog_body.clone();
-    let mut release_note_inputs = Vec::new();
-    let notes_dir = root.join(&config.release_notes_dir);
-    for candidate in [
-        notes_dir.join(format!("{}.md", plan.new_version)),
-        notes_dir.join(format!("{}.md", plan.tag_name)),
-    ] {
-        if let Ok(bytes) = fs::read(&candidate) {
-            let text = String::from_utf8(bytes.clone())
-                .map_err(|_| RailError::message(format!("release notes {} are not UTF-8", candidate.display())))?;
-            release_notes = text;
-            release_note_inputs.push(ReleaseNoteInput {
-                path: candidate,
-                digest: ContentDigest::sha256(&bytes).to_string(),
-            });
-            break;
-        }
-    }
     Ok(PlannedPresentation {
         date: date.to_string(),
         changelog,
-        release_notes,
-        note_inputs: release_note_inputs,
+        release_notes: plan.changelog_body.clone(),
     })
-}
-
-pub(crate) fn validate_inputs(root: &Path, plan: &CrateReleasePlan) -> RailResult<()> {
-    let Some(presentation) = &plan.presentation else {
-        return Err(RailError::message("release has no captured presentation"));
-    };
-    if let Some(changelog) = &presentation.changelog {
-        let current = read_optional(root, &changelog.path)?;
-        let digest = current
-            .as_ref()
-            .map(|s| ContentDigest::sha256(s.as_bytes()).to_string());
-        if digest != changelog.before_digest && digest != Some(changelog.after_digest.clone()) {
-            return Err(RailError::message(format!(
-                "changelog changed since release plan capture: {}",
-                changelog.path.display()
-            )));
-        }
-    }
-    for input in &presentation.note_inputs {
-        let bytes = fs::read(&input.path)
-            .map_err(|e| RailError::message(format!("failed to read {}: {e}", input.path.display())))?;
-        if ContentDigest::sha256(&bytes).to_string() != input.digest {
-            return Err(RailError::message(format!(
-                "release notes changed since release plan capture: {}",
-                input.path.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn apply_changelog(root: &Path, path: &Path, write: &PlannedChangelog) -> RailResult<()> {
-    let full = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    };
-    if full
-        != if write.path.is_absolute() {
-            write.path.clone()
-        } else {
-            root.join(&write.path)
-        }
-    {
-        return Err(RailError::message("changelog presentation path mismatch"));
-    }
-    if let Some(parent) = full.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| RailError::message(format!("failed to create {}: {e}", parent.display())))?;
-    }
-    crate::utils::write_file_atomic(&full, write.content.as_bytes())
 }
 
 #[cfg(test)]

@@ -40,7 +40,7 @@ pub use change::{ChangeCheckOptions, run_change_add, run_change_check, run_chang
 pub use clean::{CleanContext, run_clean};
 #[doc(hidden)]
 pub use cli::{
-    CacheCommand, CacheScope, ChangeCommand, Commands, DoctorCommand, RailCli, ReleaseCommand, SplitCommand,
+    CacheCommand, CacheScope, ChangeCommand, Commands, DoctorCommand, RailCli, ReleaseArgs, SplitCommand,
     generate_completions,
 };
 pub use common::{ChangeOutputFormat, SplitOutputFormat, SurfaceOutputFormat, TextJsonOutputFormat};
@@ -50,10 +50,7 @@ pub use config::{
 pub use doctor::run_native_cache_doctor;
 pub use init::{run_init, run_init_standalone};
 pub use plan::{PlanOptions, run_plan};
-pub use release::{
-    run_release_init, run_release_plan, run_release_publication_check, run_release_publish,
-    run_release_status_standalone,
-};
+pub use release::run_release;
 pub use split::{run_split, run_split_init};
 pub use surface::{SurfaceOptions, run_surface};
 pub use sync::run_sync;
@@ -313,7 +310,6 @@ pub fn try_dispatch_pre_context(
             prune_backups,
             all_backups,
             reports,
-            release_journal,
             check,
             format,
         } => {
@@ -326,7 +322,6 @@ pub fn try_dispatch_pre_context(
                     prune_backups,
                     all_backups,
                     reports,
-                    release_journal,
                     check,
                     format,
                 },
@@ -412,83 +407,6 @@ pub fn try_dispatch_pre_context(
                 }
             }
             Ok(PreContextDispatch::Handled)
-        }
-
-        Commands::Release {
-            command: cli::ReleaseCommand::Record { command },
-        } => {
-            let result = match command {
-                cli::ReleaseRecordCommand::Inspect { transaction } => {
-                    let path = crate::release::state::resolve_active(workspace_root, Some(&transaction))?;
-                    serde_json::to_value(crate::release::state::ReleaseState::load(&path)?)?
-                }
-                cli::ReleaseRecordCommand::Store { transaction } => {
-                    crate::release::transfer::store(workspace_root, &transaction)?
-                }
-                cli::ReleaseRecordCommand::Fetch { transaction } => {
-                    crate::release::transfer::fetch(workspace_root, transaction.as_deref())?
-                }
-                cli::ReleaseRecordCommand::Export { transaction, directory } => {
-                    crate::release::transfer::export(workspace_root, &transaction, &directory)?
-                }
-                cli::ReleaseRecordCommand::Import {
-                    directory,
-                    intent,
-                    source,
-                } => crate::release::transfer::import(workspace_root, &directory, &intent, &source)?,
-            };
-            println!("{}", serde_json::to_string(&result)?);
-            Ok(PreContextDispatch::Handled)
-        }
-
-        Commands::Release {
-            command: cli::ReleaseCommand::Status { state, history, format },
-        } => {
-            release::run_release_status_standalone(workspace_root, state.as_deref(), history, format)?;
-            Ok(PreContextDispatch::Handled)
-        }
-
-        Commands::Release {
-            command: cli::ReleaseCommand::Resume { transaction, executor },
-        } => {
-            crate::release::hosted::refresh(workspace_root, transaction.as_deref())?;
-            let state = crate::release::state::resolve_active(workspace_root, transaction.as_deref())?;
-            let retained = crate::release::state::ReleaseState::load(&state)?;
-            if executor {
-                crate::release::hosted::checkout(workspace_root, &retained)?;
-            }
-            if !retained.intent.hosted || executor {
-                crate::release::state::prepare_recovery(workspace_root, &state)?;
-            }
-            Ok(PreContextDispatch::NeedsContext(PreparedContext::new(
-                Commands::Release {
-                    command: cli::ReleaseCommand::Resume { transaction, executor },
-                },
-                config_override,
-            )?))
-        }
-
-        Commands::Release {
-            command:
-                cli::ReleaseCommand::Abort {
-                    transaction,
-                    retain_preparation,
-                    yes,
-                },
-        } => {
-            crate::release::hosted::refresh(workspace_root, transaction.as_deref())?;
-            let state = crate::release::state::resolve_active(workspace_root, transaction.as_deref())?;
-            crate::release::state::prepare_recovery(workspace_root, &state)?;
-            Ok(PreContextDispatch::NeedsContext(PreparedContext::new(
-                Commands::Release {
-                    command: cli::ReleaseCommand::Abort {
-                        transaction,
-                        retain_preparation,
-                        yes,
-                    },
-                },
-                config_override,
-            )?))
         }
 
         other => Ok(PreContextDispatch::NeedsContext(PreparedContext::new(
@@ -699,103 +617,7 @@ pub fn dispatch(cmd: Commands, ctx: &WorkspaceContext, prepared_plan: Option<Pla
             ),
         },
 
-        Commands::Release { command } => match command {
-            cli::ReleaseCommand::Init { crate_names, dry_run } => {
-                let crates = if crate_names.is_empty() {
-                    None
-                } else {
-                    Some(crate_names)
-                };
-                run_release_init(ctx, crates, dry_run)
-            }
-            cli::ReleaseCommand::Run {
-                crate_names,
-                all,
-                bump,
-                plan,
-                publish,
-                skip_tag,
-                pr,
-                local,
-                executor,
-                prepare,
-                retain_remote,
-                include_dependents,
-                yes,
-                allow_non_default_branch,
-                format,
-            } => {
-                let names = if all || crate_names.is_empty() {
-                    None
-                } else {
-                    Some(crate_names)
-                };
-
-                run_release_publish(
-                    ctx,
-                    release::ReleasePublishArgs {
-                        crate_names: names,
-                        all,
-                        bump,
-                        publish,
-                        skip_tag,
-                        pr,
-                        local,
-                        executor,
-                        prepare,
-                        retain_remote,
-                        include_dependents,
-                        yes,
-                        allow_non_default_branch,
-                        plan_path: plan,
-                        format,
-                    },
-                )
-            }
-            cli::ReleaseCommand::Check {
-                crate_names,
-                all,
-                bump,
-                publication,
-                extended,
-                skip_tag,
-                include_dependents,
-                format,
-            } => {
-                let names = if all || crate_names.is_empty() {
-                    None
-                } else {
-                    Some(crate_names)
-                };
-                if publication {
-                    release::run_release_publication_check_with_plan_inputs(
-                        ctx,
-                        release::ReleasePublicationCheckArgs {
-                            crate_names: names,
-                            all,
-                            bump,
-                            extended,
-                            skip_tag,
-                            include_dependents,
-                            format,
-                        },
-                    )
-                } else {
-                    run_release_plan(ctx, names, bump, extended, skip_tag, include_dependents, format)
-                }
-            }
-            cli::ReleaseCommand::Resume { transaction, executor } => {
-                release::run_release_resume(ctx, transaction.as_deref(), executor)
-            }
-            cli::ReleaseCommand::Status { .. } | cli::ReleaseCommand::Record { .. } => Err(
-                crate::error::RailError::message("release status reached workspace dispatch"),
-            ),
-            cli::ReleaseCommand::Abort {
-                transaction,
-                retain_preparation,
-                yes,
-            } => release::run_release_abort_with_options(ctx, transaction.as_deref(), retain_preparation, yes),
-        },
+        Commands::Release(args) => run_release(ctx, args),
 
         // Clean
         Commands::Clean { .. } => Err(crate::error::RailError::message(

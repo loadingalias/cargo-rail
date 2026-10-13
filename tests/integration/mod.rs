@@ -18,7 +18,6 @@ mod test_output_snapshots;
 mod test_ownership_index;
 mod test_plan;
 mod test_plan_apply;
-mod test_release_cargo;
 mod test_release_changelog;
 mod test_release_workspace;
 mod test_resolution_view;

@@ -69,13 +69,6 @@ pub(crate) fn remove_release_credentials(command: &mut Command) {
     }
 }
 
-/// Return true if command invocation succeeds with a zero exit status.
-pub(crate) fn succeeds(program: &str, args: &[&str], current_dir: Option<&Path>) -> bool {
-    run(program, args, current_dir)
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

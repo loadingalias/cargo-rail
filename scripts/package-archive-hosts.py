@@ -1,4 +1,4 @@
-"""Declare the archive hosts from the release artifact inventory."""
+"""Declare the archive hosts from the release asset inventory."""
 
 import hashlib
 import json
@@ -11,13 +11,13 @@ NAME = 'cargo-rail-archive-hosts-v1.json'
 
 def archive_hosts(root):
     config = tomllib.loads((root / '.config/rail.toml').read_text())
-    files = config['release']['artifacts']['cargo-rail']['files']
+    files = config['release']['assets']['cargo-rail']
     archives = {}
-    for name, item in files.items():
-        if 'target' not in item:
+    for name in files:
+        if not (name.startswith('cargo-rail-') and name.endswith('.zip')):
             continue
-        host = item['target']
-        if name != f'cargo-rail-{host}.zip' or host in archives:
+        host = name.removeprefix('cargo-rail-').removesuffix('.zip')
+        if not host or host in archives:
             raise ValueError(f'archive inventory has an ambiguous host: {name}')
         archives[host] = name
     if not archives or NAME not in files:

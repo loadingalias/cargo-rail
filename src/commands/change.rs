@@ -194,7 +194,11 @@ pub fn run_change_check(ctx: &WorkspaceContext, options: ChangeCheckOptions) -> 
     let workspace_members = ctx.graph().workspace_members();
     let base = resolve_change_check_base(ctx, &options)?;
     let pending = PendingChangeSet::load(ctx.workspace_root(), &release_config.change_dir, workspace_members)?;
-    let changed_code_crates = changed_code_crates(ctx, base.as_deref())?;
+    // Only crates a release manages need reviewed release intent.
+    let changed_code_crates = changed_code_crates(ctx, base.as_deref())?
+        .into_iter()
+        .filter(|crate_name| release_config.is_release_crate(crate_name))
+        .collect::<Vec<_>>();
     let covered_crates: Vec<_> = changed_code_crates
         .iter()
         .filter(|crate_name| pending.covers(crate_name))

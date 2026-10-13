@@ -1,4 +1,4 @@
-//! Release configuration - controls release management behavior
+//! Release configuration: which crates a release manages and where its effects go.
 
 use crate::config::unify::default_true;
 use crate::error::ConfigError;
@@ -10,59 +10,47 @@ use std::path::{Component, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseConfig {
-    /// Require change files to cover released crates in commit workflows.
+    /// Crates a release manages (default: every workspace member).
     ///
-    /// Changes mode always requires repository-wide coverage. In commit
-    /// workflows:
-    /// - `false` (default): change files are optional
-    /// - `true`: every released crate with code changes needs a covering change file
-    /// - `["crate-a", ...]`: only the listed crates are gated
-    #[serde(default)]
-    pub require_change_files: RequireChangeFiles,
-
-    /// Handling for commits that do not parse as conventional (default: "warn").
-    ///
-    /// Ignored when `source = "changes"`.
-    /// - "allow": ignore silently
-    /// - "warn": report in `release check` and plan output
-    /// - "deny": fail `release check` when the release range contains them
-    #[serde(default)]
-    pub unconventional_commits: CommitPolicy,
-
-    /// Directory containing manual release note overrides.
-    ///
-    /// If `release-notes/v1.2.3.md` or `release-notes/<tag>.md` exists, cargo-rail
-    /// uses it as the forge release body instead of generated changelog text.
-    #[serde(default = "default_release_notes_dir")]
-    pub release_notes_dir: String,
-
-    /// If true, require release notes for the target version before publishing/tagging.
-    ///
-    /// This preflight check fails release apply when generated changelog entries are empty
-    /// and no existing `## [<version>]` section exists in the crate's changelog.
-    #[serde(default = "default_true")]
-    pub require_release_notes: bool,
+    /// `change check` requires change-file coverage only for these crates,
+    /// so tooling crates that are never released need no change files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crates: Option<Vec<String>>,
 
     /// Authoritative source for release bump selection and changelog prose.
     #[serde(default)]
     pub source: ReleaseSource,
 
-    /// Git tag prefix (default: "v")
-    #[serde(default = "default_tag_prefix")]
-    pub tag_prefix: String,
+    /// Handling for commits that do not parse as conventional (default: "warn").
+    ///
+    /// Ignored when `source = "changes"`.
+    /// - "allow": ignore silently
+    /// - "warn": report in the release preview
+    /// - "deny": stop the release when its range contains them
+    #[serde(default)]
+    pub unconventional_commits: CommitPolicy,
 
-    /// Tag format template (default: "{crate}-{prefix}{version}").
-    /// Variables: {crate}, {prefix}, {version}
+    /// Tag format template (default: "{crate}-v{version}").
+    /// Variables: {crate}, {version}
     #[serde(default = "default_tag_format")]
     pub tag_format: String,
 
-    /// Authorized remote effects after local release preparation.
+    /// Package registry that receives releases (default: "crates-io").
+    ///
+    /// "none" keeps releases to Git tags and GitHub releases. Any other value names a
+    /// Cargo-configured registry with a sparse index. Each crate's own `package.publish`
+    /// still decides whether it may publish there.
     #[serde(default)]
-    pub remote_effects: ReleaseRemoteEffects,
+    pub publish: ReleasePublish,
 
-    /// Registry publication authority, separate from Git and forge effects.
-    #[serde(default)]
-    pub registry_publication: ReleaseRegistryPublication,
+    /// Create a GitHub release for each tag (default: true when `origin` is on GitHub).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_release: Option<bool>,
+
+    /// What must be green on the source commit before the first release effect
+    /// (default: "all" when `origin` is on GitHub, otherwise "none").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<ReleaseChecks>,
 
     /// Sign git tags with GPG/SSH (default: false)
     #[serde(default)]
@@ -92,19 +80,24 @@ pub struct ReleaseConfig {
     #[serde(default)]
     pub semver_check: SemverCheckPolicy,
 
-    /// Required GitHub workflow paths and the job names that must succeed for the release commit.
+    /// Complete GitHub release asset inventories, keyed by crate.
+    ///
+    /// A crate with assets gets a draft release; it is published, and the crate uploaded to its
+    /// registry, only after every listed file is attached to the draft.
+    /// Names may use `{crate}` and `{version}`.
     #[serde(default)]
-    pub validation: BTreeMap<String, Vec<String>>,
+    pub assets: BTreeMap<String, Vec<String>>,
 
-    /// GitHub workflow that executes durable release requests; omission selects local execution.
+    /// Whether each asset must carry a GitHub artifact attestation from this repository's
+    /// workflows, made from the release commit (default: "required").
+    ///
+    /// "off" accepts unattested assets, for private repositories whose GitHub plan cannot attest.
     #[serde(default)]
-    pub hosted_workflow: Option<String>,
+    pub asset_attestations: AssetAttestations,
 
-    /// Complete native asset inventories, keyed by released package name.
-    #[serde(default)]
-    pub artifacts: BTreeMap<String, ReleaseArtifacts>,
-
-    /// Explicit mutable tag aliases, promoted only after their immutable forge release is verified.
+    /// Mutable tag aliases moved to a crate's release after its GitHub release is published.
+    ///
+    /// Values may use `{major}` and `{minor}`, such as `"v{major}"`.
     #[serde(default)]
     pub aliases: BTreeMap<String, String>,
 
@@ -131,22 +124,19 @@ pub struct ReleaseConfig {
 impl Default for ReleaseConfig {
     fn default() -> Self {
         Self {
-            require_change_files: RequireChangeFiles::default(),
-            unconventional_commits: CommitPolicy::default(),
-            release_notes_dir: default_release_notes_dir(),
-            require_release_notes: true,
+            crates: None,
             source: ReleaseSource::default(),
-            tag_prefix: default_tag_prefix(),
+            unconventional_commits: CommitPolicy::default(),
             tag_format: default_tag_format(),
-            remote_effects: ReleaseRemoteEffects::default(),
-            registry_publication: ReleaseRegistryPublication::default(),
+            publish: ReleasePublish::default(),
+            github_release: None,
+            checks: None,
             sign_tags: false,
             change_dir: default_change_dir(),
             pre_1_breaking_bump: Pre1BreakingBump::default(),
             semver_check: SemverCheckPolicy::default(),
-            validation: BTreeMap::new(),
-            hosted_workflow: None,
-            artifacts: BTreeMap::new(),
+            assets: BTreeMap::new(),
+            asset_attestations: AssetAttestations::default(),
             aliases: BTreeMap::new(),
             version_groups: BTreeMap::new(),
             auxiliary_cargo_manifests: Vec::new(),
@@ -155,26 +145,69 @@ impl Default for ReleaseConfig {
     }
 }
 
-/// A package's artifact producer and complete flat release-file inventory.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReleaseArtifacts {
-    /// Workflow path also declared in `release.validation`.
-    pub workflow: String,
-    /// Asset filename templates; supported variables are `{crate}` and `{version}`.
-    pub files: BTreeMap<String, ReleaseAsset>,
+/// The package registry that receives releases.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum ReleasePublish {
+    /// crates.io.
+    #[default]
+    CratesIo,
+    /// No registry; releases are Git tags and GitHub releases.
+    None,
+    /// A registry configured in Cargo under `[registries.NAME]`.
+    Registry(String),
 }
 
-/// One required release asset supplied by the authorized producer.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReleaseAsset {
-    /// Target triple asserted by the product's build and package validation job.
-    #[serde(default)]
-    pub target: Option<String>,
-    /// Optional Git-root-relative regular file whose committed bytes must match this asset.
-    #[serde(default)]
-    pub source: Option<String>,
+impl From<String> for ReleasePublish {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "crates-io" => Self::CratesIo,
+            "none" => Self::None,
+            _ => Self::Registry(value),
+        }
+    }
+}
+
+impl From<ReleasePublish> for String {
+    fn from(value: ReleasePublish) -> Self {
+        match value {
+            ReleasePublish::CratesIo => "crates-io".to_owned(),
+            ReleasePublish::None => "none".to_owned(),
+            ReleasePublish::Registry(name) => name,
+        }
+    }
+}
+
+impl ReleasePublish {
+    /// The Cargo registry name, or `None` when releases do not publish.
+    pub fn registry(&self) -> Option<&str> {
+        match self {
+            Self::CratesIo => Some("crates-io"),
+            Self::None => None,
+            Self::Registry(name) => Some(name),
+        }
+    }
+}
+
+/// Whether release assets must prove where they were built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AssetAttestations {
+    /// Every asset carries an attestation from this repository's workflow at the release commit.
+    #[default]
+    Required,
+    /// Assets need only be present and intact.
+    Off,
+}
+
+/// Which checks gate the first release effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleaseChecks {
+    /// Every check run and commit status GitHub reports on the source commit must succeed.
+    All,
+    /// No gate.
+    None,
 }
 
 /// Authoritative input used to select releases and render changelogs.
@@ -202,10 +235,68 @@ impl ReleaseSource {
     }
 }
 
+/// Placeholders a tag format may use.
+const TAG_FORMAT_PLACEHOLDERS: &[&str] = &["{crate}", "{version}"];
+/// Placeholders an alias may use.
+const ALIAS_PLACEHOLDERS: &[&str] = &["{major}", "{minor}"];
+/// Upper bound on one crate's GitHub release asset inventory.
+const MAX_ASSETS: usize = 64;
+
 impl ReleaseConfig {
+    /// Whether `crate_name` is a crate this release manages.
+    pub fn is_release_crate(&self, crate_name: &str) -> bool {
+        self.crates
+            .as_ref()
+            .is_none_or(|crates| crates.iter().any(|name| name == crate_name))
+    }
+
     /// Whether code changes in this crate require reviewed coverage.
     pub fn requires_change_file(&self, crate_name: &str) -> bool {
-        self.source == ReleaseSource::Changes || self.require_change_files.applies_to(crate_name)
+        self.source == ReleaseSource::Changes && self.is_release_crate(crate_name)
+    }
+
+    /// Whether this release creates GitHub releases for an origin on (or off) GitHub.
+    pub fn creates_github_release(&self, github_origin: bool) -> Result<bool, ConfigError> {
+        match self.github_release {
+            Some(true) if !github_origin => Err(ConfigError::InvalidField {
+                field: "release.github_release".to_owned(),
+                reason: "origin is not a GitHub repository".to_owned(),
+            }),
+            Some(enabled) => Ok(enabled),
+            None => Ok(github_origin),
+        }
+    }
+
+    /// The effective checks gate for an origin on (or off) GitHub.
+    pub fn effective_checks(&self, github_origin: bool) -> Result<ReleaseChecks, ConfigError> {
+        match self.checks {
+            Some(ReleaseChecks::All) if !github_origin => Err(ConfigError::InvalidField {
+                field: "release.checks".to_owned(),
+                reason: "checks are read from GitHub, but origin is not a GitHub repository".to_owned(),
+            }),
+            Some(checks) => Ok(checks),
+            None if github_origin => Ok(ReleaseChecks::All),
+            None => Ok(ReleaseChecks::None),
+        }
+    }
+
+    /// The asset file names configured for `crate_name` at `version`.
+    pub fn assets_for(&self, crate_name: &str, version: &semver::Version) -> Vec<String> {
+        self.assets.get(crate_name).map_or_else(Vec::new, |files| {
+            files
+                .iter()
+                .map(|file| render_tag_template(file, crate_name, &version.to_string()))
+                .collect()
+        })
+    }
+
+    /// Render the tag alias configured for `crate_name` at `version`.
+    pub fn alias_for(&self, crate_name: &str, version: &semver::Version) -> Option<String> {
+        self.aliases.get(crate_name).map(|alias| {
+            alias
+                .replace("{major}", &version.major.to_string())
+                .replace("{minor}", &version.minor.to_string())
+        })
     }
 
     /// Validate the release configuration
@@ -214,124 +305,109 @@ impl ReleaseConfig {
 
         self.validate_policy()?;
 
-        // Check for recommended placeholders in monorepo context
-        let is_monorepo = workspace_members.len() > 1;
-        if is_monorepo && !self.tag_format.contains("{crate}") {
-            warnings.push(
-                "release.tag_format does not contain {crate} placeholder. \
-                In monorepos, this may cause tag collisions between crates."
-                    .to_string(),
-            );
+        let known = |field: &str, names: Vec<&String>| {
+            names
+                .into_iter()
+                .find(|name| !workspace_members.contains(name))
+                .map_or(Ok(()), |name| {
+                    Err(ConfigError::InvalidField {
+                        field: field.to_owned(),
+                        reason: format!("unknown workspace crate '{name}'"),
+                    })
+                })
+        };
+        if let Some(crates) = &self.crates {
+            known("release.crates", crates.iter().collect())?;
         }
-
-        if !self.tag_format.contains("{version}") && !self.tag_format.contains("{prefix}") {
-            warnings.push(
-                "release.tag_format does not contain {version} or {prefix} placeholder. \
-                Tags may not be identifiable."
-                    .to_string(),
-            );
-        }
-
-        if let RequireChangeFiles::Crates(crates) = &self.require_change_files {
-            for name in crates {
-                if !workspace_members.contains(name) {
-                    warnings.push(format!("release.require_change_files contains unknown crate '{name}'"));
-                }
-            }
-        }
-
-        if self.aliases.keys().any(|package| !workspace_members.contains(package)) {
+        known("release.assets", self.assets.keys().collect())?;
+        known("release.aliases", self.aliases.keys().collect())?;
+        if let Some(name) = self.assets.keys().find(|name| !self.is_release_crate(name)) {
             return Err(ConfigError::InvalidField {
-                field: "release.aliases".into(),
-                reason: "aliases must name workspace packages".into(),
+                field: "release.assets".to_owned(),
+                reason: format!("'{name}' is not listed in release.crates"),
             });
         }
-        self.validate_version_groups(workspace_members)?;
-        for name in self.artifacts.keys() {
-            if !workspace_members.contains(name) {
-                return Err(ConfigError::InvalidField {
-                    field: "release.artifacts".to_owned(),
-                    reason: format!("artifact inventory names unknown package '{name}'"),
-                });
-            }
+        if let Some(name) = self.aliases.keys().find(|name| !self.is_release_crate(name)) {
+            return Err(ConfigError::InvalidField {
+                field: "release.aliases".to_owned(),
+                reason: format!("'{name}' is not listed in release.crates"),
+            });
         }
+
+        // Check for recommended placeholders in monorepo context
+        let released = workspace_members
+            .iter()
+            .filter(|name| self.is_release_crate(name))
+            .count();
+        if released > 1 && !self.tag_format.contains("{crate}") {
+            warnings.push(
+                "release.tag_format does not contain {crate}; in a workspace that releases several crates, \
+                 two crates at one version would need the same tag"
+                    .to_string(),
+            );
+        }
+        self.validate_version_groups(workspace_members)?;
 
         Ok(warnings)
     }
 
     pub(crate) fn validate_policy(&self) -> Result<(), ConfigError> {
-        // Validate tag_format
-        if self.tag_format.trim().is_empty() {
+        validate_tag_format("release.tag_format", &self.tag_format)?;
+        if let ReleasePublish::Registry(name) = &self.publish
+            && !valid_registry_name(name)
+        {
             return Err(ConfigError::InvalidField {
-                field: "release.tag_format".to_string(),
-                reason: "tag_format cannot be empty".to_string(),
+                field: "release.publish".to_owned(),
+                reason: format!("'{name}' is not \"crates-io\", \"none\", or a Cargo registry name"),
             });
         }
-
         validate_change_dir(&self.change_dir)?;
-        if let Some(reason) = crate::release::change_files::change_dir_validation_error(&self.release_notes_dir) {
-            return Err(ConfigError::InvalidField {
-                field: "release.release_notes_dir".to_string(),
-                reason: reason.to_string(),
-            });
-        }
         self.changelog.filters.validate("release.changelog.filters")?;
         self.validate_auxiliary_cargo_manifests()?;
-        crate::release::artifacts::validate_config(self).map_err(|error| ConfigError::InvalidField {
-            field: "release.artifacts".to_owned(),
-            reason: error.to_string(),
-        })?;
-        if self.aliases.values().any(|alias| {
-            alias.is_empty()
-                || alias.len() > 128
-                || alias.contains("..")
-                || alias.ends_with('.')
-                || alias.ends_with(".lock")
-                || !alias.as_bytes()[0].is_ascii_alphanumeric()
-                || !alias
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        }) || self.aliases.values().collect::<std::collections::BTreeSet<_>>().len() != self.aliases.len()
+        if let Some(crates) = &self.crates
+            && (crates.is_empty() || crates.iter().collect::<std::collections::BTreeSet<_>>().len() != crates.len())
+        {
+            return Err(ConfigError::InvalidField {
+                field: "release.crates".to_owned(),
+                reason: "must list at least one crate, each once".to_owned(),
+            });
+        }
+        for (name, files) in &self.assets {
+            if files.is_empty()
+                || files.len() > MAX_ASSETS
+                || files.iter().collect::<std::collections::BTreeSet<_>>().len() != files.len()
+                || files
+                    .iter()
+                    .any(|file| !valid_asset_name(&render_tag_template(file, "x", "1.0.0")))
+            {
+                return Err(ConfigError::InvalidField {
+                    field: format!("release.assets.{name}"),
+                    reason: format!(
+                        "must list 1 to {MAX_ASSETS} unique file names of letters, digits, '.', '_', '+', or '-'; \
+                         {{crate}} and {{version}} are the only placeholders"
+                    ),
+                });
+            }
+        }
+        let rendered = self
+            .aliases
+            .values()
+            .map(|alias| {
+                let mut rendered = alias.clone();
+                for placeholder in ALIAS_PLACEHOLDERS {
+                    rendered = rendered.replace(placeholder, "0");
+                }
+                rendered
+            })
+            .collect::<Vec<_>>();
+        if rendered.iter().any(|alias| !valid_tag_name(alias))
+            || self.aliases.values().collect::<std::collections::BTreeSet<_>>().len() != self.aliases.len()
         {
             return Err(ConfigError::InvalidField {
                 field: "release.aliases".into(),
-                reason: "aliases must be unique, bounded, pathless Git tag names".into(),
+                reason: "aliases must be unique, bounded, pathless Git tag names; {major} and {minor} are the only placeholders"
+                    .into(),
             });
-        }
-        if let Some(workflow) = &self.hosted_workflow
-            && (!workflow.starts_with(".github/workflows/")
-                || workflow.split('/').count() != 3
-                || !matches!(workflow.rsplit('.').next(), Some("yml" | "yaml"))
-                || !workflow
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'/' | b'_' | b'-'))
-                || self.validation.contains_key(workflow)
-                || !self.remote_effects.pushes())
-        {
-            return Err(ConfigError::InvalidField {
-                field: "release.hosted_workflow".into(),
-                reason: "must name a separate GitHub workflow and authorize Git push effects".into(),
-            });
-        }
-        for (workflow, jobs) in &self.validation {
-            if !workflow.starts_with(".github/workflows/")
-                || !matches!(workflow.rsplit('.').next(), Some("yml" | "yaml"))
-                || workflow.split('/').count() != 3
-                || workflow
-                    .bytes()
-                    .any(|byte| byte.is_ascii_control() || matches!(byte, b'\\' | b':' | b'?' | b'#' | b'%'))
-                || jobs.is_empty()
-                || jobs
-                    .iter()
-                    .any(|job| job.trim().is_empty() || job.chars().any(char::is_control))
-                || jobs.iter().collect::<std::collections::BTreeSet<_>>().len() != jobs.len()
-            {
-                return Err(ConfigError::InvalidField {
-                    field: "release.validation".to_owned(),
-                    reason: "each workflow must name one .github/workflows YAML file and unique required job names"
-                        .to_owned(),
-                });
-            }
         }
         Ok(())
     }
@@ -405,6 +481,75 @@ impl ReleaseConfig {
     }
 }
 
+/// Replace `{crate}` and `{version}` in a tag or asset template.
+pub(crate) fn render_tag_template(template: &str, crate_name: &str, version: &str) -> String {
+    let mut rendered = template.to_owned();
+    for (placeholder, value) in TAG_FORMAT_PLACEHOLDERS.iter().zip([crate_name, version]) {
+        rendered = rendered.replace(placeholder, value);
+    }
+    rendered
+}
+
+/// Validate a tag format: it names `{version}` and uses no other placeholder than `{crate}`.
+pub(crate) fn validate_tag_format(field: &str, format: &str) -> Result<(), ConfigError> {
+    let mut rest = format.to_owned();
+    for placeholder in TAG_FORMAT_PLACEHOLDERS {
+        rest = rest.replace(placeholder, "x");
+    }
+    let reason = if format.trim().is_empty() {
+        Some("tag_format cannot be empty")
+    } else if format.contains("{prefix}") {
+        Some(
+            "{prefix} was removed in Cargo-Rail 0.32.0; write the prefix literally, such as \"{crate}-v{version}\"; `cargo rail config migrate` rewrites it",
+        )
+    } else if !format.contains("{version}") {
+        Some("must contain {version}")
+    } else if rest.contains(['{', '}']) || !valid_tag_name(&rest) {
+        Some("must render a valid Git tag name; the only placeholders are {crate} and {version}")
+    } else {
+        None
+    };
+    reason.map_or(Ok(()), |reason| {
+        Err(ConfigError::InvalidField {
+            field: field.to_owned(),
+            reason: reason.to_owned(),
+        })
+    })
+}
+
+/// A bounded Git tag name without path separators, matching what `check-ref-format` accepts here.
+fn valid_tag_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.contains("..")
+        && !name.ends_with('.')
+        && !name.ends_with(".lock")
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+'))
+}
+
+/// A Cargo registry name: what `[registries.NAME]` accepts.
+fn valid_registry_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.as_bytes()[0].is_ascii_alphabetic()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+/// A release asset file name GitHub stores unchanged.
+fn valid_asset_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-'))
+}
+
 /// How `--bump auto` maps breaking changes on pre-1.0 versions
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -425,7 +570,7 @@ pub enum CommitPolicy {
     /// Report as diagnostics (default)
     #[default]
     Warn,
-    /// Fail `release check`
+    /// Fail the release
     Deny,
 }
 
@@ -440,101 +585,6 @@ pub enum SemverCheckPolicy {
     Warn,
     /// Also block release when required API evidence is unavailable
     Deny,
-}
-
-/// Remote effects authorized after local release preparation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ReleaseRemoteEffects {
-    /// Keep release effects local.
-    #[default]
-    None,
-    /// Push the release commit and tags without creating a forge release.
-    Push,
-    /// Push and detect the forge provider from `origin`.
-    Auto,
-    /// Push and create a GitHub release via `gh`.
-    Github,
-    /// Push and create a GitLab release via `glab`.
-    Gitlab,
-}
-
-/// Registry publication authority for release execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ReleaseRegistryPublication {
-    /// Do not authorize publication to any package registry.
-    #[default]
-    None,
-    /// Permit a matching `--publish` invocation to publish to crates.io.
-    CratesIo,
-}
-
-impl ReleaseRegistryPublication {
-    /// Exact registry identity authorized by this policy.
-    pub const fn registry(self) -> Option<&'static str> {
-        match self {
-            Self::None => None,
-            Self::CratesIo => Some("crates-io"),
-        }
-    }
-}
-
-impl ReleaseRemoteEffects {
-    /// Stable configuration spelling used in durable release trailers.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Push => "push",
-            Self::Auto => "auto",
-            Self::Github => "github",
-            Self::Gitlab => "gitlab",
-        }
-    }
-
-    /// Whether the policy authorizes pushing the release commit and tags.
-    pub const fn pushes(self) -> bool {
-        !matches!(self, Self::None)
-    }
-
-    /// Whether the policy authorizes creating a forge release.
-    pub const fn creates_forge_release(self) -> bool {
-        matches!(self, Self::Auto | Self::Github | Self::Gitlab)
-    }
-}
-
-/// Which crates require change-file coverage
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum RequireChangeFiles {
-    /// Gate all crates (true) or none (false)
-    All(bool),
-    /// Gate only the listed crates
-    Crates(Vec<String>),
-}
-
-impl Default for RequireChangeFiles {
-    fn default() -> Self {
-        Self::All(false)
-    }
-}
-
-impl RequireChangeFiles {
-    /// Whether the gate applies to `crate_name`
-    pub fn applies_to(&self, crate_name: &str) -> bool {
-        match self {
-            Self::All(enabled) => *enabled,
-            Self::Crates(crates) => crates.iter().any(|c| c == crate_name),
-        }
-    }
-
-    /// Whether the gate applies to any crate at all
-    pub fn is_enabled(&self) -> bool {
-        match self {
-            Self::All(enabled) => *enabled,
-            Self::Crates(crates) => !crates.is_empty(),
-        }
-    }
 }
 
 /// Changelog location and shape (`[release.changelog]`)
@@ -717,22 +767,12 @@ pub enum ChangelogRelativeTo {
 
 // Default Functions
 
-fn default_tag_prefix() -> String {
-    "v".to_string()
-}
-
 fn default_tag_format() -> String {
-    // Use {prefix} placeholder so tag_prefix is respected
-    // With default tag_prefix="v", this produces: crate-name-v1.0.0
-    "{crate}-{prefix}{version}".to_string()
+    "{crate}-v{version}".to_string()
 }
 
 fn default_changelog_path() -> String {
     "CHANGELOG.md".to_string()
-}
-
-fn default_release_notes_dir() -> String {
-    "release-notes".to_string()
 }
 
 fn default_change_dir() -> String {
@@ -808,31 +848,102 @@ mod tests {
     #[test]
     fn release_policy_defaults() {
         let config = ReleaseConfig::default();
-        assert_eq!(config.tag_format, "{crate}-{prefix}{version}");
+        assert_eq!(config.tag_format, "{crate}-v{version}");
         assert_eq!(config.pre_1_breaking_bump, Pre1BreakingBump::Minor);
         assert_eq!(config.semver_check, SemverCheckPolicy::Warn);
-        assert_eq!(config.remote_effects, ReleaseRemoteEffects::None);
-        assert_eq!(config.registry_publication, ReleaseRegistryPublication::None);
+        assert_eq!(config.publish, ReleasePublish::CratesIo);
         assert_eq!(config.change_dir, ".changes");
         assert!(config.version_groups.is_empty());
         assert!(config.auxiliary_cargo_manifests.is_empty());
+        assert!(config.is_release_crate("anything"));
     }
 
     #[test]
-    fn release_policies_parse() {
-        let toml = r#"
-      pre_1_breaking_bump = "major"
-      semver_check = "off"
-      change_dir = "changes"
-      remote_effects = "gitlab"
-      registry_publication = "crates-io"
-    "#;
-        let config: ReleaseConfig = toml_edit::de::from_str(toml).unwrap();
-        assert_eq!(config.pre_1_breaking_bump, Pre1BreakingBump::Major);
-        assert_eq!(config.semver_check, SemverCheckPolicy::Off);
-        assert_eq!(config.change_dir, "changes");
-        assert_eq!(config.remote_effects, ReleaseRemoteEffects::Gitlab);
-        assert_eq!(config.registry_publication, ReleaseRegistryPublication::CratesIo);
+    fn forge_defaults_follow_the_origin_and_explicit_github_policy_requires_github() {
+        let config = ReleaseConfig::default();
+        assert!(config.creates_github_release(true).unwrap());
+        assert!(!config.creates_github_release(false).unwrap());
+        assert_eq!(config.effective_checks(true).unwrap(), ReleaseChecks::All);
+        assert_eq!(config.effective_checks(false).unwrap(), ReleaseChecks::None);
+
+        let explicit: ReleaseConfig = toml_edit::de::from_str("github_release = true\nchecks = \"all\"").unwrap();
+        explicit.creates_github_release(false).unwrap_err();
+        explicit.effective_checks(false).unwrap_err();
+        let off: ReleaseConfig = toml_edit::de::from_str("github_release = false\nchecks = \"none\"").unwrap();
+        assert!(!off.creates_github_release(true).unwrap());
+        assert_eq!(off.effective_checks(true).unwrap(), ReleaseChecks::None);
+    }
+
+    #[test]
+    fn publish_names_crates_io_none_or_a_cargo_registry() {
+        for (value, expected) in [
+            ("crates-io", ReleasePublish::CratesIo),
+            ("none", ReleasePublish::None),
+            ("internal", ReleasePublish::Registry("internal".to_owned())),
+        ] {
+            let config: ReleaseConfig = toml_edit::de::from_str(&format!("publish = {value:?}")).unwrap();
+            assert_eq!(config.publish, expected);
+            config.validate_policy().unwrap();
+            assert_eq!(String::from(config.publish), value);
+        }
+        let invalid: ReleaseConfig = toml_edit::de::from_str("publish = \"not a registry\"").unwrap();
+        assert!(invalid.validate_policy().is_err());
+    }
+
+    #[test]
+    fn tag_formats_use_only_crate_and_version_and_retire_prefix() {
+        for valid in ["{crate}-v{version}", "v{version}", "release-{version}"] {
+            validate_tag_format("release.tag_format", valid).unwrap();
+        }
+        let retired = concat!("{crate}-{", "prefix}{version}");
+        let prefix = validate_tag_format("release.tag_format", retired).unwrap_err();
+        assert!(prefix.to_string().contains("config migrate"), "{prefix}");
+        for invalid in ["{crate}", "{crate}-{date}-{version}", "../{version}", "v {version}"] {
+            assert!(validate_tag_format("release.tag_format", invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn aliases_render_major_and_minor() {
+        let config: ReleaseConfig =
+            toml_edit::de::from_str("[aliases]\ncargo-rail-action = \"v{major}\"\nlib = \"v{major}.{minor}\"").unwrap();
+        config.validate_policy().unwrap();
+        let version = semver::Version::new(12, 3, 1);
+        assert_eq!(config.alias_for("cargo-rail-action", &version).as_deref(), Some("v12"));
+        assert_eq!(config.alias_for("lib", &version).as_deref(), Some("v12.3"));
+        assert_eq!(config.alias_for("other", &version), None);
+
+        let unknown: ReleaseConfig = toml_edit::de::from_str("[aliases]\nlib = \"v{patch}\"").unwrap();
+        assert!(unknown.validate_policy().is_err());
+    }
+
+    #[test]
+    fn release_crates_scope_change_coverage_assets_and_aliases() {
+        let members = ["app".to_owned(), "xtask".to_owned()];
+        let config: ReleaseConfig = toml_edit::de::from_str("crates = [\"app\"]").unwrap();
+        config.validate(&members).unwrap();
+        assert!(config.requires_change_file("app"));
+        assert!(!config.requires_change_file("xtask"));
+
+        let unknown: ReleaseConfig = toml_edit::de::from_str("crates = [\"ghost\"]").unwrap();
+        unknown.validate(&members).unwrap_err();
+        let unmanaged: ReleaseConfig =
+            toml_edit::de::from_str("crates = [\"app\"]\n[assets]\nxtask = [\"xtask.zip\"]").unwrap();
+        let error = unmanaged.validate(&members).unwrap_err();
+        assert!(error.to_string().contains("release.crates"), "{error}");
+        let empty: ReleaseConfig = toml_edit::de::from_str("crates = []").unwrap();
+        assert!(empty.validate_policy().is_err());
+    }
+
+    #[test]
+    fn asset_inventories_are_unique_flat_file_names() {
+        let valid: ReleaseConfig =
+            toml_edit::de::from_str("[assets]\napp = [\"app-x86_64-unknown-linux-gnu.zip\", \"SHA256SUMS\"]").unwrap();
+        valid.validate_policy().unwrap();
+        for invalid in ["[]", "[\"dir/app.zip\"]", "[\".hidden\"]", "[\"a.zip\", \"a.zip\"]"] {
+            let config: ReleaseConfig = toml_edit::de::from_str(&format!("[assets]\napp = {invalid}")).unwrap();
+            assert!(config.validate_policy().is_err(), "{invalid}");
+        }
     }
 
     #[test]

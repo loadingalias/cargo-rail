@@ -32,14 +32,14 @@ fn equivalent_current_configuration_keeps_policy_but_changes_source_binding() {
         let config = ws.path.join(".config/rail.toml");
         std::fs::write(
             &config,
-            "[unify.msrv_policy]\nmode = 'disabled'\n[release]\nremote_effects = 'push'\n",
+            "[unify.msrv_policy]\nmode = 'disabled'\n[release]\npublish = 'none'\n",
         )?;
         ws.commit("current policy")?;
         let before = plan(&ws, &["--since", "HEAD"])?;
         let saved = write_saved_plan(&ws, "old-policy.json", &before)?;
         std::fs::write(
             &config,
-            "[unify]\nmsrv_policy = { mode = 'disabled' }\n[release]\nremote_effects = 'push'\n",
+            "[unify]\nmsrv_policy = { mode = 'disabled' }\n[release]\npublish = 'none'\n",
         )?;
         let after = plan(&ws, &["--since", "HEAD"])?;
         assert_eq!(after["changes"]["config"], serde_json::json!([]));

@@ -17,9 +17,8 @@ class ArchiveHostsTests(unittest.TestCase):
             (root / '.config').mkdir()
             (root / 'Cargo.toml').write_text('[package]\nversion = "1.2.3"\n')
             (root / '.config/rail.toml').write_text(
-                '[release.artifacts.cargo-rail.files]\n'
-                '"cargo-rail-aarch64-apple-darwin.zip" = { target = "aarch64-apple-darwin" }\n'
-                '"cargo-rail-archive-hosts-v1.json" = {}\n'
+                '[release.assets]\n'
+                'cargo-rail = ["cargo-rail-aarch64-apple-darwin.zip", "SHA256SUMS", "cargo-rail-archive-hosts-v1.json"]\n'
             )
             assets = root / 'assets'
             assets.mkdir()

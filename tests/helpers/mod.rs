@@ -128,8 +128,25 @@ pub fn cargo_rail_command(cwd: &Path) -> Result<Command> {
         .env("CARGO_RAIL_CACHE_DIR", cwd.join("target/cargo-rail-test-cache"));
     apply_isolated_git_environment(&mut command);
     disable_ambient_cargo_wrappers(&mut command);
+    for name in AMBIENT_FORGE_ENVIRONMENT {
+        command.env_remove(name);
+    }
     Ok(command)
 }
+
+/// GitHub and registry credentials and endpoints that a CI runner exposes ambiently.
+///
+/// Release tests set the ones they exercise explicitly.
+const AMBIENT_FORGE_ENVIRONMENT: &[&str] = &[
+    "GITHUB_API_URL",
+    "GITHUB_SERVER_URL",
+    "GITHUB_REPOSITORY",
+    "GITHUB_RUN_ID",
+    "GITHUB_ACTIONS",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "CARGO_REGISTRY_TOKEN",
+];
 
 /// Isolate cache-management commands from a real cargo-rail installation receipt.
 pub fn isolated_cargo_rail_command(cwd: &Path) -> Result<Command> {
@@ -374,6 +391,28 @@ mod tests {{
             git(&self.path, &["remote", "remove", "origin"])?;
         }
         git(&self.path, &["remote", "add", "origin", url])?;
+        Ok(())
+    }
+
+    /// Publish the branch to a bare `origin` repository and track it, as a release requires.
+    ///
+    /// The bare repository lives under the ignored `target/` directory. Returns its path.
+    pub fn with_origin(&self) -> Result<PathBuf> {
+        let origin = self.path.join("target/origin.git");
+        std::fs::create_dir_all(&origin)?;
+        git(&origin, &["init", "--bare", "--initial-branch=main"])?;
+        let url = origin.to_str().context("origin path is not UTF-8")?.to_owned();
+        self.set_remote(&url)?;
+        git(
+            &self.path,
+            &["push", "--quiet", "--set-upstream", "origin", "HEAD:main", "--tags"],
+        )?;
+        Ok(origin)
+    }
+
+    /// Push the current branch and tags to `origin`.
+    pub fn push(&self) -> Result<()> {
+        git(&self.path, &["push", "--quiet", "origin", "HEAD:main", "--tags"])?;
         Ok(())
     }
 

@@ -2363,13 +2363,14 @@ mode = "single"
         std::fs::write(
             split_root.join(".config/rail.toml"),
             r#"[release]
-tag_prefix = "v"
 tag_format = "v{version}"
+publish = "none"
 
 [release.changelog]
 path = "CHANGELOG.md"
 "#,
         )?;
+        std::fs::write(split_root.join(".gitignore"), "target/\n")?;
 
         // Tag current version
         git(split_root, &["tag", "-a", "v0.1.0", "-m", "Initial split tag"])?;
@@ -2383,14 +2384,29 @@ path = "CHANGELOG.md"
             split_root.join(".changes/release.md"),
             "---\n\"lib-release\" = \"patch\"\n---\n\nPrepare the split crate release.\n",
         )?;
+        let lockfile = crate::helpers::cargo_command(split_root)
+            .args(["generate-lockfile", "--offline"])
+            .output()?;
+        assert!(lockfile.status.success(), "{lockfile:?}");
         git(split_root, &["add", "."])?;
         git(split_root, &["commit", "-m", "feat: prepare release"])?;
 
-        // Run release publish in split repo (skip crates.io)
-        let output = run_cargo_rail(
+        // A release pushes to origin, so the split repository publishes its branch first.
+        let origin = tempfile::TempDir::new()?;
+        git(origin.path(), &["init", "--bare", "--initial-branch=main"])?;
+        git(
             split_root,
-            &["rail", "release", "run", "--all", "--bump", "patch", "--yes"],
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin.path().to_str().expect("UTF-8 origin path"),
+            ],
         )?;
+        git(split_root, &["push", "--quiet", "-u", "origin", "HEAD:main", "--tags"])?;
+
+        // Release the split crate without a registry.
+        let output = run_cargo_rail(split_root, &["rail", "release", "--bump", "patch", "--yes"])?;
         assert!(
             output.status.success(),
             "Split release should succeed.\nstdout:\n{}\nstderr:\n{}",
@@ -2412,6 +2428,9 @@ path = "CHANGELOG.md"
             changelog.contains("## [0.1.1]"),
             "Changelog should include new version header"
         );
+        let pushed = git(origin.path(), &["rev-parse", "refs/tags/v0.1.1^{commit}"])?;
+        let released = git(split_root, &["rev-parse", "HEAD"])?;
+        assert_eq!(pushed.stdout, released.stdout, "the release tag must reach origin");
 
         Ok(())
     })();

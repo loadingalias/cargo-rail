@@ -43,8 +43,45 @@ const REMOVED: &[RemovedCommand] = &[
     RemovedCommand {
         command: &["release", "finalize"],
         removed_in: "0.26.0",
-        instead: "`cargo rail release run` completes a release in one transaction; \
-                  `cargo rail release resume` continues an interrupted one",
+        instead: "`cargo rail release` completes a release, and running it again finishes an interrupted one",
+    },
+    RemovedCommand {
+        command: &["release", "run"],
+        removed_in: "0.32.0",
+        instead: "run `cargo rail release`; it releases every crate with release-worthy changes, \
+                  or the crates you name, after one confirmation",
+    },
+    RemovedCommand {
+        command: &["release", "check"],
+        removed_in: "0.32.0",
+        instead: "run `cargo rail release --dry-run`; it previews the release and runs every check without effects",
+    },
+    RemovedCommand {
+        command: &["release", "resume"],
+        removed_in: "0.32.0",
+        instead: "run `cargo rail release` again; it reads completed steps from Git, the registry, and GitHub. \
+                  Finish a release that an older Cargo-Rail started with that version",
+    },
+    RemovedCommand {
+        command: &["release", "status"],
+        removed_in: "0.32.0",
+        instead: "run `cargo rail release --dry-run`; it shows what an unfinished release still needs",
+    },
+    RemovedCommand {
+        command: &["release", "abort"],
+        removed_in: "0.32.0",
+        instead: "nothing reaches origin until the release push, and a failed push restores the checkout; \
+                  finish a release that an older Cargo-Rail started with that version",
+    },
+    RemovedCommand {
+        command: &["release", "record"],
+        removed_in: "0.32.0",
+        instead: "releases keep no records; Git tags, the registry, and GitHub show their progress",
+    },
+    RemovedCommand {
+        command: &["release", "init"],
+        removed_in: "0.32.0",
+        instead: "`cargo rail release` needs no setup; add `[release]` keys to .config/rail.toml only to change defaults",
     },
 ];
 
@@ -105,7 +142,11 @@ mod tests {
             message(&["-q", "release", "finalize", "--json"]).as_deref(),
             Some("`cargo rail release finalize` was removed in Cargo-Rail 0.26.0")
         );
-        assert_eq!(message(&["release", "run"]), None);
+        assert_eq!(
+            message(&["release", "run"]).as_deref(),
+            Some("`cargo rail release run` was removed in Cargo-Rail 0.32.0")
+        );
+        assert_eq!(message(&["release", "my-crate"]), None);
         assert_eq!(message(&["plan", "run"]), None, "only the command position matters");
         assert_eq!(message(&["graphs"]), None);
         let help = removed_command(&arguments(&["graph"]))

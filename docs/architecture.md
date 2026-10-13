@@ -64,21 +64,28 @@ Planned workspace edits, including Unify and Surface changes, follow this sequen
 Cache writes, compiler acquisition journals,
 and installation profiles have their own validation and recovery boundaries;
 they do not pass through a workspace mutation plan.
-Release, split, and sync persist transaction identity before remote or irreversible effects.
+Split and sync persist transaction identity before remote or irreversible effects.
+A release persists nothing of its own; Git, the registry, and GitHub hold its progress.
 Recovery reconciles external publication; it cannot undo publication.
 
 ## Release authority
 
-Local execution, GitHub dispatch, and reviewed merges continue one immutable release intent.
-A reviewed merge must preserve the complete preparation tree.
-Validation and native assets bind the final commit and exact producer attempts before publication.
-Git records retain progress and original Cargo archives; recovery reconciles registry, tag, forge,
-and alias effects against that evidence.
+`release::engine` derives every release decision from state outside Cargo-Rail.
+The `Rail-Release-Crates` trailer names a release commit's crates and versions, a remote tag names its release commit,
+the registry's `.cargo_vcs_info.json` names the commit each package came from, and GitHub holds drafts, assets,
+attestations, and pull requests.
+A rerun reads them and completes the missing effects; no record can direct an effect.
+The protected branch is the release's authority:
+a release commit lands by a leased atomic push or a merged pull request,
+and its checks gate the first effect.
 
-The companion Action independently checks records and invocation authority, then calls Cargo-Rail.
+The planner (`release::planner`, `cargo_projection`, `change_files`, `changelog`) computes the release commit's bytes.
+The engine packages and publishes from a temporary clone of the tagged commit.
+
+The companion Action installs the locked Cargo-Rail, runs `cargo rail release`, and publishes its result.
 Repository workflows own runners, credentials, and product packaging.
 They do not implement another release planner or publisher.
-See [release records](release-records.md) and [the release guide](releases.md).
+See [the release guide](releases.md).
 
 ## Process and platform boundaries
 

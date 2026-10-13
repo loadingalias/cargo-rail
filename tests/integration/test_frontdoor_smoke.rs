@@ -38,7 +38,7 @@ fn direct_and_cargo_sentinel_invocations_share_one_cli_grammar() {
             "direct version must identify the executable"
         );
 
-        let misplaced = run_cargo_rail(&ws.path, &["release", "--yes", "status"])?;
+        let misplaced = run_cargo_rail(&ws.path, &["split", "--yes", "run"])?;
         assert_eq!(
             misplaced.status.code(),
             Some(2),
@@ -67,8 +67,8 @@ fn every_completion_shell_uses_the_normalized_root_and_nested_options() {
             let completion = String::from_utf8(direct.stdout)?;
             assert!(completion.contains("cargo-rail"), "{shell} omitted the executable root");
             assert!(
-                completion.contains("allow-non-default-branch"),
-                "{shell} omitted a nested release option"
+                completion.contains("allow-dirty"),
+                "{shell} omitted a nested subcommand option"
             );
         }
         Ok(())

@@ -1019,20 +1019,6 @@ impl WorkspaceContext {
             .collect())
     }
 
-    /// Remove workspace-generated paths from a repository-relative path set.
-    pub(crate) fn non_generated_source_paths(&self, paths: &[PathBuf]) -> RailResult<Vec<PathBuf>> {
-        let git = self.git()?;
-        let generated_roots = validated_generated_source_roots(git.repo_root(), &self.workspace_root, &self.cargo)?;
-        let exclusions = SourceExclusions::from_absolute_roots(git.git(), &generated_roots)?;
-        let mut source_paths = Vec::with_capacity(paths.len());
-        for path in paths {
-            if !exclusions.contains(&RepositoryPath::new(path)?) {
-                source_paths.push(path.clone());
-            }
-        }
-        Ok(source_paths)
-    }
-
     /// Return final non-generated source paths that differ from `base`.
     ///
     /// With no base, every path in the final source tree is returned. This is

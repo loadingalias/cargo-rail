@@ -94,6 +94,7 @@ reqwest = { version = "0.13.5", default-features = false, features = ["blocking"
 rustls = { version = "0.23.45", default-features = false, features = ["aws_lc_rs", "std"] }
 chrono = { workspace = true, features = ["default"] }
 glob = "0.3.4"
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 getrandom = "0.4.3"
 futures-util = { version = "0.3.34", optional = true }
 fs2 = "0.4.3"
@@ -237,6 +238,10 @@ path = "tests/cache/mod.rs"
 [[test]]
 name = "integration"
 path = "tests/integration/mod.rs"
+
+[[test]]
+name = "release"
+path = "tests/release/mod.rs"
 
 # cargo-binstall metadata for pre-built binary downloads
 # See: https://github.com/cargo-bins/cargo-binstall

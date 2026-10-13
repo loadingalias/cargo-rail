@@ -165,19 +165,7 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "Selects release input or reviewed presentation policy.",
     ),
     policy(
-        "release.require_release_notes",
-        "Selects release input or reviewed presentation policy.",
-    ),
-    policy(
-        "release.release_notes_dir",
-        "Selects release input or reviewed presentation policy.",
-    ),
-    policy(
         "release.unconventional_commits",
-        "Selects release input or reviewed presentation policy.",
-    ),
-    policy(
-        "release.require_change_files",
         "Selects release input or reviewed presentation policy.",
     ),
     policy(
@@ -292,18 +280,25 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "crates.<name>.changelog.pr_url",
         "Controls changelog presentation and commit attribution without granting publication authority.",
     ),
-    policy("release.tag_prefix", "Defines the repository's release tag prefix."),
     policy(
         "release.tag_format",
         "Defines the repository's crate/version tag namespace.",
     ),
     policy(
-        "release.remote_effects",
-        "Selects one valid remote-effect boundary: none, push, auto, GitHub, or GitLab.",
+        "release.crates",
+        "Limits the crates a release manages and the crates `change check` requires coverage for.",
     ),
     policy(
-        "release.registry_publication",
-        "Selects an exact package-registry publication boundary independently from Git and forge effects.",
+        "release.publish",
+        "Selects the package registry that receives releases, or none.",
+    ),
+    policy(
+        "release.github_release",
+        "Selects whether each release tag gets a GitHub release.",
+    ),
+    policy(
+        "release.checks",
+        "Selects whether GitHub checks on the source commit gate the first release effect.",
     ),
     policy("release.sign_tags", "Requires cryptographic signing of release tags."),
     policy(
@@ -324,44 +319,24 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "Defines named crate sets that version and release in lockstep.",
     ),
     policy(
-        "release.hosted_workflow",
-        "Selects the GitHub workflow that executes durable release requests.",
-    ),
-    policy(
         "release.aliases",
-        "Authorizes explicit mutable tag promotion after immutable release verification.",
+        "Names mutable tags that follow each crate's newest published release.",
     ),
     policy(
         "release.aliases.<name>",
-        "Names the mutable tag for one selected package.",
+        "Names the mutable tag for one crate; {major} and {minor} follow its version.",
     ),
     policy(
-        "release.validation",
-        "Binds release authorization to exact GitHub workflows and required jobs.",
+        "release.assets",
+        "Lists the GitHub release files each crate's draft release must hold before publication.",
     ),
     policy(
-        "release.validation.<name>",
-        "Names the jobs that must succeed in this workflow's release-commit run.",
+        "release.assets.<name>",
+        "Names one crate's complete GitHub release asset inventory.",
     ),
     policy(
-        "release.artifacts",
-        "Binds complete native release inventories to authorized producers.",
-    ),
-    policy(
-        "release.artifacts.<name>.workflow",
-        "Identifies the validated workflow producing this package's assets.",
-    ),
-    policy(
-        "release.artifacts.<name>.files",
-        "Declares the complete flat inventory published with the package.",
-    ),
-    policy(
-        "release.artifacts.<name>.files.<name>.target",
-        "Records the target asserted by the product's packaging validation.",
-    ),
-    policy(
-        "release.artifacts.<name>.files.<name>.source",
-        "Requires asset bytes to match this regular file at the release commit.",
+        "release.asset_attestations",
+        "Selects whether release assets must prove they were built by this repository's workflows from the release commit.",
     ),
     policy(
         "release.version_groups.<name>",
@@ -735,7 +710,61 @@ pub(crate) const RETIRED_KEYS: &[RetiredKey] = &[
     RetiredKey {
         path: "release.require_changelog_entries",
         removed_in: "0.29.0",
-        instead: "`release.require_release_notes` remains the release-prose gate",
+        instead: "a GitHub release requires release notes; nothing else needs a key",
+        removable: true,
+    },
+    RetiredKey {
+        path: "release.remote_effects",
+        removed_in: "0.32.0",
+        instead: "a release always pushes; `release.github_release` and `release.checks` select the GitHub effects",
+        removable: true,
+    },
+    RetiredKey {
+        path: "release.registry_publication",
+        removed_in: "0.32.0",
+        instead: "`release.publish` names the registry (\"crates-io\" by default) or \"none\"",
+        removable: true,
+    },
+    RetiredKey {
+        path: "release.hosted_workflow",
+        removed_in: "0.32.0",
+        instead: "CI runs the same `cargo rail release` through `loadingalias/cargo-rail-action/release`",
+        removable: true,
+    },
+    RetiredKey {
+        path: "release.validation",
+        removed_in: "0.32.0",
+        instead: "`release.checks` requires every check GitHub reports on the source commit",
+        removable: true,
+    },
+    RetiredKey {
+        path: "release.artifacts",
+        removed_in: "0.32.0",
+        instead: "`release.assets` lists each crate's GitHub release files",
+        removable: true,
+    },
+    RetiredKey {
+        path: "release.tag_prefix",
+        removed_in: "0.32.0",
+        instead: "write the prefix in `release.tag_format`, such as \"{crate}-v{version}\"",
+        removable: true,
+    },
+    RetiredKey {
+        path: "release.require_change_files",
+        removed_in: "0.32.0",
+        instead: "the changes source requires coverage for every crate in `release.crates`",
+        removable: true,
+    },
+    RetiredKey {
+        path: "release.release_notes_dir",
+        removed_in: "0.32.0",
+        instead: "GitHub release notes are each version's changelog section",
+        removable: true,
+    },
+    RetiredKey {
+        path: "release.require_release_notes",
+        removed_in: "0.32.0",
+        instead: "a GitHub release always requires release notes",
         removable: true,
     },
     RetiredKey {

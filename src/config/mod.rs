@@ -11,10 +11,11 @@ mod unify;
 pub use plan::{
     CargoPrerequisiteConfig, CargoRootConfig, CargoTargetRootConfig, PlanConfig, PlanWorkConfig, PlanWorkScope,
 };
+pub(crate) use release::render_tag_template;
 pub use release::{
-    ChangelogConfig, ChangelogFilters, ChangelogRelativeTo, ChangelogShape, CommitPolicy, CrateReleaseConfig,
-    GroupSpec, Pre1BreakingBump, ReleaseArtifacts, ReleaseAsset, ReleaseConfig, ReleaseRegistryPublication,
-    ReleaseRemoteEffects, ReleaseSource, RequireChangeFiles, SemverCheckPolicy,
+    AssetAttestations, ChangelogConfig, ChangelogFilters, ChangelogRelativeTo, ChangelogShape, CommitPolicy,
+    CrateReleaseConfig, GroupSpec, Pre1BreakingBump, ReleaseChecks, ReleaseConfig, ReleasePublish, ReleaseSource,
+    SemverCheckPolicy,
 };
 pub(crate) use split::validate_remote_argument;
 pub use split::{CrateSplitConfig, SplitConfig, SplitMode, WorkspaceMode};
@@ -124,6 +125,8 @@ pub(crate) fn decode_all(bytes: &[u8], retired: RetiredKeys) -> Result<DecodedCo
         .parse()
         .map_err(|error: toml_edit::TomlError| vec![RailError::message(error.to_string())])?;
     if retired == RetiredKeys::Strip {
+        // Retired release keys become their replacements first, so the decoded policy keeps their effect.
+        migration::rewrite_retired_release(&mut document);
         migration::strip_retired(&mut document);
     }
     let config = RailConfig::from_document(document.clone())
@@ -236,16 +239,11 @@ impl RailConfig {
                 }),
         );
         for (name, config) in &self.crates {
-            if config
-                .release
-                .as_ref()
-                .and_then(|config| config.tag_format.as_deref())
-                .is_some_and(|format| format.trim().is_empty())
-            {
-                checks.push(Err(RailError::Config(ConfigError::InvalidField {
-                    field: format!("crates.{name}.release.tag_format"),
-                    reason: "tag_format cannot be empty".into(),
-                })));
+            if let Some(format) = config.release.as_ref().and_then(|config| config.tag_format.as_deref()) {
+                checks.push(
+                    release::validate_tag_format(&format!("crates.{name}.release.tag_format"), format)
+                        .map_err(RailError::Config),
+                );
             }
         }
         checks.into_iter().filter_map(Result::err).collect()
@@ -262,7 +260,9 @@ impl RailConfig {
             .values()
             .any(|config| config.split.is_some() || config.release.is_some() || config.changelog.is_some())
             || !self.release.version_groups.is_empty()
-            || matches!(&self.release.require_change_files, RequireChangeFiles::Crates(names) if !names.is_empty())
+            || self.release.crates.is_some()
+            || !self.release.assets.is_empty()
+            || !self.release.aliases.is_empty()
         {
             return Err(workspace_context_required("package selection"));
         }
@@ -290,7 +290,6 @@ impl RailConfig {
                 self.release_tag_format_override(name)
                     .unwrap_or(&self.release.tag_format)
                     .replace("{crate}", name)
-                    .replace("{prefix}", &self.release.tag_prefix)
                     .replace("{version}", "*"),
             )
         });
@@ -299,15 +298,6 @@ impl RailConfig {
         } else if self.release.tag_format.contains("{crate}") {
             warnings
                 .push("crate release tag formats share a namespace; choose a distinct tag line for each crate".into());
-        }
-        for (name, config) in &self.crates {
-            if let Some(format) = config.release.as_ref().and_then(|config| config.tag_format.as_ref())
-                && !format.contains("{version}")
-            {
-                warnings.push(format!(
-                    "crates.{name}.release.tag_format does not contain {{version}}; tags may not identify releases"
-                ));
-            }
         }
         Ok(warnings)
     }

@@ -123,7 +123,7 @@ pub(crate) fn assess(
         }
     } else {
         let observation = if policy == SemverCheckPolicy::Deny {
-            super::registry::RegistryObserver::new(super::packages::SPARSE_INDEX)
+            super::registry::RegistryObserver::new(super::registry::CRATES_IO_INDEX)
                 .map_err(|error| error.to_string())
                 .and_then(|observer| observer.has_published_versions(crate_name))
         } else {

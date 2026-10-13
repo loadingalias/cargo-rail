@@ -223,49 +223,48 @@ See [Caching](caching.md) for exact eligibility and support.
 
 ## A release stopped
 
-`release run` persists the original record before its first side effect.
-Inspect it and run the exact recovery command Cargo-Rail reports:
+Run the same command again:
 
 ```bash
-cargo rail release status --format json
-cargo rail release resume
+cargo rail release
 ```
 
-`resume` reconciles Git, readiness checks, registry versions, tags, and forge state before advancing.
-It does not replan from mutated manifests.
-Omit the transaction ID when exactly one active transaction exists.
-If several exist, supply the ID reported by `status`.
-Recovery requires the original record and sealed package bytes;
-commit trailers cannot recreate publication authority.
-Finish or reconcile an older record with the executable that created it before upgrading.
-Hosted execution continues remotely after terminal closure.
-`resume` redispatches the same request; `status` fetches its latest retained progress.
-If the merge-event runner stopped,
-a resumed dispatch rediscovers the recorded PR and requires the same prepared tree
-before binding its merge.
-A missing record remains `missing_record`; tags and commit trailers cannot prove completion.
-See [releases](releases.md).
+It reads the most recent release on the branch from Git tags, the registry, and GitHub,
+and completes only the missing steps.
+It packages from a temporary clone of the release commit, so the local worktree does not matter.
+The result's `state` and `next` say what remains:
 
-Abort and restore only while the status says no external side effect may exist:
+| `state`           | Meaning and next action |
+| ----------------- | ----------------------- |
+| `awaiting_checks` | Checks on the source commit are still running; nothing changed. Run again when they finish. |
+| `awaiting_assets` | A draft GitHub release waits for the files in `missing_assets`. Attach them, then run again. |
+| `pull_request`    | A release pull request is open. Merge it, then run again. |
+| `released`        | Every step is complete. |
 
-```bash
-cargo rail release abort release-<id> --yes
-```
+A push that `origin` rejected leaves nothing behind: the checkout returns to its starting commit.
+Pull, then run again.
 
-If the preparation commit was pushed but no tag, registry upload, review, forge release,
-or alias effect exists, keep the current branch and retire the transaction explicitly:
+These errors need a decision, not a rerun:
 
-```bash
-cargo rail release abort release-<id> --retain-preparation --yes
-```
+- **A version on the registry came from another commit, or is yanked.**
+  That version belongs to another source.
+  Release a new version.
+- **A tag on `origin` names another commit.**
+  A release never moves a published tag.
+  Inspect the tag.
+- **An asset has no matching attestation.**
+  Build and attach it again from the release tag with `loadingalias/cargo-rail-action/release/asset`, or set `release.asset_attestations = "off"` for a repository that cannot attest.
+- **An alias names a commit outside this release line.**
+  Inspect the alias; a release moves an alias only forward.
 
-The pushed preparation must be an ancestor of the clean local and remote branch tip.
-After any publication boundary, resume and reconcile.
-Do not move a published tag or replace a release asset.
+A release that Cargo-Rail 0.31 started is finished the same way
+once its release commit is on the branch.
 
 Commit-driven releases need complete tag history.
-Use `fetch-depth: 0` in GitHub Actions or fetch full history and tags before checking the release.
+Use `fetch-depth: 0` in GitHub Actions, or fetch full history and tags before releasing.
 Reviewed-change mode does not use commit history to choose bumps.
+
+See [releases](releases.md).
 
 ## Sync left conflicts
 

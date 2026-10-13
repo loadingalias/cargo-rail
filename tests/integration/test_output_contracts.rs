@@ -19,7 +19,7 @@ fn test_unsupported_output_formats_fail_during_cli_parsing() {
             ),
             (
                 "release",
-                &["rail", "release", "check", "lib-a", "--format", "jsonl"],
+                &["rail", "release", "lib-a", "--format", "jsonl"],
                 "[possible values: text, json]",
             ),
             (
@@ -74,9 +74,6 @@ fn test_global_json_rejects_commands_without_structured_contracts() {
         let ws = TestWorkspace::new_named("global-json-domains")?;
         let cases: &[(&str, &[&str])] = &[
             ("split init", &["rail", "--json", "split", "init"]),
-            ("release init", &["rail", "--json", "release", "init"]),
-            ("release resume", &["rail", "--json", "release", "resume", "state.json"]),
-            ("release abort", &["rail", "--json", "release", "abort", "state.json"]),
             ("completions", &["rail", "--json", "completions", "bash"]),
         ];
 

@@ -5,22 +5,11 @@ use std::io::Read as _;
 use std::time::Duration;
 
 use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::error::{RailError, RailResult};
 
 const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
-
-/// The observation is evidence about the index, not proof that an earlier
-/// upload was rejected. An absent version after an attempt remains uncertain.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum RegistryObservation {
-    Absent,
-    Matching,
-    Conflicting { checksum: String, yanked: bool },
-    Unavailable { reason: String },
-}
 
 #[derive(Debug)]
 pub(crate) struct RegistryObserver {
@@ -75,26 +64,6 @@ impl RegistryObserver {
         })
     }
 
-    pub(crate) fn observe(&self, name: &str, version: &str, checksum: &str) -> RegistryObservation {
-        match self.read(name, version, checksum) {
-            Ok(observation) => observation,
-            Err(reason) => RegistryObservation::Unavailable { reason },
-        }
-    }
-
-    fn read(&self, name: &str, version: &str, checksum: &str) -> Result<RegistryObservation, String> {
-        if !valid_name(name)
-            || !crate::source::ContentDigest::is_sha256_hex(checksum)
-            || semver::Version::parse(version).is_err()
-        {
-            return Err("invalid sealed package identity".into());
-        }
-        match self.read_index(name)? {
-            None => Ok(RegistryObservation::Absent),
-            Some(bytes) => observe_records(&bytes, name, version, checksum),
-        }
-    }
-
     pub(crate) fn has_published_versions(&self, name: &str) -> Result<bool, String> {
         if !valid_name(name) {
             return Err("invalid package name".into());
@@ -103,7 +72,7 @@ impl RegistryObserver {
             return Ok(false);
         };
         // Validate every record, including yanked versions, before claiming prior publication.
-        observe_records(&bytes, name, "0.0.0", &"0".repeat(64))?;
+        version_record(&bytes, name, &semver::Version::new(0, 0, 0))?;
         Ok(true)
     }
 
@@ -149,6 +118,279 @@ impl RegistryObserver {
     }
 }
 
+impl RegistryObserver {
+    /// The index record for one version: its checksum and whether it is yanked.
+    fn record(&self, name: &str, version: &semver::Version) -> Result<Option<(String, bool)>, String> {
+        if !valid_name(name) {
+            return Err("invalid package name".into());
+        }
+        match self.read_index(name)? {
+            None => Ok(None),
+            Some(bytes) => version_record(&bytes, name, version),
+        }
+    }
+
+    fn get(&self, url: reqwest::Url, limit: u64, what: &str) -> Result<Vec<u8>, String> {
+        let response = self
+            .client
+            .get(url)
+            .timeout(Duration::from_secs(120))
+            .send()
+            .map_err(|_| format!("{what} request failed or timed out"))?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(format!("{what} returned HTTP {}", response.status().as_u16()));
+        }
+        let mut bytes = Vec::new();
+        response
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| format!("{what} body was incomplete or timed out"))?;
+        if bytes.len() as u64 > limit {
+            return Err(format!("{what} exceeds its size limit"));
+        }
+        Ok(bytes)
+    }
+}
+
+/// Largest `.crate` a release reads back from a registry.
+const MAX_PACKAGE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The registry a release publishes to, observed through its sparse index.
+#[derive(Debug)]
+pub(crate) struct PublicationRegistry {
+    name: String,
+    observer: RegistryObserver,
+    download: String,
+}
+
+/// One version a registry already holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Published {
+    pub(crate) checksum: String,
+    pub(crate) yanked: bool,
+}
+
+#[derive(Deserialize)]
+struct IndexConfig {
+    dl: String,
+    #[serde(default, rename = "auth-required")]
+    auth_required: bool,
+}
+
+#[derive(Deserialize)]
+struct VcsInfo {
+    git: Option<VcsGit>,
+}
+
+#[derive(Deserialize)]
+struct VcsGit {
+    sha1: String,
+    #[serde(default)]
+    dirty: bool,
+}
+
+impl PublicationRegistry {
+    /// Resolve `name` through Cargo's configuration: crates.io, or `[registries.NAME].index`.
+    pub(crate) fn resolve(name: &str, cargo_config: Option<&serde_json::Value>) -> RailResult<Self> {
+        let index = if name == "crates-io" {
+            CRATES_IO_INDEX.to_owned()
+        } else {
+            let variable = format!("CARGO_REGISTRIES_{}_INDEX", name.to_ascii_uppercase().replace('-', "_"));
+            std::env::var(&variable)
+                .ok()
+                .or_else(|| {
+                    cargo_config
+                        .and_then(|settings| settings["registries"][name]["index"].as_str())
+                        .map(str::to_owned)
+                })
+                .ok_or_else(|| {
+                    RailError::with_help(
+                        format!("Cargo registry '{name}' is not configured"),
+                        format!("declare [registries.{name}] index in Cargo configuration, or set {variable}"),
+                    )
+                })?
+        };
+        if !index.starts_with("sparse+") {
+            return Err(RailError::with_help(
+                format!("Cargo registry '{name}' does not use a sparse index"),
+                "release observes registries through the sparse protocol; configure the registry's `sparse+https://` index",
+            ));
+        }
+        let observer = RegistryObserver::new(&index)?;
+        let config = observer
+            .index
+            .join("config.json")
+            .map_err(|_| RailError::message("invalid registry index URL"))?;
+        let config: IndexConfig = serde_json::from_slice(
+            &observer
+                .get(config, 64 * 1024, "registry configuration")
+                .map_err(RailError::message)?,
+        )
+        .map_err(|_| RailError::message(format!("registry '{name}' returned an invalid config.json")))?;
+        if config.auth_required {
+            return Err(RailError::with_help(
+                format!("registry '{name}' requires authentication to read packages"),
+                "release reads published packages to prove their source commit; publish to a registry with public reads",
+            ));
+        }
+        Ok(Self {
+            name: name.to_owned(),
+            observer,
+            download: config.dl,
+        })
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The registry's record of `crate_name` at `version`, if it holds one.
+    pub(crate) fn version(&self, crate_name: &str, version: &semver::Version) -> RailResult<Option<Published>> {
+        self.observer
+            .record(crate_name, version)
+            .map(|record| record.map(|(checksum, yanked)| Published { checksum, yanked }))
+            .map_err(|reason| {
+                RailError::message(format!(
+                    "could not read {crate_name} {version} from registry '{}': {reason}",
+                    self.name
+                ))
+            })
+    }
+
+    /// The Git commit Cargo recorded when it packaged the published `crate_name` at `version`.
+    ///
+    /// `None` means the package records no clean Git commit, so its source cannot be proven.
+    pub(crate) fn source_commit(
+        &self,
+        crate_name: &str,
+        version: &semver::Version,
+        published: &Published,
+    ) -> RailResult<Option<String>> {
+        let failure = |reason: String| {
+            RailError::message(format!(
+                "could not read the published {crate_name} {version} from registry '{}': {reason}",
+                self.name
+            ))
+        };
+        let url = download_url(&self.download, crate_name, version, &published.checksum).map_err(failure)?;
+        let bytes = self
+            .observer
+            .get(url, MAX_PACKAGE_BYTES, "package download")
+            .map_err(failure)?;
+        if crate::source::ContentDigest::sha256(&bytes).to_string() != published.checksum {
+            return Err(failure(
+                "the downloaded bytes do not match the index checksum".to_owned(),
+            ));
+        }
+        let wanted = format!("{crate_name}-{version}/.cargo_vcs_info.json");
+        let Some(info) = tar_entry(flate2::read::GzDecoder::new(bytes.as_slice()), &wanted).map_err(failure)? else {
+            return Ok(None);
+        };
+        let info: VcsInfo =
+            serde_json::from_slice(&info).map_err(|_| failure("its .cargo_vcs_info.json is invalid".to_owned()))?;
+        Ok(info.git.filter(|git| !git.dirty).map(|git| git.sha1))
+    }
+}
+
+pub(crate) const CRATES_IO_INDEX: &str = "sparse+https://index.crates.io/";
+
+/// Expand a registry `dl` template the way Cargo does.
+fn download_url(template: &str, name: &str, version: &semver::Version, checksum: &str) -> Result<reqwest::Url, String> {
+    // Package names are ASCII (`valid_name`), so byte ranges are character ranges.
+    let part = |range: std::ops::Range<usize>| name.get(range).unwrap_or_default();
+    let prefix = match name.len() {
+        1 => "1".to_owned(),
+        2 => "2".to_owned(),
+        3 => format!("3/{}", part(0..1)),
+        _ => format!("{}/{}", part(0..2), part(2..4)),
+    };
+    // Cargo's `dl` markers, spelled without literal braces so they read as text, not format arguments.
+    let marker = |name: &str| format!("{}{name}{}", '{', '}');
+    let markers = ["crate", "version", "prefix", "lowerprefix", "sha256-checksum"].map(marker);
+    let url = if markers.iter().any(|marker| template.contains(marker.as_str())) {
+        template
+            .replace(&marker("crate"), name)
+            .replace(&marker("version"), &version.to_string())
+            .replace(&marker("lowerprefix"), &prefix.to_ascii_lowercase())
+            .replace(&marker("prefix"), &prefix)
+            .replace(&marker("sha256-checksum"), checksum)
+    } else {
+        format!("{}/{name}/{version}/download", template.trim_end_matches('/'))
+    };
+    let url = reqwest::Url::parse(&url).map_err(|_| "the registry download URL is invalid".to_owned())?;
+    let loopback = url
+        .host_str()
+        .is_some_and(|host| host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()));
+    if !(url.scheme() == "https" || url.scheme() == "http" && loopback) {
+        return Err("the registry download URL is not HTTPS".to_owned());
+    }
+    Ok(url)
+}
+
+/// Read one regular file from a tar stream, following ustar prefixes and PAX or GNU long names.
+fn tar_entry(mut reader: impl std::io::Read, wanted: &str) -> Result<Option<Vec<u8>>, String> {
+    const BLOCK: usize = 512;
+    let mut long_name: Option<String> = None;
+    let mut read_total: u64 = 0;
+    loop {
+        let mut header = [0_u8; BLOCK];
+        if reader.read_exact(&mut header).is_err() || header.iter().all(|byte| *byte == 0) {
+            return Ok(None);
+        }
+        let field = |range: std::ops::Range<usize>| {
+            let bytes = &header[range];
+            let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+            String::from_utf8_lossy(&bytes[..end]).into_owned()
+        };
+        let size = u64::from_str_radix(field(124..136).trim(), 8).map_err(|_| "the package tar header is invalid")?;
+        read_total = read_total.saturating_add(size);
+        if read_total > 4 * MAX_PACKAGE_BYTES {
+            return Err("the package expands beyond its size limit".to_owned());
+        }
+        let padded = size.div_ceil(BLOCK as u64) * BLOCK as u64;
+        let kind = header[156];
+        let take = |reader: &mut dyn std::io::Read| -> Result<Vec<u8>, String> {
+            let mut data = vec![0; usize::try_from(size).map_err(|_| "the package entry is too large")?];
+            reader.read_exact(&mut data).map_err(|_| "the package is truncated")?;
+            std::io::copy(&mut reader.take(padded - size), &mut std::io::sink())
+                .map_err(|_| "the package is truncated")?;
+            Ok(data)
+        };
+        match kind {
+            b'L' => {
+                let data = take(&mut reader)?;
+                long_name = Some(String::from_utf8_lossy(&data).trim_end_matches('\0').to_owned());
+            }
+            b'x' => {
+                let data = take(&mut reader)?;
+                long_name = String::from_utf8_lossy(&data).lines().find_map(|line| {
+                    line.split_once(' ')
+                        .and_then(|(_, record)| record.strip_prefix("path="))
+                        .map(str::to_owned)
+                });
+            }
+            _ => {
+                let path = long_name.take().unwrap_or_else(|| {
+                    let (prefix, name) = (field(345..500), field(0..100));
+                    if prefix.is_empty() {
+                        name
+                    } else {
+                        format!("{prefix}/{name}")
+                    }
+                });
+                if path == wanted && matches!(kind, b'0' | 0) {
+                    if size > 1024 * 1024 {
+                        return Err("the package metadata entry is too large".to_owned());
+                    }
+                    return take(&mut reader).map(Some);
+                }
+                std::io::copy(&mut (&mut reader).take(padded), &mut std::io::sink())
+                    .map_err(|_| "the package is truncated")?;
+            }
+        }
+    }
+}
+
 pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -168,10 +410,14 @@ struct IndexRecord {
     v: Option<u32>,
 }
 
-fn observe_records(bytes: &[u8], name: &str, version: &str, checksum: &str) -> Result<RegistryObservation, String> {
-    let mut observation = RegistryObservation::Absent;
+/// The checksum and yank state of `version` in one package's index file, after validating every record.
+///
+/// Build metadata does not distinguish versions, as on crates.io.
+fn version_record(bytes: &[u8], name: &str, version: &semver::Version) -> Result<Option<(String, bool)>, String> {
+    let mut found = None;
     let mut versions = BTreeSet::new();
-    let wanted = semver::Version::parse(version).map_err(|_| "invalid sealed version")?;
+    let mut wanted = version.clone();
+    wanted.build = semver::BuildMetadata::EMPTY;
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return Err("registry returned an empty index".into());
     }
@@ -189,20 +435,11 @@ fn observe_records(bytes: &[u8], name: &str, version: &str, checksum: &str) -> R
         if record.v.is_some_and(|v| !matches!(v, 1 | 2)) {
             return Err("registry returned an unsupported index record version".into());
         }
-        let mut wanted = wanted.clone();
-        wanted.build = semver::BuildMetadata::EMPTY;
         if parsed == wanted {
-            observation = if record.vers == version && record.cksum == checksum && !record.yanked {
-                RegistryObservation::Matching
-            } else {
-                RegistryObservation::Conflicting {
-                    checksum: record.cksum,
-                    yanked: record.yanked,
-                }
-            };
+            found = Some((record.cksum, record.yanked));
         }
     }
-    Ok(observation)
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -219,9 +456,11 @@ mod tests {
         )
     }
 
-    fn observe_response(status: u16, headers: &str, body: &str) -> RegistryObservation {
+    type Record = Result<Option<(String, bool)>, String>;
+
+    fn observe_response(status: u16, headers: &str, body: &str) -> Record {
         with_response(status, headers, body, |observer| {
-            observer.observe("Example_Crate", "1.2.3", DIGEST)
+            observer.record("Example_Crate", &semver::Version::new(1, 2, 3))
         })
     }
 
@@ -270,36 +509,25 @@ mod tests {
 
     #[test]
     fn index_observation_binds_exact_name_version_checksum_and_yank_state() {
-        assert_eq!(observe_response(404, "", ""), RegistryObservation::Absent);
-        assert_eq!(
-            observe_response(200, "", &record("1.2.2", DIGEST, false)),
-            RegistryObservation::Absent
-        );
+        assert_eq!(observe_response(404, "", ""), Ok(None));
+        assert_eq!(observe_response(200, "", &record("1.2.2", DIGEST, false)), Ok(None));
         assert_eq!(
             observe_response(200, "", &record("1.2.3", DIGEST, false)),
-            RegistryObservation::Matching
+            Ok(Some((DIGEST.into(), false)))
         );
         assert_eq!(
             observe_response(200, "", &record("1.2.3", DIGEST, true)),
-            RegistryObservation::Conflicting {
-                checksum: DIGEST.into(),
-                yanked: true
-            }
+            Ok(Some((DIGEST.into(), true)))
         );
         let other = "a".repeat(64);
         assert_eq!(
             observe_response(200, "", &record("1.2.3", &other, false)),
-            RegistryObservation::Conflicting {
-                checksum: other,
-                yanked: false
-            }
+            Ok(Some((other, false)))
         );
         assert_eq!(
             observe_response(200, "", &record("1.2.3+different", DIGEST, false)),
-            RegistryObservation::Conflicting {
-                checksum: DIGEST.into(),
-                yanked: false
-            }
+            Ok(Some((DIGEST.into(), false))),
+            "build metadata does not make a different version"
         );
     }
 
@@ -319,13 +547,7 @@ mod tests {
             format!("{good}\n{}", record("1.2.3+duplicate", DIGEST, false)),
             format!("{good}\n{{"),
         ] {
-            assert!(
-                matches!(
-                    observe_response(200, "", &body),
-                    RegistryObservation::Unavailable { .. }
-                ),
-                "accepted {body}"
-            );
+            assert!(observe_response(200, "", &body).is_err(), "accepted {body}");
         }
     }
 
@@ -334,22 +556,16 @@ mod tests {
         for status in [301, 302, 304, 401, 403, 429, 500, 503] {
             assert_eq!(
                 observe_response(status, "Location: http://127.0.0.1:1/\r\n", ""),
-                RegistryObservation::Unavailable {
-                    reason: format!("registry index returned HTTP {status}")
-                }
+                Err(format!("registry index returned HTTP {status}"))
             );
         }
         assert_eq!(
             observe_response(200, "Content-Length: 16777217\r\n", ""),
-            RegistryObservation::Unavailable {
-                reason: "registry index exceeds the observation size limit".into()
-            }
+            Err("registry index exceeds the observation size limit".into())
         );
         assert_eq!(
             observe_response(200, "Content-Length: 512\r\n", "{"),
-            RegistryObservation::Unavailable {
-                reason: "registry index body was incomplete or timed out".into()
-            }
+            Err("registry index body was incomplete or timed out".into())
         );
     }
 
@@ -372,10 +588,8 @@ mod tests {
         let observer = RegistryObserver::new("https://example.invalid/").unwrap();
         for name in ["../escape", "a/b", ".", "", "α", "name?query", "name#fragment"] {
             assert_eq!(
-                observer.observe(name, "1.2.3", DIGEST),
-                RegistryObservation::Unavailable {
-                    reason: "invalid sealed package identity".into()
-                }
+                observer.record(name, &semver::Version::new(1, 2, 3)),
+                Err("invalid package name".into())
             );
         }
     }
@@ -412,13 +626,11 @@ mod tests {
         let observation =
             RegistryObserver::with_request_timeout(&format!("http://{address}/index/"), Duration::from_millis(200))
                 .unwrap()
-                .observe("Example_Crate", "1.2.3", DIGEST);
+                .record("Example_Crate", &semver::Version::new(1, 2, 3));
         worker.join().unwrap();
         assert_eq!(
             observation,
-            RegistryObservation::Unavailable {
-                reason: "registry index body was incomplete or timed out".into(),
-            }
+            Err("registry index body was incomplete or timed out".into())
         );
     }
 }

@@ -117,11 +117,20 @@ fn test_release_invalid_crate_name() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("error-invalid-crate")?;
         ws.add_crate("real-crate", "0.1.0", &[])?;
+        let lockfile = crate::helpers::cargo_command(&ws.path)
+            .args(["generate-lockfile", "--offline"])
+            .output()?;
+        anyhow::ensure!(lockfile.status.success(), "{lockfile:?}");
         ws.commit("Add crate")?;
+        ws.with_origin()?;
 
         // Try to release non-existent crate
-        let output = run_cargo_rail(&ws.path, &["rail", "release", "check", "does-not-exist"])?;
+        let output = run_cargo_rail(&ws.path, &["rail", "release", "--dry-run", "does-not-exist"])?;
         assert!(!output.status.success(), "release with invalid crate should fail");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Crate 'does-not-exist' not found"),
+            "{output:?}"
+        );
 
         Ok(())
     })();
@@ -394,7 +403,22 @@ fn removed_commands_name_their_release_and_replacement() -> anyhow::Result<()> {
         (
             &["rail", "-q", "release", "finalize"][..],
             "`cargo rail release finalize` was removed in Cargo-Rail 0.26.0",
-            "`cargo rail release run` completes a release in one transaction",
+            "`cargo rail release` completes a release, and running it again finishes an interrupted one",
+        ),
+        (
+            &["rail", "release", "run", "--all", "--yes"][..],
+            "`cargo rail release run` was removed in Cargo-Rail 0.32.0",
+            "run `cargo rail release`; it releases every crate with release-worthy changes",
+        ),
+        (
+            &["rail", "release", "check", "--all"][..],
+            "`cargo rail release check` was removed in Cargo-Rail 0.32.0",
+            "run `cargo rail release --dry-run`",
+        ),
+        (
+            &["rail", "release", "resume"][..],
+            "`cargo rail release resume` was removed in Cargo-Rail 0.32.0",
+            "run `cargo rail release` again",
         ),
         (
             &["graph"][..],

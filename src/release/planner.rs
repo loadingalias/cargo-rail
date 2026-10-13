@@ -10,7 +10,6 @@ use crate::release::change_files::{ChangeBump, ChangeIntent, ChangePresentation,
 use crate::release::changelog::{ChangelogSpec, CommitDiagnostic, CommitRef, detect_github_repo, resolve_links};
 use crate::release::presentation::{self, PlannedPresentation};
 use crate::release::process;
-use crate::release::semver_checks::{self, ApiEvidence};
 use crate::release::version::{BumpLevel, BumpRequest, commit_bump_level};
 use crate::workspace::WorkspaceContext;
 use cargo_metadata::PackageId;
@@ -20,7 +19,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-pub(crate) const RELEASE_REGISTRY: &str = "crates-io";
 pub(crate) const RELEASE_PLAN_CONTRACT_VERSION: u32 = 10;
 
 /// A plan for releasing one or more crates
@@ -46,9 +44,10 @@ pub struct ReleasePlan {
     /// Pending change files rewritten to retain unreleased no-release intent.
     pub change_files_to_update: Vec<PlannedChangeFileUpdate>,
     /// Exact Cargo manifest and lockfile writes validated in isolated captured source.
+    ///
+    /// Empty until [`ReleasePlanner::project_writes`] runs; the projection resolves Cargo
+    /// in an isolated copy, so the preview does not wait for it.
     pub cargo_writes: Vec<PlannedCargoWrite>,
-    /// Resolved native asset requirements for the selected package closure.
-    pub artifacts: Vec<super::ArtifactRequirement>,
     /// Target crates excluded from the plan, with the reason (auto mode only).
     pub skipped: Vec<SkippedCrate>,
 }
@@ -76,17 +75,6 @@ struct VersionGroupForce {
     level: BumpLevel,
 }
 
-/// Shared-history diagnostics for `release check`
-#[derive(Debug, Clone, Default)]
-pub struct ReleaseCheckInsights {
-    /// Conventional-commit diagnostics for selected commit workflows.
-    pub commit_diagnostics: Vec<(String, Vec<CommitDiagnostic>)>,
-    /// Crates with code changes but no covering change file (sorted)
-    pub missing_change_files: Vec<String>,
-    /// Whether the repository is shallow and may not contain release tags.
-    pub shallow_repository: bool,
-}
-
 /// Release plan for a single crate
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -111,12 +99,12 @@ pub struct CrateReleasePlan {
     pub changelog_range_start: Option<String>,
     /// Changelog range end ref
     pub changelog_range_end: String,
-    /// Whether to publish to crates.io
+    /// Whether the release publishes this crate to the configured registry
     pub publish: bool,
-    /// Human-readable publish intent
-    pub publish_intent: String,
-    /// API comparison against the captured prior release commit, using default features.
-    pub api_evidence: ApiEvidence,
+    /// The strongest bump that reviewed intent or conventional commits request, which
+    /// API checks compare against.
+    #[serde(skip)]
+    pub(crate) reviewed_level: Option<BumpLevel>,
     /// Whether to generate changelog
     pub generate_changelog: bool,
     /// Canonical bump expression `old -> new`.
@@ -243,15 +231,6 @@ pub struct ReleaseSummary {
     pub crates_to_tag: usize,
 }
 
-/// How explicit crate selections should handle dependent closure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DependentPolicy {
-    /// Reject partial selections that omit published workspace dependents.
-    RejectPartialClosure,
-    /// Expand explicit selection with published workspace dependents.
-    IncludeDependents,
-}
-
 #[derive(Default)]
 struct PlanningInputs {
     pending: PendingChangeSet,
@@ -279,12 +258,7 @@ impl<'a> ReleasePlanner<'a> {
     ///
     /// Uses dependency order for deterministic crate sequencing and computes
     /// per-crate publish/tag/changelog intent.
-    pub fn plan(
-        &self,
-        crate_names: Option<Vec<String>>,
-        bump_request: &BumpRequest,
-        dependent_policy: DependentPolicy,
-    ) -> RailResult<ReleasePlan> {
+    pub fn plan(&self, crate_names: Option<Vec<String>>, bump_request: &BumpRequest) -> RailResult<ReleasePlan> {
         if matches!(bump_request, BumpRequest::Auto)
             && self.release_config.source.uses_commits()
             && is_shallow_repository(self.ctx.workspace_root())?
@@ -294,7 +268,7 @@ impl<'a> ReleasePlanner<'a> {
                 "fetch full history and tags before selecting an automatic commit bump",
             ));
         }
-        let ordered_targets = self.resolve_targets(crate_names, dependent_policy)?;
+        let ordered_targets = self.resolve_targets(crate_names)?;
         self.validate_touched_version_groups(&ordered_targets)?;
 
         let mut crate_plans = Vec::with_capacity(ordered_targets.len());
@@ -393,21 +367,13 @@ impl<'a> ReleasePlanner<'a> {
             }
             plan.presentation = Some(presentation::capture(
                 self.ctx.workspace_root(),
-                self.release_config,
                 plan,
                 &date,
                 github.as_ref(),
             )?);
         }
-        let cargo_writes = crate::release::cargo_projection::plan_writes(
-            self.ctx,
-            &crate_plans,
-            &self.release_config.auxiliary_cargo_manifests,
-        )?;
-
         Ok(ReleasePlan {
             plan_contract_version: RELEASE_PLAN_CONTRACT_VERSION,
-            artifacts: super::artifacts::plan(self.release_config, &crate_plans)?,
             snapshot_id: self.ctx.snapshot()?.id().to_string(),
             source: self.release_config.source,
             canonical_crate_order,
@@ -415,74 +381,36 @@ impl<'a> ReleasePlanner<'a> {
             summary,
             change_files_to_delete: consumption.delete,
             change_files_to_update,
-            cargo_writes,
+            cargo_writes: Vec::new(),
             skipped,
         })
     }
 
+    /// Fill `plan.cargo_writes` with the exact manifest and lockfile bytes after the release.
+    pub fn project_writes(&self, plan: &mut ReleasePlan) -> RailResult<()> {
+        plan.cargo_writes = crate::release::cargo_projection::plan_writes(
+            self.ctx,
+            &plan.crates,
+            &self.release_config.auxiliary_cargo_manifests,
+        )?;
+        Ok(())
+    }
+
     fn planning_inputs(&self) -> RailResult<PlanningInputs> {
-        let pending =
-            if self.release_config.source.uses_changes() || self.release_config.require_change_files.is_enabled() {
-                PendingChangeSet::load(
-                    self.ctx.workspace_root(),
-                    &self.release_config.change_dir,
-                    self.ctx.graph().workspace_members(),
-                )?
-            } else {
-                PendingChangeSet::default()
-            };
+        let pending = if self.release_config.source.uses_changes() {
+            PendingChangeSet::load(
+                self.ctx.workspace_root(),
+                &self.release_config.change_dir,
+                self.ctx.graph().workspace_members(),
+            )?
+        } else {
+            PendingChangeSet::default()
+        };
         Ok(PlanningInputs {
             pending,
             head: self.ctx.git()?.git().head_commit()?,
             ..Default::default()
         })
-    }
-
-    /// Gather diagnostics and reviewed coverage using the selected source's attribution rules.
-    pub fn release_check_insights(&self, crate_names: &[String]) -> RailResult<ReleaseCheckInsights> {
-        let mut inputs = self.planning_inputs()?;
-        let mut insights = ReleaseCheckInsights {
-            shallow_repository: is_shallow_repository(self.ctx.workspace_root())?,
-            ..Default::default()
-        };
-        for name in crate_names {
-            let previous = self.find_previous_tag(name)?;
-            let overrides = self
-                .ctx
-                .config()
-                .and_then(|config| config.crates.get(name))
-                .and_then(|config| config.changelog.as_ref());
-            let has_code = if self.release_config.source.uses_commits() {
-                let filters = overrides
-                    .and_then(|config| config.filters.as_ref())
-                    .unwrap_or(&self.release_config.changelog.filters);
-                let history = history_for_range(
-                    &mut inputs.histories,
-                    &CommitAttributor::new(self.ctx),
-                    previous,
-                    &inputs.head,
-                    filters,
-                )?;
-                if self.release_config.unconventional_commits != CommitPolicy::Allow
-                    && !overrides.is_some_and(|config| config.skip)
-                {
-                    let diagnostics = ChangelogSpec::resolve(&self.release_config.changelog, overrides)?
-                        .diagnose(&history.commit_refs_for_crate(name));
-                    if !diagnostics.is_empty() {
-                        insights.commit_diagnostics.push((name.clone(), diagnostics));
-                    }
-                }
-                history.has_code_changes(name)
-            } else {
-                self.changed_code_crates(previous, &mut inputs.changed_code)?
-                    .contains(name)
-            };
-            if self.release_config.requires_change_file(name) && !inputs.pending.covers(name) && has_code {
-                insights.missing_change_files.push(name.clone());
-            }
-        }
-        insights.missing_change_files.sort();
-        Ok(insights)
     }
 
     fn changed_code_crates<'b>(
@@ -596,8 +524,11 @@ impl<'a> ReleasePlanner<'a> {
 
         // Cargo's registry allowlist is the hard ceiling. Repository policy
         // may narrow that authority but can never widen it.
-        let publish_from_cargo = crate::workspace::CargoState::package_allows_registry(package, RELEASE_REGISTRY);
-        let publish = publish_from_cargo
+        let publish = self
+            .release_config
+            .publish
+            .registry()
+            .is_some_and(|registry| crate::workspace::CargoState::package_allows_registry(package, registry))
             && crate_config
                 .and_then(|c| c.release.as_ref())
                 .map(|r| r.publish)
@@ -651,20 +582,6 @@ impl<'a> ReleasePlanner<'a> {
                 .then(|| format!("- synchronized version with version group {}.", force.name))
         });
         let bump = format!("{} -> {}", current_version, new_version);
-        let publish_intent = if publish {
-            "publish_to_crates_io".to_string()
-        } else {
-            "skip_publish".to_string()
-        };
-
-        let api_evidence = semver_checks::assess(
-            self.ctx,
-            crate_name,
-            publish,
-            previous_tag.as_deref(),
-            self.release_config.semver_check,
-            explicit_signal,
-        )?;
         Ok(CratePlanOutcome::Planned(Box::new(CrateReleasePlan {
             name: crate_name.to_string(),
             current_version,
@@ -676,8 +593,7 @@ impl<'a> ReleasePlanner<'a> {
             changelog_range_start: previous_tag,
             changelog_range_end: inputs.head.clone(),
             publish,
-            publish_intent,
-            api_evidence,
+            reviewed_level: explicit_signal,
             generate_changelog,
             bump,
             bump_reason,
@@ -849,25 +765,18 @@ impl<'a> ReleasePlanner<'a> {
         updates
     }
 
-    /// Format git tag name for a crate
-    ///
-    /// Supports placeholders:
-    /// - {prefix} - the tag_prefix config value (default: "v")
-    /// - {crate} - the crate name
-    /// - {version} - the version number
-    fn format_tag(&self, crate_name: &str, version: &Version) -> String {
+    /// Format git tag name for a crate from its `{crate}` and `{version}` template.
+    pub(crate) fn format_tag(&self, crate_name: &str, version: &Version) -> String {
         self.format_tag_value(crate_name, &version.to_string())
     }
 
     fn format_tag_value(&self, crate_name: &str, version: &str) -> String {
-        const VERSION_PLACEHOLDER: &str = "\u{7b}version\u{7d}";
-        self.ctx
+        let format = self
+            .ctx
             .config()
             .and_then(|config| config.release_tag_format_override(crate_name))
-            .unwrap_or(&self.release_config.tag_format)
-            .replace("{prefix}", &self.release_config.tag_prefix)
-            .replace("{crate}", crate_name)
-            .replace(VERSION_PLACEHOLDER, version)
+            .unwrap_or(&self.release_config.tag_format);
+        crate::config::render_tag_template(format, crate_name, version)
     }
 
     fn find_previous_tag(&self, crate_name: &str) -> RailResult<Option<String>> {
@@ -876,59 +785,39 @@ impl<'a> ReleasePlanner<'a> {
         self.ctx.git()?.git().find_latest_tag(&pattern)
     }
 
-    pub(crate) fn resolve_targets(
-        &self,
-        crate_names: Option<Vec<String>>,
-        dependent_policy: DependentPolicy,
-    ) -> RailResult<Vec<String>> {
-        let all_ordered = self.ctx.graph().publish_order()?;
+    /// The selected crates and every published dependent and version-group member they need,
+    /// in publication order. No selection means every crate the release manages.
+    pub(crate) fn resolve_targets(&self, crate_names: Option<Vec<String>>) -> RailResult<Vec<String>> {
+        let all_ordered = self
+            .ctx
+            .graph()
+            .publish_order()?
+            .into_iter()
+            .filter(|name| self.release_config.is_release_crate(name))
+            .collect::<Vec<_>>();
         let Some(targets) = crate_names else {
             return Ok(all_ordered);
         };
         for crate_name in &targets {
             self.workspace_package_id(crate_name)?;
-        }
-
-        let requested: HashSet<String> = targets.into_iter().collect();
-
-        if dependent_policy == DependentPolicy::RejectPartialClosure {
-            self.reject_partial_version_groups(&requested)?;
-        }
-
-        let requested_ids = self.workspace_package_ids(&requested)?;
-        let dependents = self.published_dependents(&requested_ids)?;
-        if !dependents.is_empty() && dependent_policy == DependentPolicy::RejectPartialClosure {
-            let mut missing: Vec<String> = dependents.into_iter().collect();
-            missing.sort();
-            return Err(RailError::with_help(
-                format!(
-                    "partial release would leave dependent crate(s) out of sync: {}",
-                    missing.join(", ")
-                ),
-                "re-run with --include-dependents or release the full dependent closure",
-            ));
-        }
-
-        if dependent_policy == DependentPolicy::IncludeDependents {
-            let mut selected = requested;
-            loop {
-                let before = selected.len();
-                self.expand_selected_version_groups(&mut selected);
-                let selected_ids = self.workspace_package_ids(&selected)?;
-                let dependents = self.published_dependents(&selected_ids)?;
-                selected.extend(dependents);
-                self.expand_selected_version_groups(&mut selected);
-                if selected.len() == before {
-                    break;
-                }
+            if !self.release_config.is_release_crate(crate_name) {
+                return Err(RailError::with_help(
+                    format!("'{crate_name}' is not a crate this release manages"),
+                    "add it to release.crates, or select a listed crate",
+                ));
             }
-            return Ok(all_ordered.into_iter().filter(|name| selected.contains(name)).collect());
         }
-
-        Ok(all_ordered
-            .into_iter()
-            .filter(|name| requested.contains(name))
-            .collect())
+        let mut selected: HashSet<String> = targets.into_iter().collect();
+        loop {
+            let before = selected.len();
+            self.expand_selected_version_groups(&mut selected);
+            let selected_ids = self.workspace_package_ids(&selected)?;
+            selected.extend(self.published_dependents(&selected_ids)?);
+            if selected.len() == before {
+                break;
+            }
+        }
+        Ok(all_ordered.into_iter().filter(|name| selected.contains(name)).collect())
     }
 
     fn workspace_package_id(&self, crate_name: &str) -> RailResult<&PackageId> {
@@ -945,10 +834,12 @@ impl<'a> ReleasePlanner<'a> {
             .transitive_dependents_of_ids(selected)?
             .into_iter()
             .filter(|name| {
-                self.ctx
-                    .cargo()
-                    .get_package(name)
-                    .is_some_and(crate::workspace::CargoState::is_package_publishable)
+                self.release_config.is_release_crate(name)
+                    && self
+                        .ctx
+                        .cargo()
+                        .get_package(name)
+                        .is_some_and(crate::workspace::CargoState::is_package_publishable)
             })
             .collect())
     }
@@ -966,30 +857,6 @@ impl<'a> ReleasePlanner<'a> {
             .iter()
             .find(|(_, members)| members.iter().any(|member| member == crate_name))
             .map(|(name, members)| (name.as_str(), members.as_slice()))
-    }
-
-    fn reject_partial_version_groups(&self, selected: &HashSet<String>) -> RailResult<()> {
-        for (group_name, members) in &self.release_config.version_groups {
-            let selected_count = members.iter().filter(|member| selected.contains(*member)).count();
-            if selected_count == 0 || selected_count == members.len() {
-                continue;
-            }
-            let mut missing: Vec<_> = members
-                .iter()
-                .filter(|member| !selected.contains(*member))
-                .cloned()
-                .collect();
-            missing.sort();
-            return Err(RailError::with_help(
-                format!(
-                    "partial release would leave version group '{}' out of sync: missing {}",
-                    group_name,
-                    missing.join(", ")
-                ),
-                "re-run with --include-dependents or release every member of the version group",
-            ));
-        }
-        Ok(())
     }
 
     fn expand_selected_version_groups(&self, selected: &mut HashSet<String>) {
@@ -1051,102 +918,6 @@ pub(crate) fn is_shallow_repository(workspace_root: &Path) -> RailResult<bool> {
         return Err(RailError::message("failed to determine whether repository is shallow"));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
-}
-
-impl ReleasePlan {
-    /// Format summary for display
-    ///
-    /// Applies skip flags to presentation only; it does not mutate the plan.
-    pub fn format_summary_with_flags(&self, skip_publish: bool, skip_tag: bool) -> String {
-        let mut output = String::new();
-
-        output.push_str("📦 Release Plan\n\n");
-
-        for (i, crate_plan) in self.crates.iter().enumerate() {
-            output.push_str(&format!("{}. {}\n", i + 1, crate_plan.name));
-            output.push_str(&format!(
-                "   Version: {} → {}\n",
-                crate_plan.current_version, crate_plan.new_version
-            ));
-            output.push_str(&format!("   Bump: {} ({})\n", crate_plan.bump, crate_plan.bump_reason));
-
-            output.push_str(&format!(
-                "   API: {:?}: {}\n",
-                crate_plan.api_evidence.outcome, crate_plan.api_evidence.detail
-            ));
-
-            let tag_status = if skip_tag {
-                "✗ (--skip-tag)"
-            } else {
-                &crate_plan.tag_name
-            };
-            output.push_str(&format!("   Tag: {}\n", tag_status));
-
-            let publish_status = if skip_publish {
-                "✗ (not authorized; pass --publish)".to_string()
-            } else if crate_plan.publish {
-                "✓".to_string()
-            } else {
-                "✗ (publish = false)".to_string()
-            };
-            output.push_str(&format!("   Publish: {}\n", publish_status));
-            if let Some(artifact) = self
-                .artifacts
-                .iter()
-                .find(|artifact| artifact.package == crate_plan.name)
-            {
-                output.push_str(&format!("   Asset producer: {}\n", artifact.workflow));
-                for asset in &artifact.files {
-                    output.push_str(&format!("     {}", asset.name));
-                    if let Some(target) = &asset.target {
-                        output.push_str(&format!(" (target: {target})"));
-                    }
-                    if let Some(source) = &asset.source {
-                        output.push_str(&format!(" (committed source: {source})"));
-                    }
-                    output.push('\n');
-                }
-            }
-
-            if !crate_plan.affected_dependents.is_empty() {
-                output.push_str(&format!("   Affects: {}\n", crate_plan.affected_dependents.join(", ")));
-            }
-            output.push('\n');
-        }
-
-        if !self.cargo_writes.is_empty() {
-            output.push_str("Cargo file writes:\n");
-            for write in &self.cargo_writes {
-                output.push_str(&format!("  {}\n", write.path.display()));
-            }
-            output.push('\n');
-        }
-
-        if !self.skipped.is_empty() {
-            output.push_str("Skipped:\n");
-            for skip in &self.skipped {
-                output.push_str(&format!("  {} — {}\n", skip.name, skip.reason));
-            }
-            output.push('\n');
-        }
-
-        let effective_publish_count = if skip_publish {
-            0
-        } else {
-            self.summary.crates_to_publish
-        };
-        let effective_tag_count = if skip_tag { 0 } else { self.summary.crates_to_tag };
-
-        output.push_str(&format!(
-            "Summary: {} crate(s), {} to publish, {} tag(s), {} skipped\n",
-            self.summary.total_crates,
-            effective_publish_count,
-            effective_tag_count,
-            self.skipped.len()
-        ));
-
-        output
-    }
 }
 
 fn planned_change_entries(intents: &[ChangeIntent]) -> Vec<PlannedChangeEntry> {
