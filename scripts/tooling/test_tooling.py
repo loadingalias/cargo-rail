@@ -410,14 +410,15 @@ class ToolingLane(unittest.TestCase):
             index for index, line in enumerate(lines[start + 1:], start + 1)
             if line.startswith('  ') and not line.startswith('    ') and line.endswith(':')
         )
-        actions = [
-            line.strip()
-            for line in lines[start:end]
-            if line.strip().startswith('- uses: loadingalias/cargo-rail-action')
-        ]
-        self.assertGreaterEqual(len(actions), 2)
-        self.assertTrue(actions[0].startswith('- uses: loadingalias/cargo-rail-action/cache@'))
-        self.assertTrue(actions[1].startswith('- uses: loadingalias/cargo-rail-action@'))
+        job = [line.strip() for line in lines[start:end]]
+        cache = next(
+            index for index, line in enumerate(job)
+            if line.startswith('- uses: loadingalias/cargo-rail-action/cache@')
+        )
+        # The step that captures the plan publishes it as `steps.rail`.
+        plan = job.index('id: rail')
+        self.assertLess(cache, plan)
+        self.assertNotIn('id: rail', job[plan + 1:])
 
     def test_shared_recipe_rejects_invalid_workflow(self):
         with tempfile.TemporaryDirectory() as temporary:

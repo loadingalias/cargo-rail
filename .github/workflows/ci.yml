@@ -71,11 +71,30 @@ jobs:
           max-size: 10GiB
           root-portability: remap
           verify-remote: true
-      - uses: loadingalias/cargo-rail-action@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
-        id: rail
+      # Until CI pins Cargo-Rail 0.32: no released Cargo-Rail reads this repository's configuration,
+      # so the candidate plans every work item and serves each later `cargo rail` command.
+      # The Action still supplies the independent plan consumer that checks each selection.
+      - uses: loadingalias/cargo-rail-action/setup@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
         with:
           version: 0.30.1
-          all: ${{ github.event_name == 'workflow_dispatch' }}
+      - name: Build the candidate planner
+        run: |
+          suffix=""
+          if [[ "$RUNNER_OS" == Windows ]]; then suffix=.exe; fi
+          cargo build --locked --all-features --bin cargo-rail
+          # A copy outside target/ stays fixed while later steps rebuild the workspace.
+          mkdir -p "$RUNNER_TEMP/cargo-rail-candidate"
+          cp "target/debug/cargo-rail$suffix" "$RUNNER_TEMP/cargo-rail-candidate/"
+          printf '%s\n' "$RUNNER_TEMP/cargo-rail-candidate" >> "$GITHUB_PATH"
+      - name: Plan every work item with the candidate
+        id: rail
+        run: |
+          plan="$RUNNER_TEMP/cargo-rail-plan/plan.json"
+          mkdir -p "$RUNNER_TEMP/cargo-rail-plan"
+          cargo-rail rail plan --all --json > "$plan"
+          [[ "$(cargo-rail-action plan is-required "$plan" cargo.fmt)" == true ]]
+          required="$(python3 -c 'import json, sys; print(json.dumps(json.load(open(sys.argv[1]))["required"], separators=(",", ":")))' "$plan")"
+          printf 'plan-file=%s\nrequired-work=%s\n' "$plan" "$required" >> "$GITHUB_OUTPUT"
       - name: Check tooling and workflows
         if: matrix.platform == 'x86_64-linux' && contains(fromJSON(steps.rail.outputs.required-work), 'check-tooling')
         env:
