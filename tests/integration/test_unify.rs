@@ -8,7 +8,7 @@
 //! - dep_kinds display
 //! - End-to-end analyze → apply workflow
 
-use crate::helpers::{TestWorkspace, run_cargo_rail, run_cargo_rail_with_env, rustc_host_target};
+use crate::helpers::{TestWorkspace, cargo_rail_command, run_cargo_rail, run_cargo_rail_with_env, rustc_host_target};
 use anyhow::Result;
 use cargo_rail::source::SourceSnapshot;
 use cargo_rail::workspace::WorkspaceContext;
@@ -3249,6 +3249,48 @@ fn test_unify_apply_from_plan_file() {
             "workspace should be unified after plan apply"
         );
 
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
+fn test_unify_applies_a_plan_written_twice_or_redirected() {
+    let result: Result<()> = (|| {
+        let unify_workspace = |name: &str| -> Result<TestWorkspace> {
+            let workspace = TestWorkspace::new_named(name)?;
+            workspace.add_crate("crate-a", "0.1.0", &[("serde", r#""1.0""#)])?;
+            workspace.add_crate("crate-b", "0.1.0", &[("serde", r#""1.0""#)])?;
+            workspace.commit("Add crates that share a dependency")?;
+            Ok(workspace)
+        };
+        let apply = |workspace: &TestWorkspace, plan: &str| -> Result<()> {
+            let applied = run_cargo_rail(&workspace.path, &["rail", "unify", "apply", "--plan", plan])?;
+            anyhow::ensure!(applied.status.success(), "apply --plan {plan}: {applied:?}");
+            let post_check = run_cargo_rail(&workspace.path, &["rail", "unify", "--check"])?;
+            anyhow::ensure!(post_check.status.code() == Some(0), "{plan} left work: {post_check:?}");
+            Ok(())
+        };
+
+        // A second `--check -o` run captures the plan file the first run wrote.
+        let rerun = unify_workspace("unify-plan-written-twice")?;
+        for _ in 0..2 {
+            let check = run_cargo_rail(
+                &rerun.path,
+                &["rail", "unify", "--check", "-f", "json", "-o", "unify-plan.json"],
+            )?;
+            anyhow::ensure!(check.status.code() == Some(1), "check: {check:?}");
+        }
+        apply(&rerun, "unify-plan.json")?;
+
+        // `unify --check -f json > unify-plan.json`: the shell creates the plan file first.
+        let redirected = unify_workspace("unify-plan-redirected")?;
+        let check = cargo_rail_command(&redirected.path)?
+            .args(["rail", "unify", "--check", "-f", "json"])
+            .stdout(std::fs::File::create(redirected.path.join("unify-plan.json"))?)
+            .output()?;
+        anyhow::ensure!(check.status.code() == Some(1), "check: {check:?}");
+        apply(&redirected, "unify-plan.json")?;
         Ok(())
     })();
     super::helpers::finish_test(result);

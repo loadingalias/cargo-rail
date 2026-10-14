@@ -1658,6 +1658,33 @@ fn config_migrate_deletes_a_default_only_file_and_rejects_drift() {
 }
 
 #[test]
+fn config_migrate_applies_a_plan_redirected_into_the_worktree() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("config-migrate-redirect")?;
+        ws.add_crate("member", "0.1.0", &[])?;
+        let path = ws.path.join(".config/rail.toml");
+        fs::write(&path, "[release]\nrequire_clean = true\nsemver_check = \"off\"\n")?;
+        ws.commit("Retired configuration")?;
+
+        // `config migrate -f json > migrate.json`: the shell creates the plan file first.
+        let plan_path = ws.path.join("migrate.json");
+        let preview = cargo_rail_command(&ws.path)?
+            .args(["rail", "config", "migrate", "-f", "json"])
+            .stdout(fs::File::create(&plan_path)?)
+            .output()?;
+        assert!(preview.status.success(), "{preview:?}");
+        let applied = run_cargo_rail(
+            &ws.path,
+            &["rail", "config", "migrate", "apply", "--plan", "migrate.json"],
+        )?;
+        assert!(applied.status.success(), "{applied:?}");
+        assert!(!fs::read_to_string(&path)?.contains("require_clean"));
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
+}
+
+#[test]
 fn config_migrate_rejects_check_with_apply_and_keeps_explicit_files() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("config-migrate-explicit")?;

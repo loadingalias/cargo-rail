@@ -7,7 +7,7 @@
 
 use crate::error::{RailError, RailResult};
 use crate::git::SystemGit;
-use crate::utils::{canonicalize_existing, file_fingerprint};
+use crate::utils::{canonicalize_allow_missing, canonicalize_existing, file_fingerprint};
 use crate::workspace::WorkspaceContext;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -273,6 +273,22 @@ pub fn build_plan(
     build_plan_with_inputs(ctx, operation, actions, Vec::new(), risks, trace)
 }
 
+/// Build a deterministic mutation plan that this process writes to `output`.
+///
+/// The plan cannot bind the file it is written to, so the capture leaves `output` out,
+/// as apply leaves out its `--plan` file.
+pub fn build_plan_to_file(
+    ctx: &WorkspaceContext,
+    operation: &str,
+    actions: Vec<MutationAction>,
+    risks: Vec<MutationRisk>,
+    trace: Vec<MutationTrace>,
+    output: Option<&Path>,
+) -> RailResult<MutationPlan> {
+    let output = output.map(Path::to_path_buf).into_iter().collect::<Vec<_>>();
+    build_plan_excluding(ctx, operation, actions, Vec::new(), risks, trace, &output)
+}
+
 /// Build a deterministic mutation plan with explicit non-mutated file inputs.
 pub fn build_plan_with_inputs(
     ctx: &WorkspaceContext,
@@ -282,11 +298,23 @@ pub fn build_plan_with_inputs(
     risks: Vec<MutationRisk>,
     trace: Vec<MutationTrace>,
 ) -> RailResult<MutationPlan> {
+    build_plan_excluding(ctx, operation, actions, declared_inputs, risks, trace, &[])
+}
+
+fn build_plan_excluding(
+    ctx: &WorkspaceContext,
+    operation: &str,
+    actions: Vec<MutationAction>,
+    declared_inputs: Vec<MutationInput>,
+    risks: Vec<MutationRisk>,
+    trace: Vec<MutationTrace>,
+    own_outputs: &[PathBuf],
+) -> RailResult<MutationPlan> {
     let resolved_refs = MutationResolvedRefs {
         git_head: ctx.git()?.git().head_commit()?,
         git_branch: ctx.git()?.current_branch()?,
     };
-    let pre_apply = capture_pre_apply_checks(ctx)?;
+    let pre_apply = capture_pre_apply_checks(ctx, own_outputs)?;
 
     let inputs_fingerprint = mutation_fingerprint(
         ctx.git()?.git(),
@@ -349,14 +377,7 @@ pub fn validate_pre_apply_with_allowed_paths(
             "use the plan exactly as emitted; regenerate it if the file was edited",
         ));
     }
-    let mut current = capture_pre_apply_checks(ctx)?;
-    if !allowed_paths.is_empty() {
-        let git_root = canonicalize_existing(&ctx.git()?.git().worktree_root)?;
-        let allowed = allowed_worktree_paths(&git_root, allowed_paths)?;
-        current.changed_paths.retain(|path| !allowed.contains(path));
-        current.worktree_fingerprint = fingerprint_changed_paths(ctx.git()?.git(), &git_root, &current.changed_paths)?;
-        current.metadata_fingerprint = format!("snapshot:{}", ctx.snapshot()?.id_excluding_paths(&allowed)?);
-    }
+    let current = capture_pre_apply_checks(ctx, allowed_paths)?;
     let git = ctx.git()?.git();
     let mut changed_inputs = Vec::new();
     for input in &plan.declared_inputs {
@@ -562,20 +583,61 @@ fn sanitize_for_filename(input: &str) -> String {
         .to_lowercase()
 }
 
-fn capture_pre_apply_checks(ctx: &WorkspaceContext) -> RailResult<MutationPreApplyChecks> {
+/// Capture the state a plan binds, leaving out the plan's own files.
+///
+/// `excluded` names control files: the `-o` file a check writes, or the `--plan` file apply reads.
+/// A redirected standard output inside the worktree is also left out: `> plan.json` creates the
+/// file before the process starts, so no plan could bind it.
+fn capture_pre_apply_checks(ctx: &WorkspaceContext, excluded: &[PathBuf]) -> RailResult<MutationPreApplyChecks> {
     ctx.validate_snapshot_unchanged()?;
     let snapshot = ctx.snapshot()?;
     let git = ctx.git()?.git();
-    let changed_paths = ctx.changed_source_paths()?;
+    let mut changed_paths = ctx.changed_source_paths()?;
+    let git_root = canonicalize_existing(&git.worktree_root)?;
+    let mut excluded = allowed_worktree_paths(&git_root, excluded)?;
+    excluded.extend(redirected_standard_output(&git_root, &changed_paths));
+    let metadata_fingerprint = if excluded.is_empty() {
+        format!("snapshot:{}", snapshot.id())
+    } else {
+        changed_paths.retain(|path| !excluded.contains(path));
+        format!("snapshot:{}", snapshot.id_excluding_paths(&excluded)?)
+    };
     Ok(MutationPreApplyChecks {
         git_head: ctx.git()?.git().head_commit()?,
         config_fingerprint: snapshot.configuration_fingerprint().to_string(),
         toolchain_fingerprint: snapshot.toolchain_fingerprint().to_string(),
         lock_fingerprint: snapshot.lockfile_fingerprint(),
-        metadata_fingerprint: format!("snapshot:{}", snapshot.id()),
+        metadata_fingerprint,
         worktree_fingerprint: fingerprint_changed_paths(git, &git.worktree_root, &changed_paths)?,
         changed_paths,
     })
+}
+
+/// The changed worktree file that standard output is redirected to, if any.
+fn redirected_standard_output(git_root: &Path, changed: &[PathBuf]) -> Option<PathBuf> {
+    let stdout = standard_output_file().ok()?;
+    let length = stdout.metadata().ok().filter(fs::Metadata::is_file)?.len();
+    changed
+        .iter()
+        .find(|path| crate::utils::opened_file_matches_path(&stdout, &git_root.join(path), length).unwrap_or(false))
+        .cloned()
+}
+
+#[cfg(unix)]
+fn standard_output_file() -> std::io::Result<fs::File> {
+    use std::os::fd::AsFd as _;
+    Ok(fs::File::from(std::io::stdout().as_fd().try_clone_to_owned()?))
+}
+
+#[cfg(windows)]
+fn standard_output_file() -> std::io::Result<fs::File> {
+    use std::os::windows::io::AsHandle as _;
+    Ok(fs::File::from(std::io::stdout().as_handle().try_clone_to_owned()?))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn standard_output_file() -> std::io::Result<fs::File> {
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
 }
 
 /// Return the deduplicated workspace paths authorized by a plan.
@@ -626,6 +688,7 @@ pub fn validate_changed_paths_with_allowed_paths(
     allowed.extend(expected_paths(plan).into_iter().chain(declared_input_paths(plan)));
     // The context's capture predates the writes; only a live capture sees new untracked files.
     let changed = ctx.live_changed_source_paths()?;
+    allowed.extend(redirected_standard_output(&canonical_git_root, &changed));
     let unexpected: Vec<_> = changed.into_iter().filter(|path| !allowed.contains(path)).collect();
     if unexpected.is_empty() {
         return Ok(());
@@ -639,16 +702,13 @@ pub fn validate_changed_paths_with_allowed_paths(
     ))
 }
 
+/// Worktree-relative forms of control-file paths; a relative path is relative to the current directory.
 fn allowed_worktree_paths(git_root: &Path, paths: &[PathBuf]) -> RailResult<BTreeSet<PathBuf>> {
     let mut allowed = BTreeSet::new();
     for path in paths {
-        if path.is_absolute() {
-            let canonical = canonicalize_existing(path)?;
-            if let Ok(relative) = canonical.strip_prefix(git_root) {
-                allowed.insert(relative.to_path_buf());
-            }
-        } else {
-            allowed.insert(path.clone());
+        let canonical = canonicalize_allow_missing(path)?;
+        if let Ok(relative) = canonical.strip_prefix(git_root) {
+            allowed.insert(relative.to_path_buf());
         }
     }
     Ok(allowed)

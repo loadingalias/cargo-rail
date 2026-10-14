@@ -1068,12 +1068,13 @@ pub fn run_unify_analyze(ctx: &WorkspaceContext, options: UnifyAnalyzeOptions<'_
         let proof_certificates = proof_certificates_to_json(ctx, &plan, msrv_write_needed)?;
         let proof_fingerprint = proof_set_fingerprint(&proof_certificates);
         let mutation_plan = if ctx.has_git() {
-            Some(mutation::build_plan(
+            Some(mutation::build_plan_to_file(
                 ctx,
                 "unify",
                 actions.clone(),
                 risks.clone(),
                 trace.clone(),
+                output.map(PathBuf::as_path),
             )?)
         } else {
             None
