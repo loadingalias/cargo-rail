@@ -868,6 +868,9 @@ fn a_version_published_from_another_commit_stops_the_release() {
         git(&fixture.root, &["tag", "-d", "base-v0.2.0"])?;
         git(&fixture.root, &["reset", "--quiet", "--hard", &start])?;
         fixture.github.with(|state| state.releases.clear());
+        // Different content, so the second release commit differs even within the same second.
+        let source = fixture.root.join("crates/base/src/lib.rs");
+        std::fs::write(&source, std::fs::read_to_string(&source)? + "// Another source.\n")?;
         let other = legacy_release(&fixture)?;
         assert_ne!(other, commit);
 
