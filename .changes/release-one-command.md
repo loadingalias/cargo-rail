@@ -1,5 +1,5 @@
 ---
-cargo-rail = "minor"
+cargo-rail = "major"
 ---
 
 Replace the release subcommands with one stateless command, `cargo rail release`.
