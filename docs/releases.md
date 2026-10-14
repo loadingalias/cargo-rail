@@ -196,6 +196,10 @@ jobs:
     environment: release
     permissions:
       contents: write
+      actions: read
+      checks: read
+      pull-requests: read
+      statuses: read
     steps:
       - uses: actions/checkout@<sha>
         with:
@@ -213,6 +217,8 @@ the checkout keeps no credentials.
 It commits as `github-actions[bot]` unless the checkout configures an identity.
 Use crates.io trusted publishing to mint `CARGO_REGISTRY_TOKEN` instead of storing a secret.
 Use a token that may push to the branch when branch rules block `github.token`, or use `pull-request: true`.
+The read permissions let the release read the source commit's checks, this workflow run,
+and release pull requests; `pull-request: true` needs `pull-requests: write`.
 
 Its inputs are `crates`, `bump`, `pull-request`, `dry-run`, `token`, and `version`.
 Its outputs are `state`, `commit`, `tags` (a JSON array), and `pull-request`.

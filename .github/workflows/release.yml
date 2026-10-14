@@ -22,6 +22,10 @@ jobs:
     environment: release
     permissions:
       contents: write # Push the release commit and tag, and create the draft release.
+      actions: read # Exclude this run from the checks gate.
+      checks: read # Read the source commit's check runs.
+      pull-requests: read # Find open and merged release pull requests.
+      statuses: read # Read the source commit's commit statuses.
     outputs:
       state: ${{ steps.release.outputs.state }}
       tag: ${{ steps.release.outputs.tag }}
@@ -91,6 +95,10 @@ jobs:
     environment: release
     permissions:
       contents: write # Publish the GitHub release.
+      actions: read # Exclude this run from the checks gate.
+      checks: read # Read the source commit's check runs.
+      pull-requests: read # Find merged release pull requests.
+      statuses: read # Read the source commit's commit statuses.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
