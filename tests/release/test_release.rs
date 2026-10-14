@@ -221,6 +221,7 @@ impl Fixture {
     }
 
     /// Record an attestation for `name` made from `commit`, as `actions/attest` would.
+    #[cfg(unix)]
     fn attest(&self, name: &str, commit: &str) -> Result<()> {
         std::fs::write(self.attested.join(name), commit)?;
         Ok(())
@@ -355,6 +356,8 @@ fn dependent_crates_publish_in_order_and_a_failed_upload_finishes_on_rerun() {
     finish_test(result);
 }
 
+// The fake `gh` is a POSIX script; on Windows, `Command::new("gh")` finds only `gh.exe`.
+#[cfg(unix)]
 #[test]
 fn assets_hold_every_irreversible_effect_until_each_attested_file_is_attached() {
     let result: Result<()> = (|| {
