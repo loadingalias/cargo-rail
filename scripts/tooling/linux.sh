@@ -55,9 +55,11 @@ chmod 755 "$temporary" "$temporary/lists" "$temporary/lists/partial"
 for suite in "$codename" "$codename-updates" "$codename-security"; do
   printf 'deb [target=Packages check-valid-until=no signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/%s %s main universe\n' "$snapshot" "$suite"
 done > "$temporary/sources.list"
+# The snapshot service is the only package source and can return HTTP 502 and 503 for minutes.
+# apt retries transient errors after delays that double from 1 to 30 seconds; eight retries span about two minutes.
 apt_options=(-o "Dir::Etc::sourcelist=$temporary/sources.list" -o Dir::Etc::sourceparts=-
   -o "Dir::State::lists=$temporary/lists" -o APT::Update::Error-Mode=any
-  -o Acquire::Retries=3 -o Acquire::https::Timeout=30 -o Acquire::Languages=none)
+  -o Acquire::Retries=8 -o Acquire::https::Timeout=30 -o Acquire::Languages=none)
 apt=("${sudo_cmd[@]}" env DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}")
 "${apt[@]}" update
 catalog_get() { python3 "$SCRIPT_DIR/catalog.py" get "$@"; }
