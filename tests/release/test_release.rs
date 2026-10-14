@@ -5,7 +5,7 @@ use crate::fakes::{Check, FakeGithub, FakeRegistry, write_gh, write_ssh};
 use crate::helpers::{cargo_command, cargo_rail_command, finish_test, git};
 use anyhow::{Context as _, Result, ensure};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Output;
 
 struct Fixture {
@@ -230,14 +230,12 @@ impl Fixture {
         self.registry.with(|state| state.attempts.clone())
     }
 
-    fn hook(&self, repository: &Path, name: &str, script: &str) -> Result<()> {
+    #[cfg(unix)]
+    fn hook(&self, repository: &std::path::Path, name: &str, script: &str) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
         let path = repository.join("hooks").join(name);
         std::fs::write(&path, script)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
-        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
         Ok(())
     }
 }

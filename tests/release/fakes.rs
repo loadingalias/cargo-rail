@@ -667,11 +667,15 @@ printf '[{"verificationResult":{"signature":{"certificate":{"sourceRepositoryDig
     executable(&path)
 }
 
+#[cfg(unix)]
 fn executable(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
-    }
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+/// Windows has no executable mode bit.
+#[cfg(not(unix))]
+fn executable(_path: &Path) -> Result<()> {
     Ok(())
 }
