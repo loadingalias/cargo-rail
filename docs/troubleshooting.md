@@ -1,7 +1,7 @@
 # Troubleshooting
 
-Start with Cargo-Rail's decision or status output.
-It records the failed boundary and the safe next command.
+Start with the decision output or status output of Cargo-Rail.
+That output records the failed boundary and the safe next command.
 
 ## A plan selected the wrong work
 
@@ -10,21 +10,24 @@ cargo rail plan --explain
 cargo rail plan --json | jq '{inputs, changes, required, work, evidence}'
 ```
 
-Check in this order:
+Do these checks in this order:
 
-1. `inputs.base`, `inputs.head`, and `inputs.head_commit` identify the intended comparison.
-1. `changes` contains the expected file, Cargo, and configuration deltas.
-1. `work.NAME.state` says whether the item is required or skipped.
-   Its `.evidence` entries refer to the top-level `evidence` map; required items also have a `.cause`.
-1. Required items have `work.NAME.scope`, which contains the package, target,
-   or variant selector used by the executor.
+1. Make sure that `inputs.base`, `inputs.head`, and `inputs.head_commit` identify the intended comparison.
+1. Make sure that `changes` contains the expected file, Cargo, and configuration deltas.
+1. Read `work.NAME.state`.
+   It shows whether the item is required or skipped.
+   The `.evidence` entries of the item refer to the top-level `evidence` map.
+   A required item also has a `.cause`.
+1. For a required item, read `work.NAME.scope`.
+   It contains the package, target, or variant selector that the executor uses.
 
 Explanations and evidence are not execution input.
-If the plan is correct but execution is wrong, inspect the consumer that lowered the typed scope.
-Transfer one exact plan across CI jobs; independently re-planned work can differ when the base,
-source, Cargo universe, toolchain, catalog, platform, or evidence differs.
+If the plan is correct but execution is wrong, examine the consumer that lowered the typed scope.
+Transfer one exact plan between CI jobs.
+If each job makes its own plan, the work can differ when the base, source, Cargo universe,
+toolchain, catalog, platform, or evidence differs.
 
-See [Planning](planning.md) for the consumer contract.
+For the consumer contract, see [Planning](planning.md).
 
 ## Configuration differs from expectation
 
@@ -40,88 +43,104 @@ A global `--config` option bypasses discovery.
 
 ## Cargo metadata fails
 
-Every Cargo metadata failure names one cause, one recovery,
-and a `reproduce:` command that repeats the exact Cargo invocation, including `--locked`.
-Named causes are a stale `Cargo.lock`, an unloadable manifest, an unavailable target or `rustc`,
-and a missing Cargo executable.
+Each Cargo metadata failure gives one cause, one recovery, and a `reproduce:` command.
+This command repeats the exact Cargo invocation, including `--locked`.
+The named causes are a stale `Cargo.lock`, a manifest that Cargo cannot load,
+a target or `rustc` that is not available, and a missing Cargo executable.
 
-When a Cargo credential capability is active, such as a registry token or credential provider,
-Cargo's output is withheld because it can contain provider output.
-Manifest failures are the exception: Cargo reports them before it contacts a registry.
-Run the reproduction command to see Cargo's complete output.
+A registry token and a credential provider are examples of a Cargo credential capability.
+When a Cargo credential capability is active, Cargo-Rail does not show the output of Cargo,
+because that output can contain provider output.
+Manifest failures are the exception: Cargo-Rail shows their output,
+because Cargo reports them before it contacts a registry.
+To see the complete output of Cargo, run the reproduction command.
 
-A JSON error names its class in `failure_class`: `lockfile`, `manifest`, `toolchain`, or `cargo`.
+A JSON error gives its class in `failure_class`.
+The class is `lockfile`, `manifest`, `toolchain`, or `cargo`.
 
 ## Unify compiler evidence fails
 
 Unify compiles the workspace to prove which dependencies are unused.
-When one compiler-evidence view fails, Unify stops, exits `2`, and reports one cause,
-one recovery section, and a `reproduce with Cargo:` command.
-That command runs the view's Cargo command in the workspace root,
-outside Cargo-Rail's private target directory.
+When one compiler-evidence view fails, Unify stops and exits `2`.
+It reports one cause, one recovery section, and a `reproduce with Cargo:` command.
+That command runs the Cargo command of the view in the workspace root,
+outside the private target directory of Cargo-Rail.
 
 | `failure_class` | Cause | Recovery |
 | --- | --- | --- |
-| `build_script` | A package's build script failed | Provide the tools, files, or environment it needs |
-| `source` | Rust source failed to compile | Fix the compiler errors shown under the cause |
+| `build_script` | The build script of a package failed | Supply the tools, files, or environment that it needs |
+| `source` | Rust source failed to compile | Fix the compiler errors that appear under the cause |
 | `toolchain` | A target library, linker, `rustc`, or `RUSTC_WRAPPER` is missing or cannot run | Install or correct it, or narrow `unify.compiler_targets` |
-| `cargo_rail` | Cargo-Rail's compiler adapter failed | Report the `--verbose` output as a Cargo-Rail defect |
+| `cargo_rail` | The compiler adapter of Cargo-Rail failed | Report the `--verbose` output as a Cargo-Rail defect |
 | `cargo` | Any other Cargo failure | Run the reproduction command |
-| `interrupted` | SIGINT or SIGTERM stopped compiler acquisition | Rerun the same command |
+| `interrupted` | SIGINT or SIGTERM stopped compiler acquisition | Run the same command again |
 
-A build-script failure lists the environment variable names that the script declares with `rerun-if-env-changed`.
+A build-script failure lists the names of the environment variables that the script declares with `rerun-if-env-changed`.
 Unify never prints their values.
-Text mode shows the last lines of the build script's own stderr under the cause.
-Any exact value of an inherited environment variable in that text appears as `<env:NAME>`.
-Cargo's complete output appears only with `--verbose`, and never when a Cargo credential capability is active.
+In text mode, Unify shows the last lines of the build script's own stderr under the cause.
+Unify replaces each exact value of an inherited environment variable in that text with `<env:NAME>`.
+The complete output of Cargo appears only with `--verbose`.
+It never appears when a Cargo credential capability is active.
 When a build script reports a missing native tool through the `cc`, `cmake`, or `pkg-config` crates,
-or source reads a file that does not exist, the cause names that tool or file,
-redacted the same way.
+the cause names that tool.
+When source reads a file that does not exist, the cause names that file.
+Unify applies the same redaction to these names.
 JSON errors contain no other Cargo or build-script output.
 
-Setting `unify.compiler_targets = "none"` runs Unify without compiler evidence.
-Unify then keeps every dependency whose use it cannot prove.
+With `unify.compiler_targets = "none"`, Unify runs without compiler evidence.
+Unify then keeps each dependency whose use it cannot prove.
 
-Unify writes progress to stderr, including with `--format json`; stdout stays one JSON value.
-When a phase prints nothing for 30 seconds,
-a `Still running:` line names the phase and whether Cargo-Rail is analyzing, waiting for a Cargo subprocess,
-or waiting for Cargo's file lock.
-A Cargo file-lock wait is reported as soon as Cargo reports it.
-`--quiet` suppresses progress.
+Unify writes progress to stderr, also with `--format json`.
+With `--format json`, stdout stays one JSON value.
+When a phase prints nothing for 30 seconds, Unify prints a `Still running:` line.
+This line names the phase.
+It also tells whether Cargo-Rail is analyzing, waiting for a Cargo subprocess,
+or waiting for the Cargo file lock.
+Unify reports a Cargo file-lock wait as soon as Cargo reports it.
+`--quiet` disables progress output.
 
-A repository wrapper should pass stderr through as it arrives and capture only stdout:
+In a repository wrapper, pass stderr through as it arrives and capture only stdout:
 
 ```bash
 cargo rail unify --check --format json > target/unify.json
 ```
 
-Progress is plain lines on stderr, written as each event happens, in every output format.
-A wrapper relays it unchanged without parsing it.
-Capturing both streams until the command exits, as `$(cargo rail unify --check 2>&1)` does, hides all progress for the whole run.
-`--diagnostics-file` records each completed phase in `progress_phases`, with its activity, whether Cargo waited for a file lock,
-and its duration.
+In every output format, progress is plain lines on stderr.
+Unify writes each line when its event occurs.
+A wrapper relays progress unchanged, without parsing it.
+If a wrapper captures both streams until the command exits,
+all progress stays hidden for the full run.
+`$(cargo rail unify --check 2>&1)` is an example of this capture.
+`--diagnostics-file` records each completed phase in `progress_phases`.
+Each record includes the activity of the phase, whether Cargo waited for a file lock,
+and the duration of the phase.
 
-An interrupted acquisition stops its Cargo process tree and names the phase it interrupted.
-Compiler acquisition writes only to its private target directory, so no workspace file has changed.
-Outside compiler acquisition, SIGINT and SIGTERM end the process immediately;
-a second signal always does.
+An interrupted acquisition stops its Cargo process tree and names the interrupted phase.
+Compiler acquisition writes only to its private target directory,
+so the workspace files stay unchanged.
+Outside compiler acquisition, SIGINT and SIGTERM stop the process immediately.
+A second signal always stops the process immediately.
 
 ## Surface is unavailable or reports unexpected findings
 
-A `cargo install` or single-binary `cargo binstall` installation lacks the embedded Surface component set.
-`cargo rail surface --schema` remains available without it.
-Install and extract a supported native ZIP with all its components kept together,
-or select an independently authenticated [compiler adapter pack](caching.md#select-an-independent-compiler-adapter).
-Prepare the exact workspace-selected toolchain with:
+An installation from `cargo install` or from single-binary `cargo binstall` does not have the embedded Surface component set.
+`cargo rail surface --schema` is still available without that component set.
+Use one of these options:
+
+- Install and extract a supported native ZIP.
+  Keep all its components together.
+- Select an independently authenticated [compiler adapter pack](caching.md#select-an-independent-compiler-adapter).
+
+To prepare the exact toolchain that the workspace selects, run this command:
 
 ```bash
 cargo rail surface --prepare --json
 ```
 
-Preparation may install `rustc-dev` for the selected rustup toolchain.
+Preparation can install `rustc-dev` for the selected rustup toolchain.
 It does not change the default toolchain.
 
-For an unexpected gate or finding, inspect planning, policy, readiness,
+For an unexpected gate or finding, examine planning, policy, readiness,
 and report authority separately:
 
 ```bash
@@ -131,18 +150,18 @@ cargo rail surface --prepare --json
 cargo rail surface --check --json
 ```
 
-Before changing policy, verify the report's audited and open targets, products, target views,
-feature views, and completeness.
-Any open compiler-crate observation preserves the declaration.
+Before you change policy, verify these values in the report: audited and open targets, products,
+target views, feature views, and completeness.
+An open compiler-crate observation keeps the declaration.
 Use `consumer_scope = "workspace"` only when the workspace contains every consumer of its private compiler crates.
 Prove that boundary with reviewed inventories of published APIs, downstream repositories, plugins,
 generated code, and build-script or proc-macro consumers.
-Cargo metadata from this checkout cannot prove that external set is empty.
+Cargo metadata from this checkout cannot prove that the external set is empty.
 
-If one compiler view fails, correct the source failure
-and run the exact `surface --resume` command printed by the error.
-The acquisition journal identifies completed and pending views
-but never authorizes cached facts by itself.
+If one compiler view fails, correct the source failure.
+Then run the exact `surface --resume` command that the error prints.
+The acquisition journal identifies completed and pending views.
+The journal alone never authorizes cached facts.
 
 ## Compiler reuse did not happen
 
@@ -153,32 +172,41 @@ cargo rail cache status --scope local --json
 cargo rail doctor native-cache --json
 ```
 
-A missing compiler identity, incremental compilation, unsupported compiler class,
-conflicting wrapper, or incomplete input evidence executes the original compiler.
+With any of these conditions, the original compiler runs:
+
+- a missing compiler identity;
+- incremental compilation;
+- an unsupported compiler class;
+- a conflicting wrapper; or
+- incomplete input evidence.
+
 An installation without embedded component authority also needs an independently authenticated
 [compiler adapter pack](caching.md#select-an-independent-compiler-adapter).
-Pack authentication, compilation, or calibration failure safely bypasses native reuse;
+If pack authentication, compilation, or calibration fails, Cargo-Rail safely bypasses native reuse.
 Surface fails when it requires those compiler facts.
-Physical-root mode also binds the canonical checkout;
-use `--root-portability remap` only for certified cross-root Rust metadata and library results.
-External `CARGO_TARGET_DIR` locations are supported for eligible native results.
-A bypass is safe fallback, not a failed hit.
+Physical-root mode also binds the canonical checkout.
+Use `--root-portability remap` only for certified cross-root Rust metadata and library results.
+Cargo-Rail supports external `CARGO_TARGET_DIR` locations for eligible native results.
+A bypass is a safe fallback, not a failed hit.
 
-`native_cache_hardware_qualification_unavailable` means the operating system is recognized
-but its architecture is not in the [native host table](caching.md#native-host-eligibility).
-`native_cache_platform_qualification_unavailable` means the operating system is unsupported.
-An explicit target is not an automatic bypass.
-Reuse requires the selected target's compiler distribution, target definition, sysroot,
-and target-library evidence; linked outputs also require complete linker evidence.
-Inspect the reported missing boundary before changing the build target.
+`native_cache_hardware_qualification_unavailable` means that Cargo-Rail recognizes the operating system,
+but the architecture is not in the [native host table](caching.md#native-host-eligibility).
+`native_cache_platform_qualification_unavailable` means that the operating system is not supported.
+An explicit target does not cause an automatic bypass.
+Reuse requires the compiler distribution, target definition, sysroot,
+and target-library evidence of the selected target.
+Linked outputs also require complete linker evidence.
+Before you change the build target, examine the missing boundary in the report.
 
-Status schema 18 keeps native failure-reason counters outside the bounded 65,536-event usage ledger.
-Inspect `status.installation.usage.failure_reason_counts_available` before interpreting `status.installation.usage.failure_reasons`.
-The ledger stops accepting events when full; the separate failure counters continue to advance.
-A strict `cache probe` verifies authenticated provider and protocol readiness without exposing the remote URL,
-object names, credentials, or local paths.
+Status schema 18 keeps the native failure-reason counters outside the usage ledger.
+The usage ledger has a bound of 65,536 events.
+Before you interpret `status.installation.usage.failure_reasons`, examine `status.installation.usage.failure_reason_counts_available`.
+When the ledger is full, it stops accepting events.
+The separate failure counters continue to increase.
+A strict `cache probe` verifies authenticated provider readiness and protocol readiness.
+It does not show the remote URL, object names, credentials, or local paths.
 
-Disable an installed wrapper for one process tree without changing setup:
+To disable an installed wrapper for one process tree and keep the setup unchanged, run:
 
 ```bash
 CARGO_RAIL_CACHE=off cargo check --locked
@@ -187,7 +215,7 @@ CARGO_RAIL_CACHE=off cargo check --locked
 `cargo rail unify --check --json` reports its separate compiler-evidence cache.
 That cache never restores Cargo build artifacts.
 
-Preview cleanup before removing state:
+Before you remove state, preview the cleanup:
 
 ```bash
 cargo rail cache clean --scope workspace --check
@@ -197,29 +225,46 @@ cargo rail cache profiles --json
 cargo rail cache uninstall --check
 ```
 
-Workspace cleanup removes reconstructible state for the current checkout.
-Local cleanup removes the current profile's CAS and requires `cargo rail cache setup` to repair it.
-`cache detach` preserves the profile and CAS while removing the current root binding.
-`cache uninstall` removes the global wrapper and Cargo configuration while preserving every profile.
-Use `cache profiles` and `cache drop-profile --profile PROFILE_ID --check` for explicit machine-wide cleanup.
-Resolve receipt, wrapper, profile,
-or ownership drift instead of deleting cache files or Cargo configuration by hand.
+Workspace cleanup removes the reconstructible state for the current checkout.
+Local cleanup removes the CAS of the current profile.
+After local cleanup, you must run `cargo rail cache setup` to repair the CAS.
+`cache detach` keeps the profile and the CAS, and removes the current root binding.
+`cache uninstall` removes the global wrapper and Cargo configuration.
+It keeps every profile.
+For explicit machine-wide cleanup, use `cache profiles` and `cache drop-profile --profile PROFILE_ID --check`.
+Resolve receipt, wrapper, profile, or ownership drift.
+Do not delete cache files or Cargo configuration by hand instead.
 
-Upgrading to 0.30.0 starts every cache cold once: action keys, registry dependency results,
-stored compiler evidence, and units that load a procedural macro all changed identity,
-and remote caches start cold too.
-Before the first build, `cargo rail cache clean --scope local --check` previews removing the current store and the retired `local-cas-v2` store;
-run it without `--check`, then rerun `cargo rail cache setup`.
-Independent compiler adapter packs from earlier releases are rejected
-(native input protocol 4); republish them for 0.30.0.
+After an upgrade to 0.30.0, every cache starts cold one time.
+The identity changed for action keys, registry dependency results, stored compiler evidence,
+and units that load a procedural macro.
+Remote caches also start cold.
+Before the first build, do these steps:
 
-If setup reports an unsupported installation receipt version,
-preserve the installation and the executable that created it.
-Use that executable to preview and perform removal, then run the current `cargo rail cache setup`.
-The receipt error cannot identify the originating release version;
-do not substitute manual file deletion.
+1. Run `cargo rail cache clean --scope local --check`.
+   It previews the removal of the current store and the retired `local-cas-v2` store.
+1. Run the same command without `--check`.
+1. Run `cargo rail cache setup` again.
 
-See [Caching](caching.md) for exact eligibility and support.
+Cargo-Rail rejects independent compiler adapter packs from earlier releases
+(native input protocol 4).
+Publish these packs again for 0.30.0.
+
+Cargo-Rail 0.32 uses native input protocol 5.
+It rejects independent compiler adapter packs from 0.30 and 0.31.
+Publish these packs again for 0.32.
+
+If setup reports an unsupported installation receipt version, do these steps:
+
+1. Keep the installation and the executable that created it.
+1. Use that executable to preview the removal.
+1. Use that executable to do the removal.
+1. Run the current `cargo rail cache setup`.
+
+The receipt error cannot identify the release version that created the receipt.
+Do not delete the files manually instead of this procedure.
+
+For exact eligibility and support, see [Caching](caching.md).
 
 ## A release stopped
 
@@ -229,20 +274,21 @@ Run the same command again:
 cargo rail release
 ```
 
-It reads the most recent release on the branch from Git tags, the registry, and GitHub,
-and completes only the missing steps.
-It packages from a temporary clone of the release commit, so the local worktree does not matter.
-The result's `state` and `next` say what remains:
+The command reads the most recent release on the branch from Git tags, the registry, and GitHub.
+It completes only the missing steps.
+It packages from a temporary clone of the release commit, so the local worktree has no effect.
+The `state` and `next` fields of the result show what remains:
 
 | `state`           | Meaning and next action |
 | ----------------- | ----------------------- |
-| `awaiting_checks` | Checks on the source commit are still running; nothing changed. Run again when they finish. |
-| `awaiting_assets` | A draft GitHub release waits for the files in `missing_assets`. Attach them, then run again. |
-| `pull_request`    | A release pull request is open. Merge it, then run again. |
+| `awaiting_checks` | Checks on the source commit are still running. Nothing changed. When the checks finish, run the command again. |
+| `awaiting_assets` | A draft GitHub release waits for the files in `missing_assets`. Attach these files, then run the command again. |
+| `pull_request`    | A release pull request is open. Merge it, then run the command again. |
 | `released`        | Every step is complete. |
 
-A push that `origin` rejected leaves nothing behind: the checkout returns to its starting commit.
-Pull, then run again.
+If `origin` rejects a push, the release leaves nothing behind.
+The checkout goes back to its starting commit.
+Pull, then run the command again.
 
 These errors need a decision, not a rerun:
 
@@ -251,26 +297,27 @@ These errors need a decision, not a rerun:
   Release a new version.
 - **A tag on `origin` names another commit.**
   A release never moves a published tag.
-  Inspect the tag.
+  Examine the tag.
 - **An asset has no matching attestation.**
-  Build and attach it again from the release tag with `loadingalias/cargo-rail-action/release/asset`, or set `release.asset_attestations = "off"` for a repository that cannot attest.
-- **An alias names a commit outside this release line.**
-  Inspect the alias; a release moves an alias only forward.
+  Use `loadingalias/cargo-rail-action/release/asset` to build the asset again from the release tag and attach it.
+  For a repository that cannot attest, set `release.asset_attestations = "off"` instead.
+- **An alias names a commit outside this release line.** Examine the alias.
+  A release moves an alias only forward.
 
-A release that Cargo-Rail 0.31 started is finished the same way
-once its release commit is on the branch.
+Use the same procedure to finish a release that Cargo-Rail 0.31 started,
+after its release commit is on the branch.
 
-Commit-driven releases need complete tag history.
-Use `fetch-depth: 0` in GitHub Actions, or fetch full history and tags before releasing.
+Commit-driven releases need the complete tag history.
+Use `fetch-depth: 0` in GitHub Actions, or fetch the full history and tags before you release.
 Reviewed-change mode does not use commit history to choose bumps.
 
 See [releases](releases.md).
 
 ## Sync left conflicts
 
-A manual conflict exits `1` and writes a receipt.
-Resolve every listed file and remove conflict markers,
-then let Cargo-Rail validate and commit the result:
+When sync stops at a manual conflict, it exits `1` and writes a receipt.
+Resolve every listed file and remove the conflict markers.
+Then run this command to let Cargo-Rail validate and commit the result:
 
 ```bash
 cargo rail sync --resume target/cargo-rail/receipts/sync-conflict-<crate>-<id>.json
@@ -285,21 +332,24 @@ Resume verifies the expected branch, parent, owned paths, and files.
 - `1`: required changes found, or a resumable sync conflict.
 - `2`: invalid arguments or an operational failure.
 
-An executed subprocess may deliberately propagate another status.
+An executed subprocess can deliberately propagate a different status.
 
 ## Repair a deleted compiler-cache installation
 
 Run `cargo rail cache setup` from an enrolled workspace.
 Setup restores a missing installation
-when Cargo's configured wrapper path exactly equals Cargo-Rail's managed path,
-even if the receipt was deleted.
-Other configured wrappers still require an explicit owner decision.
-The repair preserves unrelated Cargo configuration and replaces the receipt and missing components.
-Run `cargo rail cache ready` to prove a cold build and verified reuse.
+when the wrapper path in the Cargo configuration exactly equals the managed path of Cargo-Rail.
+Setup does this even if the receipt was deleted.
+Other configured wrappers still require an explicit decision from the owner.
+The repair keeps unrelated Cargo configuration.
+It replaces the receipt and the missing components.
+To prove a cold build and verified reuse, run `cargo rail cache ready`.
 
-A stale authenticated compiler component reports its path, found and expected digests,
-the adjacent component-manifest version, and the running Cargo-Rail version.
-Install the complete matching native archive from the release URL in the diagnostic, then rerun `cargo rail cache setup`.
-A source installation has no archive driver authority
-and ignores archive-only driver files left beside it;
-Cargo still runs through the source installation's supported fallback.
+The diagnostic for a stale authenticated compiler component shows its path,
+the found and expected digests, the adjacent component-manifest version,
+and the running Cargo-Rail version.
+Install the complete matching native archive from the release URL in the diagnostic.
+Then run `cargo rail cache setup` again.
+A source installation has no archive driver authority.
+It ignores archive-only driver files that remain beside it.
+Cargo still runs through the supported fallback of the source installation.

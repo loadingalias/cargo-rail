@@ -2,6 +2,6 @@
 cargo-rail = "patch"
 ---
 
-Hash each unchanged input file once per compiler wrapper on Linux and macOS.
-A `-sys` crate's static library in its `OUT_DIR` was hashed again when rustc selected it,
-and again before a hit was restored.
+On Linux and macOS, hash each unchanged input file once for each compiler wrapper.
+Before, Cargo-Rail hashed a static library in the `OUT_DIR` of a `-sys` crate again when rustc selected it.
+It hashed that library again before it restored a hit.

@@ -2,21 +2,26 @@
 cargo-rail = "patch"
 ---
 
-Reject `--check` and other `unify` or `config migrate` options placed before the `apply` subcommand.
-`cargo rail unify --check apply` previously ignored `--check` and wrote manifests.
+Reject `--check` and other `unify` or `config migrate` options that come before the `apply` subcommand.
+Before, `cargo rail unify --check apply` ignored `--check` and wrote manifests.
 
-Keep machine output to one JSON value: `--json unify undo` no longer prints `backup restored` before the JSON result,
-and a `--diagnostics-file` write failure after a successful command is reported on stderr.
-A missing working directory or a failed standard-output write now exits 2, not 1,
-because exit 1 means a pending mutation.
+Keep machine output to one JSON value.
+`--json unify undo` no longer prints `backup restored` before the JSON result.
+When a `--diagnostics-file` write fails after a successful command, Cargo-Rail reports the failure on stderr.
+A missing working directory or a failed standard-output write now causes exit code 2, not 1.
+Exit code 1 means a pending mutation.
 
-`config migrate apply` keeps a default-only file that `--config` selected explicitly instead of deleting it.
-`init` refuses to write below the Cargo workspace root, where configuration discovery would never read it,
-and `init --force` no longer overwrites a file that another discovery location shadows.
+`config migrate apply` no longer deletes a default-only file that `--config` selected explicitly.
+A default-only file contains only default values.
+`init` refuses to write below the Cargo workspace root,
+because configuration discovery never reads a file there.
+`init --force` no longer overwrites a file that another discovery location shadows.
 
-`config explain --all` lists `release.auxiliary_cargo_manifests` and `unify.transitive_pinning.host` when they are unset, and `config explain` accepts them by name.
-The `plan` help saves and verifies the plan under `target/`;
-an untracked plan file inside the checkout is itself drift.
+`config explain --all` lists `release.auxiliary_cargo_manifests` and `unify.transitive_pinning.host` when they are unset.
+`config explain` also accepts these fields by name.
+The `plan` help examples save and verify the plan under `target/`.
+An untracked plan file inside the checkout is itself drift.
 
-`plan` and `change check` without `--since` compare against `origin/HEAD`, `origin/main`, `origin/master`, `main`, or `master`, in that order, and fail when none exists.
-They previously compared against `HEAD~1`, which left earlier commits on the branch out of the comparison.
+Without `--since`, `plan` and `change check` compare against the first of these refs that exists: `origin/HEAD`, `origin/main`, `origin/master`, `main`, or `master`.
+They fail when none of these refs exists.
+Before, they compared against `HEAD~1`, so the comparison left out earlier commits on the branch.

@@ -2,7 +2,8 @@
 cargo-rail = "patch"
 ---
 
-Compile without reuse when an rlib or staticlib that rustc writes holds a native-library member
-that the compilation did not generate and that no reported native-library search selected.
-A future rustc that bundles a library the compiler driver does not report then cannot bind the
-archive without the search that chose the library.
+An rlib or staticlib that rustc writes can hold a native-library member.
+Compile without reuse when the compilation did not generate that member
+and no reported native-library search selected it.
+A future rustc might bundle a library that the compiler driver does not report.
+With this rule, the archive then cannot be bound without the search that chose the library.

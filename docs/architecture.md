@@ -1,10 +1,10 @@
 # Architecture
 
 Cargo-Rail is a library-backed Rust workspace engine.
-It captures one workspace view, makes bounded decisions from that view,
-and coordinates the operations it owns.
+It captures one view of the workspace and makes bounded decisions from that view.
+It also coordinates the operations that it owns.
 Cargo, nextest, Just, scripts, CI, Git, forges,
-and registries remain the executors of their own operations.
+and registries stay the executors of their own operations.
 
 ## One model, separate workflows
 
@@ -17,72 +17,84 @@ and registries remain the executors of their own operations.
 | `change` / `release` | Reviewed release intent and durable publication state | Forge, registry, or Git implementation |
 | `split` / `sync` | Crate ownership, history mapping, and conflict receipts | General repository synchronization |
 
-These workflows share captured infrastructure but do not invoke one another implicitly.
+These workflows share captured infrastructure.
+A workflow does not implicitly start another workflow.
 
 ## Captured workspace authority
 
-`WorkspaceContext` owns the source capture, effective configuration, Cargo metadata, dependency graph, lockfile,
-toolchain, targets, and repository boundary used by a command.
+`WorkspaceContext` owns the inputs that a command uses: the source capture, effective configuration, Cargo metadata,
+dependency graph, lockfile, toolchain, targets, and repository boundary.
 Derived feature and target views stay bound to those inputs.
 
-Snapshot-bound commands revalidate the relevant live state before writing.
-A command may cross a named live boundary, such as Git readiness or registry state,
-only when it revalidates that boundary at the operation that uses it.
+Before a snapshot-bound command writes, it revalidates the applicable live state.
+A command can cross a named live boundary only when it revalidates that boundary at the operation
+that uses it.
+Git readiness and registry state are examples of named live boundaries.
 
 ## Decisions and execution
 
-- Planning emits one typed decision per work item.
-  Consumers lower its package, target, or variant scope directly.
+- Planning produces one typed decision for each work item.
+  Consumers lower the package, target, or variant scope of that decision directly.
 - Compiler facts, native cache results, local CAS objects,
-  and remote objects retain separate identities and validation rules.
+  and remote objects keep separate identities and validation rules.
 - Surface accepts only authenticated, complete compiler facts for the selected compiler-crate views.
 
-Incomplete evidence widens or bypasses only its owning decision.
-It never becomes permission to skip work or restore a result.
+Incomplete evidence widens or bypasses only the decision that owns it.
+Incomplete evidence never gives permission to skip work or restore a result.
 
 Compiler-backed Unify and Surface work uses one acquisition engine:
 
-1. Build a deterministic target and feature schedule from the captured workspace.
-1. Admit only identity-matched, complete cached evidence.
-1. Run remaining views one Cargo process at a time.
+1. The engine builds a deterministic target and feature schedule from the captured workspace.
+1. It admits only cached evidence that is complete and has a matching identity.
+1. It runs the remaining views one Cargo process at a time.
    Views of one target and command class reuse one sandbox,
    so Cargo compiles each shared dependency unit once.
    Cargo owns job parallelism inside each view.
    Output and artifact storage stay bounded.
-1. Persist resumable progress before dispatch and cancel complete process trees after a failure.
-1. Integrate completed work in deterministic order, independent of worker completion order.
+1. It persists resumable progress before dispatch.
+   After a failure, it cancels complete process trees.
+1. It integrates completed work in deterministic order.
+   This order does not depend on the order in which workers complete.
 
 ## Mutation boundary
 
 Planned workspace edits, including Unify and Surface changes, follow this sequence:
 
-1. Capture the relevant source and repository state.
-1. Build a deterministic plan with exact authorized paths.
-1. Revalidate the captured assumptions immediately before writing.
-1. Apply only the planned changes and persist recovery evidence when needed.
+1. Cargo-Rail captures the applicable source and repository state.
+1. Cargo-Rail builds a deterministic plan with exact authorized paths.
+1. Immediately before it writes, Cargo-Rail revalidates the captured assumptions.
+1. Cargo-Rail applies only the planned changes.
+   When necessary, it persists recovery evidence.
 
 Cache writes, compiler acquisition journals,
-and installation profiles have their own validation and recovery boundaries;
-they do not pass through a workspace mutation plan.
-Split and sync persist transaction identity before remote or irreversible effects.
-A release persists nothing of its own; Git, the registry, and GitHub hold its progress.
-Recovery reconciles external publication; it cannot undo publication.
+and installation profiles have their own validation and recovery boundaries.
+They do not pass through a workspace mutation plan.
+Split and sync persist the transaction identity before a remote or irreversible effect.
+A release persists nothing of its own.
+Git, the registry, and GitHub hold its progress.
+Recovery reconciles external publication.
+Recovery cannot undo publication.
 
 ## Release authority
 
-`release::engine` derives every release decision from state outside Cargo-Rail.
-The `Rail-Release-Crates` trailer names a release commit's crates and versions, a remote tag names its release commit,
-the registry's `.cargo_vcs_info.json` names the commit each package came from, and GitHub holds drafts, assets,
-attestations, and pull requests.
-A rerun reads them and completes the missing effects; no record can direct an effect.
-The protected branch is the release's authority:
-a release commit lands by a leased atomic push or a merged pull request,
-and its checks gate the first effect.
+`release::engine` derives every release decision from state outside Cargo-Rail:
 
-The planner (`release::planner`, `cargo_projection`, `change_files`, `changelog`) computes the release commit's bytes.
+- The `Rail-Release-Crates` trailer names the crates and versions of a release commit.
+- A remote tag names its release commit.
+- In the registry, `.cargo_vcs_info.json` names the commit that each package came from.
+- GitHub holds drafts, assets, attestations, and pull requests.
+
+A rerun reads this state and completes the missing effects.
+No record can direct an effect.
+The protected branch is the authority for the release.
+A release commit lands on that branch through a leased atomic push or a merged pull request.
+The checks on that branch gate the first effect.
+
+The planner (`release::planner`, `cargo_projection`, `change_files`, `changelog`) computes the bytes of the release commit.
 The engine packages and publishes from a temporary clone of the tagged commit.
 
-The companion Action installs the locked Cargo-Rail, runs `cargo rail release`, and publishes its result.
+The companion Action installs the locked Cargo-Rail version.
+It runs `cargo rail release` and publishes the result.
 Repository workflows own runners, credentials, and product packaging.
 They do not implement another release planner or publisher.
 See [the release guide](releases.md).
@@ -93,17 +105,17 @@ See [the release guide](releases.md).
 and library dispatch.
 User-visible behavior belongs in the library.
 
-Compiler wrappers preserve the selected compiler and its execution contract
-when reuse is unavailable.
-Eligible cache operations may run through the authenticated compiler-matched driver
-or restore validated outputs.
-Cache and analysis roles receive bounded invocation inputs
-and do not build a workspace context inside a compiler process.
+When reuse is not available, compiler wrappers keep the selected compiler
+and its execution contract.
+An eligible cache operation can run through the authenticated driver that matches the compiler.
+It can also restore validated outputs.
+Cache and analysis roles receive bounded invocation inputs.
+They do not build a workspace context inside a compiler process.
 
 `src/windows_fs.rs` is the only production `unsafe` and Win32 FFI boundary.
-Its safe API remains crate-private.
-The separately built compiler driver has one `unsafe` module, `macro_observation`,
-which instruments procedural-macro images on Linux and macOS to record what they read.
+Its safe API stays crate-private.
+The separately built compiler driver has one `unsafe` module, `macro_observation`.
+On Linux and macOS, this module instruments procedural-macro images to record what they read.
 
 ## Module ownership
 

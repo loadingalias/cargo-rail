@@ -1,21 +1,21 @@
 # Configuration
 
 `rail.toml` contains sparse repository policy.
-Omitted settings and absent files use coded defaults.
-Keep commands, credentials, timeouts, setup, and execution in their owning tools.
+When a setting or the file is absent, Cargo-Rail uses the coded default.
+Keep commands, credentials, timeouts, setup, and execution in the tools that own them.
 
 ## Find and inspect configuration
 
-Cargo-Rail uses the first file found:
+Cargo-Rail uses the first file that it finds in this order:
 
 1. `rail.toml`
 1. `.rail.toml`
 1. `.cargo/rail.toml`
 1. `.config/rail.toml`
 
-`--config PATH` bypasses discovery.
-Relative paths are resolved from the selected workspace root.
-Use `--workspace-root PATH` to select a different workspace.
+`--config PATH` skips discovery.
+Cargo-Rail resolves relative paths from the selected workspace root.
+To select a different workspace, use `--workspace-root PATH`.
 
 ```bash
 cargo rail init --dry-run
@@ -28,66 +28,79 @@ cargo rail config validate --strict
 cargo rail config migrate
 ```
 
-`init` recognizes either an explicit `[workspace]` manifest or a root `[package]` manifest.
-Without a Cargo manifest it still writes the requested configuration but reports
-that no workspace was detected.
+`init` recognizes an explicit `[workspace]` manifest or a root `[package]` manifest.
+If no Cargo manifest exists, `init` still writes the requested configuration.
+It also reports that it detected no workspace.
 
-Bare `cargo rail config` shows configured overrides and the active source, or reports that coded defaults apply.
-`config explain --all` reports configured and effective values, defaults, sources, and field rationale.
-Pass leaf paths for exact fields, or a parent node to enumerate its effective children, such as `config explain surface --json`.
-Both commands validate policy before reporting success.
-Unknown keys, unreadable files, and failed Cargo workspace discovery are errors;
-a missing explicit `--config PATH` never falls back to defaults.
+`cargo rail config` without a subcommand shows the configured overrides and the active source.
+When no configuration file exists, it reports that the coded defaults apply.
+`config explain --all` reports the configured value, effective value, default, source, and rationale of each field.
+To explain exact fields, give their leaf paths.
+To list the effective children of a parent node, give the parent path, for example `config explain surface --json`.
+Both commands validate the policy before they report success.
+Unknown keys, unreadable files, and failed Cargo workspace discovery are errors.
+A missing explicit `--config PATH` file is also an error.
+Cargo-Rail never uses the defaults in its place.
 
-`config print` exports canonical TOML with defaults.
-It preserves policy such as `surface.targets = "workspace"`, so saved output continues inheriting future changes to top-level
-targets.
-Explanation shows the resolved targets.
-Use `-f json` or `--json` for machine inspection.
-Explanation conforms to [`config-explain-v2.schema.json`](../schemas/config-explain-v2.schema.json).
+`config print` writes canonical TOML that includes the defaults.
+It writes policy values such as `surface.targets = "workspace"` without resolving them.
+As a result, saved output continues to follow later changes to the top-level targets.
+`config explain` shows the resolved targets.
+For machine inspection, use `-f json` or `--json`.
+The JSON output of `config explain` conforms to [`config-explain-v2.schema.json`](../schemas/config-explain-v2.schema.json).
 
-Canonical output can be validated through stdin:
+To validate canonical output through stdin, use this command:
 
 ```bash
 cargo rail config print | cargo rail --config - config validate --strict
 ```
 
-Stdin validation is independent of the checkout.
-Policy requiring workspace facts, such as split paths, package selections,
-or a transitive host path, reports the missing context;
-inspect that policy from a file in its owning workspace.
-Ordinary file inspection validates against the selected Cargo workspace.
-When `Cargo.lock` exists, validation resolves it with `--locked`, as consuming commands do,
-so a stale lockfile fails validation.
+Stdin validation does not depend on the checkout.
+Some policy needs workspace facts, such as split paths, package selections,
+or a transitive host path.
+For that policy, stdin validation reports the missing context.
+Inspect that policy from a file in the workspace that owns it.
+Inspection of a file validates the policy against the selected Cargo workspace.
+When `Cargo.lock` exists, validation resolves it with `--locked`, as the consuming commands do.
+Thus a stale lockfile fails validation.
 Validation never creates a lockfile.
-`config validate` states what it checked: `workspace` evidence binds policy to the Cargo workspace,
-and `schema` evidence covers stdin or a directory without `Cargo.toml`.
-JSON output reports this in `evidence`.
+`config validate` states what it checked.
+`workspace` evidence binds the policy to the Cargo workspace.
+`schema` evidence applies to stdin or to a directory without `Cargo.toml`.
+The JSON output reports this value in `evidence`.
 
 ## Compatibility
 
 The current Cargo-Rail release accepts only current configuration fields.
-Configuration inspection leaves the input file unchanged;
-unsupported keys fail before planning or mutation,
-and a retired key names the release that removed it.
-Historical comparisons read retired keys with their current meaning,
-and identify the revision and configuration path when decoding fails.
+Configuration inspection does not change the input file.
+An unsupported key causes a failure before planning or mutation starts.
+The error for a retired key names the release that removed it.
+Historical comparisons read retired keys with their current meaning.
+When decoding fails, the error identifies the revision and the configuration path.
 
-`cargo rail config migrate` previews the update; `config migrate apply` writes it.
-It replaces each retired `[release]` key from Cargo-Rail 0.31 with its successor and keeps what the key did:
-a file without registry publication gets `publish = "none"`, one without GitHub effects gets `github_release = false` and `checks = "none"`,
-`{prefix}` in a tag format becomes the prefix itself, and an artifact inventory becomes `release.assets`.
-It also removes settings that only restate current defaults; see [Start sparse](#start-sparse).
-Run `cargo rail config validate --strict` afterward.
+`cargo rail config migrate` previews the update.
+`config migrate apply` writes it.
+The migration replaces each retired `[release]` key from Cargo-Rail 0.31 with its successor.
+The successor keeps the behavior of the retired key:
 
-Plans use contract v9 and variant catalogs use v2.
-Regenerate older saved plans and validate catalogs against the current schemas before execution.
+- A file without registry publication gets `publish = "none"`.
+- A file without GitHub effects gets `github_release = false` and `checks = "none"`.
+- `{prefix}` in a tag format becomes the prefix itself.
+- An artifact inventory becomes `release.assets`.
+
+The migration also removes settings that only repeat the current defaults.
+See [Start sparse](#start-sparse).
+Then run `cargo rail config validate --strict`.
+
+Plans use contract v9.
+Variant catalogs use v2.
+Before execution, regenerate older saved plans and validate catalogs against the current schemas.
 See [Planning](planning.md#consume-the-machine-contract).
 
 ## Start sparse
 
-Keep only choices that differ from defaults.
-`config migrate` reduces an existing file, such as saved `config print` output, to that form:
+Keep only the settings that differ from the defaults.
+`config migrate` reduces an existing file to that form, for example saved `config print` output:
 
 ```bash
 cargo rail config migrate                 # preview; changes no files
@@ -97,24 +110,32 @@ cargo rail config migrate -f json > target/migrate.json
 cargo rail config migrate apply --plan target/migrate.json
 ```
 
-The migration removes a setting only when removing it leaves the effective policy unchanged,
-so an older spelling of a default, such as `unify.compiler_targets = []`, is removed as well.
-It keeps every other setting, comments, and ordering, and removes the header comment that `config print` writes.
-A file containing only defaults is deleted
-when no other discovery location holds a configuration file; otherwise,
-and for a file outside the discovery locations, the emptied file is kept.
-Keys that an earlier release removed, such as `[run]` or `release.require_changelog_entries`, have no current meaning,
-so the migration removes them first and names the release that removed each one;
-the JSON preview marks them with `removed_in`.
-Every other command rejects such a key, names its release and replacement,
-and points to this migration.
-Retired `[release]` keys are first replaced by their successors, listed under `added` in the JSON preview,
-so the release behaves as before.
-A removed key that needs a manual edit, such as a split's `paths`, is reported but never changed.
+The migration removes a setting only when the removal does not change the effective policy.
+Thus it also removes an older spelling of a default, such as `unify.compiler_targets = []`.
+It keeps every other setting, the comments, and the order.
+It removes the header comment that `config print` writes.
+When a file contains only defaults,
+the migration deletes it if no other discovery location holds a configuration file.
+Otherwise, the migration keeps the emptied file.
+The migration also keeps an emptied file that is outside the discovery locations.
+
+Keys that an earlier release removed, such as `[run]` or `release.require_changelog_entries`, have no current meaning.
+The migration removes them first and names the release that removed each one.
+The JSON preview marks them with `removed_in`.
+Every other command rejects such a key.
+Its error names the release that removed the key and the replacement, and points to this migration.
+The migration first replaces retired `[release]` keys with their successors, so the release behaves as before.
+The JSON preview lists those successors under `added`.
+The migration reports a removed key that needs a manual edit, such as a split's `paths`,
+but never changes it.
+
 The JSON preview includes `mutation_plan`.
-`apply --plan` accepts that plan, saved to a file, only while the configuration and checkout are unchanged.
-Save the plan in an ignored directory such as `target/` or outside the checkout:
-an untracked plan file in the worktree is a checkout change.
+`apply --plan` accepts that plan from a file.
+It accepts the plan only while the configuration and the checkout are unchanged.
+The plan file itself is not a checkout change.
+The preview ignores the file that it writes through its standard output or `-o`.
+Apply ignores the file that `--plan` names.
+Any other untracked file in the worktree is a checkout change.
 
 ```toml
 targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
@@ -138,7 +159,7 @@ paths = ["verification/**"]
 
 | Family             | Owns |
 | ------------------ | ---- |
-| `targets`          | Additional target triples used by target-aware workspace decisions |
+| `targets`          | Additional target triples that target-aware workspace decisions use |
 | `[unify]`          | Dependency and manifest policy |
 | `[surface]`        | Compiler-derived reachability and visibility policy |
 | `[release]`        | Release intent, changelogs, and external-effect authority |
@@ -151,123 +172,142 @@ paths = ["verification/**"]
 `--check` makes the same decision and exits `1` when edits are pending.
 `cargo rail unify apply` revalidates and writes the planned manifest changes.
 
-Declare standalone Cargo workspaces with `unify.cargo_manifests`:
+To declare standalone Cargo workspaces, use `unify.cargo_manifests`:
 
 ```toml
 [unify]
 cargo_manifests = ["fuzz/Cargo.toml", "tools/check/Cargo.toml"]
 ```
 
-Each entry must name a contained workspace root with an existing `Cargo.lock`.
-Unify captures and resolves each workspace independently
-and reports its dependency repairs with its own snapshot and manifest.
+Each entry must name a contained workspace root that has an existing `Cargo.lock`.
+Unify captures and resolves each workspace independently.
+It reports the dependency repairs of each workspace with the snapshot and manifest of
+that workspace.
 Apply includes those exact manifests and lockfiles in drift checks, backups, and recovery.
-This list is separate from `release.auxiliary_cargo_manifests` because the operations own different policy.
-A normal dependency unused in every normal compilation unit,
-retained by development compiler evidence, and referenced only in integration tests, examples,
-or benchmarks is moved to its matching `dev-dependencies` table.
-Production source and README references retain declarations conservatively.
-The move preserves its rename, features, requirement, target condition, and comments.
-An existing declaration in that destination is retained for manual review.
+This list is separate from `release.auxiliary_cargo_manifests`, because the two operations own different policy.
+
+Unify moves a normal dependency to its matching `dev-dependencies` table when all of these conditions are true:
+
+- No normal compilation unit uses the dependency.
+- Development compiler evidence retains the dependency.
+- Only integration tests, examples, or benchmarks refer to the dependency.
+
+A reference in production source or in a README keeps the declaration, as a conservative choice.
+The move keeps the rename, features, requirement, target condition, and comments of the declaration.
+Unify keeps an existing declaration in that destination for manual review.
 
 Cargo's unused-dependency lint is a fast signal for one build.
-Unify checks the configured target and feature views before editing declarations.
-Both retain dependencies that rustc counts as used through another crate's re-export;
-Unify does not infer removal authority from source spelling alone.
+Before Unify edits declarations, it checks the configured target and feature views.
+The lint and Unify both keep a dependency that rustc counts
+as used through the re-export of another crate.
+Unify does not use source spelling alone as authority to remove a dependency.
 
-Top-level `targets` always remain the dependency-resolution authority.
-`unify.compiler_targets` selects where Unify acquires compiler evidence:
+Top-level `targets` always stay the authority for dependency resolution.
+`unify.compiler_targets` selects the targets where Unify acquires compiler evidence:
 
 | Value             | Evidence targets |
 | ----------------- | ---------------- |
-| `"all"` (default) | Every top-level target. An empty list written by earlier releases means the same. |
-| `["TARGET", ...]` | The exact top-level subset where Unify's workspace compiler command is valid. |
+| `"all"` (default) | Every top-level target. An empty list from earlier releases has the same meaning. |
+| `["TARGET", ...]` | The exact subset of top-level targets where the Unify workspace compiler command is valid. |
 | `"none"`          | No target. Unify resolves dependencies but removes nothing that needs compiler proof. |
 
-Dependencies that require an unobserved resolution target are retained
-unless another complete proof makes the compiler view unnecessary;
-the narrower evidence set never narrows Cargo resolution.
+Unify keeps a dependency that needs an unobserved resolution target,
+unless another complete proof makes the compiler view unnecessary.
+The narrower evidence set never narrows Cargo resolution.
 Before acquisition, Unify checks each target that needs new evidence:
-its Rust target library must be installed,
-and a target that compiles doctests must link a probe with its configured linker.
-A failure names the target and stops before Cargo runs.
+
+- The Rust target library of the target must be installed.
+- A target that compiles doctests must link a probe with its configured linker.
+
+If a check fails, Unify names the target and stops before Cargo runs.
 `cargo rail unify doctor` reports the same readiness and the unobserved targets.
 
 Use `consumer_scope = "workspace"` only when the workspace contains every consumer of the affected private packages.
-Published packages remain open-world.
-A major-version unification requires explicit `major_version_conflict = "bump"` authority.
+Published packages stay open-world.
+A major-version unification needs the explicit authority of `major_version_conflict = "bump"`.
 Exact pins, renamed dependencies, MSRV policy, preserved features,
-and backup retention remain independent choices; inspect their current defaults with `config explain --all`.
-`unify.msrv_policy` defaults to compute mode with `source = "max"` and `inherit = false`.
-A partial compute table inherits omitted values; disabled mode rejects compute-only `source` and `inherit` fields.
-`unify --explain` shows the exact planned package-inheritance and MSRV manifest edits.
+and backup retention are independent choices.
+To see their current defaults, run `config explain --all`.
+The default `unify.msrv_policy` is compute mode with `source = "max"` and `inherit = false`.
+In a partial compute table, each omitted value uses its default.
+Disabled mode rejects the compute-only fields `source` and `inherit`.
+`unify --explain` shows the exact manifest edits that it plans for package inheritance and MSRV.
 
 ### Surface policy
 
 `surface.enabled = true` adds the Surface gate to planning.
-Direct `cargo rail surface` inspection is available even when the gate is disabled.
-Surface analyzes the host by default.
-Set `surface.targets = "workspace"` to analyze the host and every top-level target,
-or list a non-empty subset of `"host"` and the configured top-level targets.
-Top-level `targets` are supported dependency-resolution views.
+You can run `cargo rail surface` directly for inspection even when the gate is disabled.
+By default, Surface analyzes the host.
+To analyze the host and every top-level target, set `surface.targets = "workspace"`.
+Alternatively, list a non-empty subset of `"host"` and the configured top-level targets.
+Top-level `targets` are supported views for dependency resolution.
 They do not assert that one host has every Rust target, SDK, linker,
-or native dependency needed to execute those views.
+or native dependency that is necessary to execute those views.
 Surface owns its execution matrix separately.
 
 Keep `consumer_scope = "open"` unless the workspace owns every consumer of its non-publishable compiler crates.
-Closed-world pruning requires reviewed evidence covering published APIs, downstream repositories,
-plugins, generated code, and build-script or proc-macro consumers.
-The current checkout's Cargo graph is not sufficient evidence by itself.
+Closed-world pruning needs reviewed evidence.
+That evidence must cover published APIs, downstream repositories, plugins, generated code,
+and build-script or proc-macro consumers.
+The Cargo graph of the current checkout is not sufficient evidence by itself.
 Declare products, external crates, feature profiles, doctest coverage, lint levels, overrides,
-and exclusions only when Cargo-Rail's automatic workspace model does not express the intended
+and exclusions only when the automatic workspace model of Cargo-Rail does not express the intended
 boundary.
 
-`cargo rail surface --schema` exposes the report contract.
-`surface --check` does not modify source; `surface --fix --dry-run` previews exact source edits before `surface --fix` receives write authority.
-When JSON output is written with `--output`,
-long-running acquisition keeps one bounded progress update on stderr every 30 seconds.
-`--quiet` suppresses those updates.
-JSON written to stdout remains silent on stderr.
+`cargo rail surface --schema` shows the report contract.
+`surface --check` does not change source.
+Before you give write authority with `surface --fix`, preview the exact source edits with `surface --fix --dry-run`.
+When `--output` receives the JSON output,
+long-running acquisition writes one bounded progress update to stderr every 30 seconds.
+`--quiet` disables those updates.
+When the JSON output goes to stdout, stderr stays silent.
 
 Surface report contract v5 separates raw compiler observations from merged physical declarations.
-Every selected target checks production code without linking.
-Tests, examples, benchmarks, and doctests are acquired only on a selected host view.
-The coverage object records their target views and reports incomplete target and doctest coverage
-when cross targets are selected.
-Cross-target inspection and checking remain available without a cross linker or `std`.
-Visibility repair requires host-only targets because missing test views cannot authorize an edit.
-Host doctests still require the host linker.
-Its `retention` section reports both denominators, per-predicate observation and unique-item counts,
-and at most three deterministic representatives per predicate.
-`--explain` additionally runs an omit-one-reason counterfactual before diagnostic policy;
-every other retention reason and graph authority remains active.
-Those suppressed-finding counts measure conservative impact, not false positives.
-Without `--explain`, the counterfactual is `null` and Surface performs only its three authoritative graph traversals.
+For every selected target, Surface checks production code without linking.
+Surface acquires tests, examples, benchmarks, and doctests only on a selected host view.
+The coverage object records their target views.
+When cross targets are selected, the coverage object reports incomplete target and doctest coverage.
+Cross-target inspection and checking stay available without a cross linker or `std`.
+Visibility repair needs host-only targets, because missing test views cannot authorize an edit.
+Host doctests still need the host linker.
+
+The `retention` section of the report contains:
+
+- both denominators;
+- the observation count and the unique-item count of each predicate;
+- at most three deterministic representatives of each predicate.
+
+With `--explain`, Surface also runs an omit-one-reason counterfactual before diagnostic policy.
+In that counterfactual, every other retention reason and graph authority stays active.
+The counts of suppressed findings measure conservative impact, not false positives.
+Without `--explain`, the counterfactual is `null`.
+Surface then does only its three authoritative graph traversals.
 
 ### Release policy
 
-`cargo rail release` needs no configuration; set `[release]` keys only to change its defaults.
-Reviewed `.changes/*.md` files are the default source for bumps and release prose.
-See [releasing a workspace](releases.md) for the command, its effects, and recovery.
+`cargo rail release` needs no configuration.
+Set `[release]` keys only to change its defaults.
+By default, the bumps and the release text come from reviewed `.changes/*.md` files.
+For the command, its effects, and recovery, see [releasing a workspace](releases.md).
 
 | Key                         | Default                                          | Effect |
 | --------------------------- | ------------------------------------------------ | ------ |
-| `crates`                    | every member                                     | Crates a release manages; `change check` requires change files only for these. |
-| `publish`                   | `"crates-io"`                                    | Registry that receives releases: `"crates-io"`, `"none"`, or a registry in Cargo's `[registries]`. Each crate's Cargo `package.publish` still decides whether it may publish there. |
+| `crates`                    | every member                                     | The crates that a release manages. `change check` requires change files only for these crates. |
+| `publish`                   | `"crates-io"`                                    | The registry that receives releases: `"crates-io"`, `"none"`, or a registry in Cargo's `[registries]`. The Cargo `package.publish` of each crate still decides whether the crate can publish there. |
 | `github_release`            | `true` on a GitHub `origin`                      | Create a GitHub release for each tag. |
-| `checks`                    | `"all"` on a GitHub `origin`, otherwise `"none"` | Require every check GitHub reports on the source commit to pass before the first effect. |
-| `tag_format`                | `"{crate}-v{version}"`                           | Tag template; `{crate}` and `{version}` are its only placeholders. |
+| `checks`                    | `"all"` on a GitHub `origin`, otherwise `"none"` | Before the first effect, require every check that GitHub reports on the source commit to pass. |
+| `tag_format`                | `"{crate}-v{version}"`                           | The tag template. `{crate}` and `{version}` are its only placeholders. |
 | `sign_tags`                 | `false`                                          | Sign release tags with the configured Git signing key. |
-| `assets`                    | none                                             | Per-crate GitHub release files the draft must hold before publication. |
+| `assets`                    | none                                             | Per-crate GitHub release files that the draft must hold before publication. |
 | `asset_attestations`        | `"required"`                                     | `"off"` accepts assets without GitHub artifact attestations. |
-| `aliases`                   | none                                             | Per-crate mutable tags, such as `"v{major}"`, moved to each new release. |
+| `aliases`                   | none                                             | Per-crate mutable tags, such as `"v{major}"`, that move to each new release. |
 | `auxiliary_cargo_manifests` | none                                             | Standalone workspaces whose lockfiles a release rewrites. |
 
 `config explain --all` lists every key, including changelog shape, version groups, and semver policy.
 
-The effective tag format controls both previous-tag lookup and new tags.
-Repositories that use unqualified tags such as `v1.2.3` set `tag_format = "v{version}"`.
-Override the format for one crate with `[crates.NAME.release].tag_format`:
+The effective tag format controls the lookup of the previous tag and the names of new tags.
+A repository that uses unqualified tags, such as `v1.2.3`, sets `tag_format = "v{version}"`.
+To override the format for one crate, use `[crates.NAME.release].tag_format`:
 
 ```toml
 [release]
@@ -277,42 +317,45 @@ tag_format = "v{version}"
 tag_format = "{crate}-v{version}"
 ```
 
-The other crates keep `v<version>` tags; `provider` looks up and creates only `provider-v<version>` tags.
-Release output includes configuration warnings, including colliding effective tag formats.
+The other crates keep `v<version>` tags.
+`provider` looks up and creates only `provider-v<version>` tags.
+Release output includes configuration warnings, for example about colliding effective tag formats.
 
-Aliases move only forward and only after the crate's GitHub release is published.
-`{major}` and `{minor}` follow the released version, so `"v{major}"` needs no edit for a new major release.
+An alias moves only forward.
+It moves only after the GitHub release of the crate is published.
+`{major}` and `{minor}` follow the released version.
+Thus `"v{major}"` needs no edit for a new major release.
 
-Asset names may use `{crate}` and `{version}`:
+Asset names can use `{crate}` and `{version}`:
 
 ```toml
 [release.assets]
 my-cli = ["{crate}-{version}-x86_64-unknown-linux-gnu.zip", "SHA256SUMS"]
 ```
 
-Standalone tools or fuzz workspaces
-that depend on released crates by path must declare their exact manifests with `auxiliary_cargo_manifests`
-when their independent lockfiles are tracked in Git.
-A release inspects captured tracked lockfiles and uses Cargo metadata to identify workspaces
-that resolve a released crate by its manifest path.
+A standalone tool or fuzz workspace can depend on released crates by path.
+If Git tracks the independent lockfile of such a workspace, declare its exact manifest with `auxiliary_cargo_manifests`.
+A release inspects the captured tracked lockfiles.
+It uses Cargo metadata to find the workspaces that resolve a released crate by its manifest path.
 Discovery follows Cargo-declared path dependencies, including inactive optional dependencies.
-An omitted workspace blocks the release before any effect.
-A matching local lockfile identity that Cargo cannot attribute also blocks it
-until the workspace is declared.
-Packages with the same name and version
-that Cargo attributes to another manifest remain independent.
-Cargo-Rail resolves each manifest's committed `Cargo.lock`,
-computes its post-release bytes in an isolated copy of the captured workspace,
-and writes those bytes into the release commit.
+An undeclared workspace blocks the release before any effect.
+A matching local lockfile identity that Cargo cannot attribute also blocks the release
+until you declare the workspace.
+Packages with the same name and version that Cargo attributes to another manifest stay independent.
+
+For each manifest, Cargo-Rail resolves the committed `Cargo.lock`.
+It computes the post-release bytes in an isolated copy of the captured workspace.
+Then it writes those bytes into the release commit.
 The primary workspace uses the same projection.
 Compatible path requirements of unreleased crates and path-only dependencies stay unchanged.
-Released members retain the minimum-version refresh for their released local dependencies;
-shared workspace declarations used by those members refresh with them.
-An incompatible caret, tilde, or exact requirement on a local released crate is retargeted to its
-new version; compound and inequality requirements that need editing are rejected before any effect.
-Each manifest and lockfile must be a regular file whose index identity,
-filter-cleaned worktree content, and executable mode exactly match `HEAD`;
-every local Cargo package must resolve inside the captured Git source.
+Released members keep the minimum-version refresh for their released local dependencies.
+Shared workspace declarations that those members use refresh with them.
+Cargo-Rail retargets an incompatible caret, tilde,
+or exact requirement on a local released crate to its new version.
+Before any effect, it rejects compound and inequality requirements that need an edit.
+Each manifest and lockfile must be a regular file.
+Its index identity, filter-cleaned worktree content, and executable mode must exactly match `HEAD`.
+Every local Cargo package must resolve inside the captured Git source.
 This is a Cargo-only projection, not a general command hook.
 
 ```toml
@@ -336,16 +379,17 @@ variant_catalog = "variants.json"
 Paths are positive repository-relative globs.
 `config` names exact effective fields.
 `cargo` subscribes repository- or Cargo-scoped work to built-in Cargo decisions.
-Variant work requires a checked-in catalog conforming to [`plan-variants-v2.schema.json`](../schemas/plan-variants-v2.schema.json).
-Each row declares typed Cargo package or exact target roots plus external paths;
-variant Cargo impact cannot be supplied by work-level string subscriptions.
-`features` binds one exact no-default-feature set
-and follows Cargo feature edges plus captured Rust module cfgs.
+Variant work needs a checked-in catalog that conforms to [`plan-variants-v2.schema.json`](../schemas/plan-variants-v2.schema.json).
+Each row declares typed roots and external paths.
+A typed root is a Cargo package or an exact target.
+Work-level string subscriptions cannot supply the Cargo impact of a variant.
+`features` binds one exact no-default-feature set.
+It follows Cargo feature edges and captured Rust module cfgs.
 `manifest` selects an exact entry in `release.auxiliary_cargo_manifests` and resolves its committed lockfile.
-Any source, cfg, manifest, or lock relationship Cargo-Rail cannot attribute exactly widens the
-variant family.
+If Cargo-Rail cannot attribute a source, cfg, manifest, or lock relationship exactly,
+that relationship widens the variant family.
 
-A Cargo-scoped named work item may declare bounded one-hop artifact prerequisites:
+A Cargo-scoped named work item can declare bounded one-hop artifact prerequisites:
 
 ```toml
 [plan.work.runtime-artifacts]
@@ -359,36 +403,38 @@ cargo_prerequisites = [
 ```
 
 `when` selects execution packages or targets.
-`require` emits a separate build selector and adds the declared execution root when an artifact changes.
+`require` emits a separate build selector.
+When an artifact changes, `require` adds the declared execution root.
 `require_target_kinds` requires every workspace target of the named Cargo kinds,
-such as `["cdylib"]` for plugins that tests load at run time,
-so a new target joins the edge without a configuration edit.
-Package and target identities must resolve uniquely in captured Cargo metadata,
-and each named kind must select at least one workspace target.
+such as `["cdylib"]` for plugins that tests load at run time.
+Thus a new target joins the edge without a configuration edit.
+Package and target identities must resolve uniquely in captured Cargo metadata.
+Each named kind must select at least one workspace target.
 This is not a command hook or task graph.
 
-Absolute paths, parent traversal, negative globs, commands, unknown fields,
-and malformed catalogs are rejected.
-See [Planning](planning.md) for selector and consumer rules.
+Cargo-Rail rejects absolute paths, parent traversal, negative globs, commands, unknown fields,
+and malformed catalogs.
+For selector and consumer rules, see [Planning](planning.md).
 
 ### Per-crate policy
 
 `[crates.NAME.split]` maps package-owned history and explicit non-Cargo assets to one split destination.
-`include` adds non-Cargo files; `exclude` can only narrow that explicit set.
-Cargo-owned package files cannot be excluded.
+`include` adds non-Cargo files.
+`exclude` can only narrow that explicit set.
+`exclude` cannot remove Cargo-owned package files.
 
-`[crates.NAME.release]` may narrow publication.
+`[crates.NAME.release]` can narrow publication.
 `[crates.NAME.changelog]` overrides workspace changelog policy for one crate.
 
 ## Rejected ownership
 
-Repository `[cache]` configuration is rejected.
+Cargo-Rail rejects repository `[cache]` configuration.
 Remote URLs, credentials, provider environment, local CAS placement,
 and distributed-worker selection are machine-owned cache setup.
 
-Execution tables and path-category planning policy are rejected.
-Keep commands in Cargo, nextest, Just, scripts, or CI,
-and register only their positive inputs under `[plan.work.NAME]`.
+Cargo-Rail also rejects execution tables and path-category planning policy.
+Keep commands in Cargo, nextest, Just, scripts, or CI.
+Register only their positive inputs under `[plan.work.NAME]`.
 
 ## Exit behavior
 
@@ -397,5 +443,5 @@ and register only their positive inputs under `[plan.work.NAME]`.
 | Mutation command `--check` | No mutation                  | Mutation pending | Invalid input or operation |
 | `config validate`          | Valid at selected strictness | —                | Invalid or unreadable configuration, or a Cargo workspace that fails to load |
 
-`config validate` enables strict mode in common CI environments.
-Use `--no-strict` only when warnings are deliberately non-blocking.
+In common CI environments, `config validate` uses strict mode.
+Use `--no-strict` only when you decide that warnings must not block.
