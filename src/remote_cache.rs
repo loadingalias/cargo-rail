@@ -417,13 +417,23 @@ impl RemoteCacheSelection {
         Self::parse(remote_url, mode, &additional).map(Some)
     }
 
-    /// Prefer an explicit transient selection, then one receipt-owned policy.
+    /// The receipt-owned selection that compiler processes use.
+    ///
+    /// Cargo passes repository `[env]` values and build-script `rustc-env` output to the compiler
+    /// wrapper, so a `CARGO_RAIL_CACHE_*` variable there is not machine authority and is ignored.
+    pub(crate) fn from_installed(installed: Option<&InstalledRemoteCache>) -> RemoteStoreResult<Option<Self>> {
+        installed.map(InstalledRemoteCache::selection).transpose()
+    }
+
+    /// Prefer an explicit environment selection, then the receipt-owned one.
+    ///
+    /// Only a command that the user or CI starts directly may call this: Cargo does not set its environment.
     pub(crate) fn from_environment_or_installed(
         installed: Option<&InstalledRemoteCache>,
     ) -> RemoteStoreResult<Option<Self>> {
         match Self::from_environment()? {
             Some(selection) => Ok(Some(selection)),
-            None => installed.map(InstalledRemoteCache::selection).transpose(),
+            None => Self::from_installed(installed),
         }
     }
 
@@ -748,15 +758,10 @@ impl RemoteCacheConfigurationStatus {
     }
 }
 
+/// The remote selection compilation uses: the installed profile's, never the process environment's.
 pub(crate) fn configuration_status(
     current_dir: &std::path::Path,
 ) -> RemoteStoreResult<Option<RemoteCacheConfigurationStatus>> {
-    if let Some(selection) = RemoteCacheSelection::from_environment()? {
-        return Ok(Some(RemoteCacheConfigurationStatus::from_selection_source(
-            &selection,
-            "transient_environment",
-        )));
-    }
     let installed = crate::cache::installation::installed_remote(current_dir)
         .map_err(|_| RemoteStoreError::configuration("installed remote cache policy is unavailable"))?;
     installed

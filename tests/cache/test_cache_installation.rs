@@ -408,6 +408,16 @@ fn profile_authority_projection(status: &serde_json::Value) -> serde_json::Value
     })
 }
 
+/// Install `remote` in the workspace profile; compilation reads remote selection only from setup.
+#[cfg(unix)]
+fn remote_setup(workspace: &Path, cargo_home: &Path, remote: &str, mode: &str) -> Result<Output> {
+    rail(
+        workspace,
+        cargo_home,
+        &["rail", "cache", "setup", "--remote", remote, "--remote-mode", mode],
+    )
+}
+
 fn remote_probe(workspace: &Path, cargo_home: &Path, remote: &str, mode: &str) -> Result<Output> {
     Command::new(crate::helpers::cargo_binary("cargo-rail"))
         .current_dir(workspace)
@@ -3128,34 +3138,60 @@ fn setup_refuses_global_conflicts_and_workspace_shadowing() {
 }
 
 #[test]
-fn cache_status_reports_only_redacted_machine_selected_remote_authority() {
+fn cache_status_reports_only_the_installed_remote_authority_redacted() {
     let result: Result<()> = (|| {
         let workspace = TestWorkspace::new_single_crate("transparent-remote-status", "0.1.0")?;
         let cargo_home = tempfile::tempdir()?;
-        let output = Command::new(crate::helpers::cargo_binary("cargo-rail"))
-            .current_dir(&workspace.path)
-            .args(["rail", "cache", "status", "--scope", "local", "-f", "json"])
-            .env("CARGO_HOME", cargo_home.path())
-            .env(
-                "CARGO_RAIL_CACHE_REMOTE",
-                "s3://cargo-rail-cache-fixture/cache?region=us-east-1&owner=123456789012",
-            )
-            .env("CARGO_RAIL_CACHE_MODE", "read")
-            .env_remove("RUSTC_WRAPPER")
-            .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
-            .output()?;
-        assert!(output.status.success(), "remote status failed: {output:?}");
-        let value = json(&output)?;
+        let remote = LoopbackS3::start()?;
+        let setup = rail(
+            &workspace.path,
+            cargo_home.path(),
+            &[
+                "rail",
+                "cache",
+                "setup",
+                "--remote",
+                &remote.remote_url(),
+                "--remote-mode",
+                "read-write",
+            ],
+        )?;
+        assert!(setup.status.success(), "remote setup failed: {setup:?}");
+        let status = |environment: &[(&str, &str)]| -> Result<serde_json::Value> {
+            let output = Command::new(crate::helpers::cargo_binary("cargo-rail"))
+                .current_dir(&workspace.path)
+                .args(["rail", "cache", "status", "--scope", "local", "-f", "json"])
+                .env("CARGO_HOME", cargo_home.path())
+                .envs(environment.iter().copied())
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+                .output()?;
+            anyhow::ensure!(output.status.success(), "remote status failed: {output:?}");
+            json(&output)
+        };
+        let value = status(&[])?;
         assert_eq!(value["status"]["schema_version"], 18);
-        assert_eq!(value["status"]["remote_authority"], "read");
-        assert_eq!(value["status"]["remote"]["activation"], "direct_transport_selected");
-        assert_eq!(value["status"]["remote"]["provider"], "aws-s3");
-        assert_eq!(value["status"]["remote"]["mode"], "read");
+        assert_eq!(value["status"]["remote_authority"], "read-write");
+        assert_eq!(value["status"]["remote"]["mode"], "read-write");
+        assert_eq!(value["status"]["remote"]["selection_source"], "installed_profile");
         assert!(value["status"]["remote"].get("normalized_url").is_none());
         assert!(
             value["status"]["remote"]["authority"]
                 .as_str()
                 .is_some_and(|identity| identity.starts_with("remote-authority-v1-sha256-"))
+        );
+        // Cargo passes repository `[env]` values to compilers, so the environment selects nothing.
+        let ambient = status(&[
+            (
+                "CARGO_RAIL_CACHE_REMOTE",
+                "s3://cargo-rail-cache-fixture/cache?region=us-east-1&owner=123456789012",
+            ),
+            ("CARGO_RAIL_CACHE_MODE", "read"),
+        ])?;
+        assert_eq!(ambient["status"]["remote"], value["status"]["remote"]);
+        assert_eq!(
+            ambient["status"]["remote_authority"],
+            value["status"]["remote_authority"]
         );
         Ok(())
     })();
@@ -3484,14 +3520,15 @@ fn one_global_wrapper_isolates_three_concurrent_workspace_profiles_and_an_unenro
         )?;
         assert!(
             transient_output.status.success(),
-            "transient profile override failed: {transient_output:?}"
+            "compilation with an ambient remote failed: {transient_output:?}"
         );
-        assert!(transient.request_count() > 0);
-        assert_eq!(remotes[0].request_count(), installed_before);
+        // Cargo passes repository `[env]` to the wrapper, so only the installed profile selects a remote.
+        assert_eq!(transient.request_count(), 0, "the ambient remote selected storage");
+        assert!(remotes[0].request_count() > installed_before);
         assert_eq!(
             profile_authority_projection(&selected_profile_status(&workspaces[0].path, cargo_home.path(),)?),
             initial_statuses[0],
-            "transient policy rewrote the installed profile"
+            "an ambient remote rewrote the installed profile"
         );
         Ok(())
     })();
@@ -4393,7 +4430,7 @@ fn direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage() {
         }
         fs::write(&source_path, credential_source)?;
         phase("credential setup");
-        let setup = rail(&workspace.path, credential_home.path(), &["rail", "cache", "setup"])?;
+        let setup = remote_setup(&workspace.path, credential_home.path(), &remote_url, "read-write")?;
         assert!(setup.status.success(), "credential cache setup failed: {setup:?}");
         phase("credential compilation");
         let credential_probe = cargo_check_remote(
@@ -4425,7 +4462,7 @@ fn direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage() {
 
         let seed_home = tempfile::tempdir()?;
         phase("seed setup");
-        let setup = rail(&workspace.path, seed_home.path(), &["rail", "cache", "setup"])?;
+        let setup = remote_setup(&workspace.path, seed_home.path(), &remote_url, "read-write")?;
         assert!(setup.status.success(), "seed cache setup failed: {setup:?}");
         let seed_coverage = tempfile::tempdir()?;
         fs::set_permissions(seed_coverage.path(), fs::Permissions::from_mode(0o700))?;
@@ -4482,7 +4519,7 @@ fn direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage() {
         remote.set_available(true);
         let import_home = tempfile::tempdir()?;
         phase("import setup");
-        let setup = rail(&workspace.path, import_home.path(), &["rail", "cache", "setup"])?;
+        let setup = remote_setup(&workspace.path, import_home.path(), &remote_url, "read")?;
         assert!(setup.status.success(), "import cache setup failed: {setup:?}");
         fs::remove_dir_all(workspace.path.join("target"))?;
         let import_coverage = tempfile::tempdir()?;
@@ -4633,7 +4670,7 @@ fn direct_s3_remote_is_l2_only_and_falls_back_cold_on_corruption_or_outage() {
             )?;
             assert!(clean.status.success(), "recovery L1 cleanup failed: {clean:?}");
             assert!(!root.try_exists()?, "recovery retained the seeded L1 authority");
-            let setup = rail(&workspace.path, seed_home.path(), &["rail", "cache", "setup"])?;
+            let setup = remote_setup(&workspace.path, seed_home.path(), &remote_url, "read-write")?;
             assert!(setup.status.success(), "recovery cache setup failed: {setup:?}");
             Ok(())
         };

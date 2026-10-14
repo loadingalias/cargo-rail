@@ -1379,6 +1379,7 @@ impl CompilerCacheIdentity {
             .flatten()
             .and_then(|selection| {
                 let cas = LocalCas::open_initialized_selected(selection.cache()).ok()?;
+                // The collector runs in the Cargo-Rail command process, whose environment Cargo does not set.
                 let remote =
                     crate::remote_cache::RemoteCacheSelection::from_environment_or_installed(selection.remote())
                         .ok()

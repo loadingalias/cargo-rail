@@ -5653,7 +5653,7 @@ impl NativeCacheContext {
         })
         .map_err(|error| early_bypass("native compiler session", &error, "native_cache_session_unavailable"))?;
         let runtime = private_command_directory().map_err(|_| "native_cache_runtime_unavailable")?;
-        let remote = crate::remote_cache::RemoteCacheSelection::from_environment_or_installed(receipt.remote())
+        let remote = crate::remote_cache::RemoteCacheSelection::from_installed(receipt.remote())
             .ok()
             .flatten();
         let analysis_session = load_analysis_session().map_err(|_| "analysis_session_unavailable")?;

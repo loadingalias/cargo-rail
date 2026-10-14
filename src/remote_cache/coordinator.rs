@@ -563,7 +563,7 @@ fn run_server(identity: &str) -> RemoteStoreResult<()> {
         .map_err(|_| RemoteStoreError::unavailable("remote coordinator executable is unavailable"))?;
     let receipt = crate::cache::installation::load_for_coordinator(&invoked)
         .map_err(|_| RemoteStoreError::integrity("remote coordinator installation is invalid"))?;
-    let selection = RemoteCacheSelection::from_environment_or_installed(receipt.remote())?
+    let selection = RemoteCacheSelection::from_installed(receipt.remote())?
         .filter(RemoteCacheSelection::direct_transport_supported)
         .ok_or_else(|| RemoteStoreError::configuration("remote coordinator has no qualified authority"))?;
     if coordinator_identity(&selection, &receipt)?.as_deref() != Some(identity) {
