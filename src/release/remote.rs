@@ -34,7 +34,7 @@ impl RemoteRepository {
             let scheme = scheme.to_ascii_lowercase();
             match scheme.as_str() {
                 "http" | "https" | "ssh" | "git" => {}
-                "file" => return Self::local(remainder),
+                "file" => return Self::local(file_url_path(remainder)),
                 _ => return None,
             }
             let (authority, path) = remainder.split_once('/')?;
@@ -113,6 +113,19 @@ impl RemoteRepository {
             Some(host) => format!("{}/{}", host, self.path),
         }
     }
+}
+
+/// The local path of a `file://` URL: `file:///C:/repo` names `C:/repo` on Windows.
+fn file_url_path(remainder: &str) -> &str {
+    match remainder.strip_prefix('/') {
+        Some(path) if cfg!(windows) && is_drive_path(path) => path,
+        _ => remainder,
+    }
+}
+
+fn is_drive_path(path: &str) -> bool {
+    let mut characters = path.chars();
+    characters.next().is_some_and(|drive| drive.is_ascii_alphabetic()) && characters.next() == Some(':')
 }
 
 fn ambiguous_hosted_path(path: &str) -> bool {
@@ -202,6 +215,21 @@ fn one_remote_repository(workspace_root: &Path, args: &[&str], operation: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_urls_name_their_local_path() {
+        assert_eq!(
+            RemoteRepository::parse("file:///srv/repo.git").unwrap().path(),
+            "/srv/repo.git"
+        );
+        let drive = RemoteRepository::parse("file:///C:/Users/repo").unwrap();
+        let expected = if cfg!(windows) {
+            "C:/Users/repo"
+        } else {
+            "/C:/Users/repo"
+        };
+        assert_eq!(drive.path(), expected);
+    }
 
     #[test]
     fn parses_common_repository_transports_to_one_identity() {
