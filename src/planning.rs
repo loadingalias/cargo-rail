@@ -56,6 +56,11 @@ pub(crate) struct IndexedFileChange {
 pub(crate) struct PlanningIndex {
     file_changes: Vec<IndexedFileChange>,
     config: Vec<ConfigDelta>,
+    /// Changed repository paths outside a nested workspace, relative to the workspace root (`../...`).
+    ///
+    /// Cargo and rustup read some of them, and the compiler can read any of them,
+    /// so they reach the evaluators although `changes.files` names only workspace paths.
+    outside: Vec<String>,
 }
 
 impl PlanningIndex {
@@ -93,7 +98,12 @@ impl PlanningIndex {
             base_ref,
             None,
         )?;
-        let index = Self { file_changes, config };
+        let outside = outside_workspace_paths(ctx, &changes);
+        let index = Self {
+            file_changes,
+            config,
+            outside,
+        };
         index.validate()?;
         Ok(index)
     }
@@ -132,7 +142,12 @@ impl PlanningIndex {
             base_ref,
             Some(head_ref),
         )?;
-        let index = Self { file_changes, config };
+        let outside = outside_workspace_paths(ctx, &changes);
+        let index = Self {
+            file_changes,
+            config,
+            outside,
+        };
         index.validate()?;
         Ok(index)
     }
@@ -145,6 +160,10 @@ impl PlanningIndex {
         &self.config
     }
 
+    pub(crate) fn outside_paths(&self) -> impl Iterator<Item = &str> {
+        self.outside.iter().map(String::as_str)
+    }
+
     fn validate(&self) -> RailResult<()> {
         if !self.config.windows(2).all(|pair| pair[0].path < pair[1].path) {
             return Err(RailError::message(
@@ -154,8 +173,46 @@ impl PlanningIndex {
         if !self.file_changes.windows(2).all(|pair| pair[0].path < pair[1].path) {
             return Err(RailError::message("planning file changes are not strictly sorted"));
         }
+        if !self.outside.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Err(RailError::message(
+                "planning changes outside the workspace are not strictly sorted",
+            ));
+        }
         Ok(())
     }
+}
+
+/// Changed repository paths outside a nested workspace, as `../` paths from the workspace root.
+fn outside_workspace_paths(ctx: &WorkspaceContext, changes: &ChangeSet) -> Vec<String> {
+    let Some(prefix) = ctx.workspace_prefix() else {
+        return Vec::new();
+    };
+    changes
+        .entries()
+        .iter()
+        .filter(|change| ctx.to_workspace_path(change.path.as_path()).is_none())
+        .map(|change| outside_relative_path(&prefix, change.path.as_path()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Express repository path `path` relative to the workspace at repository prefix `prefix`.
+fn outside_relative_path(prefix: &std::path::Path, path: &std::path::Path) -> String {
+    let prefix = prefix.components().collect::<Vec<_>>();
+    let path = path.components().collect::<Vec<_>>();
+    let shared = prefix
+        .iter()
+        .zip(&path)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut relative = std::iter::repeat_n("..".to_string(), prefix.len() - shared).collect::<Vec<_>>();
+    relative.extend(
+        path[shared..]
+            .iter()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned()),
+    );
+    relative.join("/")
 }
 
 fn source_change_kind(kind: crate::source::SourceChangeKind) -> &'static str {
@@ -360,6 +417,23 @@ fn collect_config_deltas(path: &str, before: &Value, after: &Value, output: &mut
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outside_paths_climb_to_the_shared_ancestor() {
+        let prefix = std::path::Path::new("services/rust");
+        assert_eq!(
+            outside_relative_path(prefix, std::path::Path::new("rust-toolchain.toml")),
+            "../../rust-toolchain.toml"
+        );
+        assert_eq!(
+            outside_relative_path(prefix, std::path::Path::new("services/.cargo/config.toml")),
+            "../.cargo/config.toml"
+        );
+        assert_eq!(
+            outside_relative_path(prefix, std::path::Path::new("web/app.ts")),
+            "../../web/app.ts"
+        );
+    }
 
     #[test]
     fn effective_config_delta_names_only_changed_schema_leaves() {

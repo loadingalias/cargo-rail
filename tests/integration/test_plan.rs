@@ -1215,6 +1215,82 @@ fn test_plan_global_cargo_inputs_select_the_whole_workspace() {
 }
 
 #[test]
+fn test_plan_nested_workspace_counts_changes_outside_its_root() {
+    let result: Result<()> = (|| {
+        let repository = tempfile::tempdir()?;
+        let root = repository.path();
+        let workspace = root.join("rust");
+        std::fs::create_dir_all(workspace.join("crates/app/src"))?;
+        std::fs::write(
+            workspace.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/app\"]\nresolver = \"2\"\n",
+        )?;
+        std::fs::write(
+            workspace.join("crates/app/Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        std::fs::write(workspace.join("crates/app/src/lib.rs"), "pub fn value() -> u8 { 1 }\n")?;
+        std::fs::create_dir_all(root.join("web"))?;
+        std::fs::write(root.join("web/app.ts"), "export {};\n")?;
+        let lockfile = Command::new("cargo")
+            .current_dir(&workspace)
+            .args(["generate-lockfile", "--offline"])
+            .output()?;
+        ensure!(
+            lockfile.status.success(),
+            "cargo generate-lockfile failed: {lockfile:?}"
+        );
+        git(root, &["init", "--quiet", "--initial-branch=main"])?;
+        git(root, &["add", "."])?;
+        git(root, &["commit", "--quiet", "-m", "nested workspace"])?;
+        let commit_and_plan = |message: &str| -> Result<Value> {
+            git(root, &["add", "."])?;
+            git(root, &["commit", "--quiet", "-m", message])?;
+            let output = run_cargo_rail(&workspace, &["rail", "plan", "--since", "HEAD~1", "--json"])?;
+            ensure!(
+                output.status.success(),
+                "{message}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(serde_json::from_slice(&output.stdout)?)
+        };
+        let cargo_work = [
+            "cargo.build",
+            "cargo.clippy",
+            "cargo.doc",
+            "cargo.doctest",
+            "cargo.test",
+        ];
+
+        // Cargo reads its configuration in every ancestor directory of the workspace.
+        std::fs::create_dir_all(root.join(".cargo"))?;
+        std::fs::write(root.join(".cargo/config.toml"), "[env]\nRAIL_FIXTURE = \"1\"\n")?;
+        let planned = commit_and_plan("configure Cargo above the workspace")?;
+        assert_eq!(planned["changes"]["files"], serde_json::json!([]));
+        for work in cargo_work {
+            let decision = &planned["work"][work];
+            assert_eq!(decision["state"], "required", "{work}: {planned:#}");
+            assert_eq!(decision["cause"], "changed_input", "{work}");
+            assert_eq!(decision["scope"]["selection"]["kind"], "workspace", "{work}");
+        }
+        assert_eq!(planned["work"]["cargo.fmt"]["state"], "skipped");
+
+        // Any other file outside the workspace can be a compiler input until evidence rules it out.
+        std::fs::write(root.join("web/app.ts"), "export const changed = 1;\n")?;
+        let planned = commit_and_plan("change a sibling file")?;
+        for work in cargo_work {
+            let decision = &planned["work"][work];
+            assert_eq!(decision["state"], "required", "{work}: {planned:#}");
+            assert_eq!(decision["cause"], "incomplete_evidence", "{work}");
+            assert_eq!(decision["scope"]["selection"]["kind"], "workspace", "{work}");
+        }
+        assert_eq!(planned["work"]["cargo.fmt"]["state"], "skipped");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[test]
 fn test_plan_target_selectors_never_narrow_a_package_reached_by_another_change() {
     let result: Result<()> = (|| {
         let ws = TestWorkspace::new_named("plan-target-cross-cause")?;

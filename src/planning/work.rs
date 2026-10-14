@@ -845,6 +845,8 @@ struct Evaluator<'a> {
     ctx: &'a WorkspaceContext,
     cargo_model: &'a PlanningCargoModel,
     paths: &'a [&'a str],
+    /// Changed paths outside a nested workspace, as `../` paths from its root.
+    outside: &'a [&'a str],
     config_deltas: &'a [ConfigDelta],
     semantic_changes: &'a BTreeMap<String, SemanticFileChange>,
     observed: &'a PlanningEvidenceState,
@@ -909,6 +911,7 @@ pub(crate) fn build_work_plan(
     );
     let (work, required, evidence, attribution) = {
         let paths = index.paths().collect::<Vec<_>>();
+        let outside = index.outside_paths().collect::<Vec<_>>();
         let structural_impact =
             structural_cargo_impact(ctx, &cargo_model, semantic_changes, observed.base_model(), &paths)?;
         let prerequisite_source_roots = prerequisite_source_roots(&specs, &structural_impact);
@@ -916,6 +919,7 @@ pub(crate) fn build_work_plan(
             ctx,
             cargo_model: &cargo_model,
             paths: &paths,
+            outside: &outside,
             config_deltas: index.config_deltas(),
             semantic_changes,
             observed: &observed,
@@ -948,7 +952,9 @@ pub(crate) fn build_work_plan(
         (evaluator.decisions, required, evaluator.evidence, attribution)
     };
 
-    let PlanningIndex { file_changes, config } = index;
+    let PlanningIndex {
+        file_changes, config, ..
+    } = index;
 
     let mut plan = WorkPlan {
         plan_contract_version: PLAN_CONTRACT_VERSION,
@@ -2272,6 +2278,15 @@ impl Evaluator<'_> {
                     .map(|input| WorkInput::new(WorkInputKind::Prerequisite, input)),
             );
         }
+        // Outside a nested workspace, the work's own tools read configuration in ancestor
+        // directories. Those inputs cannot be attributed to packages, so they require full scope.
+        let outside_direct = self
+            .outside
+            .iter()
+            .copied()
+            .filter(|path| outside_tool_input(&spec.id, path))
+            .collect::<Vec<_>>();
+        direct.extend(outside_direct.iter().map(|path| WorkInput::path(*path)));
 
         let uncertain = if BUILTIN_CARGO_WORK.binary_search(&spec.id.as_str()).is_ok() {
             let direct_paths = direct
@@ -2279,10 +2294,12 @@ impl Evaluator<'_> {
                 .filter(|input| input.kind == WorkInputKind::Path)
                 .map(|input| input.value.as_str())
                 .collect::<BTreeSet<_>>();
+            // Any other outside file can still be a compiler input; only observation can rule it out.
             paths
                 .iter()
                 .copied()
                 .filter(|path| !direct_paths.contains(path) && cargo_membership_uncertain(self.ctx, path))
+                .chain(self.outside.iter().copied().filter(|path| !direct_paths.contains(path)))
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -2309,7 +2326,11 @@ impl Evaluator<'_> {
 
         if uncertain.is_empty() {
             if let Some(evidence) = direct_evidence {
-                let scope = self.scope_for(spec, paths, evidence.clone(), None)?;
+                let scope = if outside_direct.is_empty() {
+                    self.scope_for(spec, paths, evidence.clone(), None)?
+                } else {
+                    self.full_scope(spec, evidence.clone())?
+                };
                 self.decisions.insert(
                     spec.id.clone(),
                     WorkDecision::Required {
@@ -2320,10 +2341,11 @@ impl Evaluator<'_> {
                 );
                 return Ok(());
             }
+            let considered = paths.iter().chain(self.outside).copied().collect::<Vec<_>>();
             let evidence = self.add_evidence(
                 "complete_disjoint",
                 &spec.id,
-                Some(&paths.join(",")),
+                Some(&considered.join(",")),
                 true,
                 "captured structural inputs are complete and disjoint from this work".to_string(),
             )?;
@@ -2360,7 +2382,11 @@ impl Evaluator<'_> {
                 }
                 let mut selections = Vec::new();
                 if !evidence.is_empty() {
-                    selections.push(cargo_selection(self.ctx, self.structural_impact, &spec.id, paths)?);
+                    selections.push(if outside_direct.is_empty() {
+                        cargo_selection(self.ctx, self.structural_impact, &spec.id, paths)?
+                    } else {
+                        whole_workspace()
+                    });
                 }
                 if !matched.is_empty() {
                     self.report_inputs
@@ -2399,15 +2425,14 @@ impl Evaluator<'_> {
                 evidence.push(self.add_evidence(&code, &spec.id, input.as_deref(), false, description)?);
                 evidence.sort();
                 // An unattributed non-Rust file can be read by any unit. A Rust module keeps
-                // the structural attribution to the package that contains it.
-                let selection = if uncertain.iter().any(|path| !path.ends_with(".rs")) {
-                    self.add_prerequisite_source_roots(
-                        &spec.id,
-                        CargoSelection::Workspace {
-                            cargo_args: Vec::new(),
-                            targets: Vec::new(),
-                        },
-                    )?
+                // the structural attribution to the package that contains it; a file outside
+                // the workspace, or an outside tool input, has no package.
+                let selection = if !outside_direct.is_empty()
+                    || uncertain
+                        .iter()
+                        .any(|path| !path.ends_with(".rs") || path.starts_with("../"))
+                {
+                    self.add_prerequisite_source_roots(&spec.id, whole_workspace())?
                 } else {
                     self.cargo_selection(&spec.id, paths)?
                 };
@@ -2912,6 +2937,19 @@ impl Evaluator<'_> {
         })
     }
 
+    /// The complete scope of `spec`, for an input that no package or variant owns.
+    fn full_scope(&self, spec: &WorkSpec, evidence: String) -> RailResult<WorkScope> {
+        Ok(match spec.scope {
+            WorkSpecScope::Repository => WorkScope::Repository,
+            WorkSpecScope::Cargo => WorkScope::Cargo {
+                selection: self.add_prerequisite_source_roots(&spec.id, whole_workspace())?,
+            },
+            WorkSpecScope::Variants => WorkScope::Variants {
+                selection: VariantSelection::All { evidence },
+            },
+        })
+    }
+
     fn force_all(&mut self, specs: &[WorkSpec]) -> RailResult<()> {
         for spec in specs {
             let evidence = self.add_evidence(
@@ -3135,6 +3173,33 @@ fn is_cargo_structural_input(path: &str) -> bool {
         || path.ends_with("rust-toolchain")
         || path.ends_with("rust-toolchain.toml")
         || path.contains(".cargo/config")
+}
+
+fn whole_workspace() -> CargoSelection {
+    CargoSelection::Workspace {
+        cargo_args: Vec::new(),
+        targets: Vec::new(),
+    }
+}
+
+/// Whether `path`, a `../` path outside a nested workspace, is read by the tool behind `work`:
+/// Cargo configuration or a toolchain file, or the formatter, Clippy, or license policy file,
+/// directly in an ancestor directory of the workspace root.
+fn outside_tool_input(work: &str, path: &str) -> bool {
+    let Some(below_ancestor) = path.strip_prefix("../").map(|rest| rest.trim_start_matches("../")) else {
+        return false;
+    };
+    let cargo = matches!(
+        below_ancestor,
+        "rust-toolchain" | "rust-toolchain.toml" | ".cargo/config" | ".cargo/config.toml"
+    );
+    match work {
+        "cargo.fmt" => matches!(below_ancestor, "rustfmt.toml" | ".rustfmt.toml"),
+        "cargo.clippy" => cargo || matches!(below_ancestor, "clippy.toml" | ".clippy.toml"),
+        "dependency-policy" => below_ancestor == "deny.toml",
+        id if BUILTIN_CARGO_WORK.binary_search(&id).is_ok() => cargo,
+        _ => false,
+    }
 }
 
 fn is_semver_input(path: &str) -> bool {
@@ -3654,6 +3719,28 @@ fn sorted_unique(values: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outside_tool_inputs_are_ancestor_configuration_only() {
+        for work in BUILTIN_CARGO_WORK {
+            assert!(outside_tool_input(work, "../.cargo/config.toml"), "{work}");
+            assert!(outside_tool_input(work, "../../rust-toolchain.toml"), "{work}");
+            assert!(
+                !outside_tool_input(work, "../web/.cargo/config.toml"),
+                "{work}: not an ancestor"
+            );
+            assert!(!outside_tool_input(work, "../web/app.ts"), "{work}");
+        }
+        assert!(outside_tool_input("cargo.fmt", "../rustfmt.toml"));
+        assert!(!outside_tool_input("cargo.fmt", "../rust-toolchain.toml"));
+        assert!(outside_tool_input("cargo.clippy", "../../clippy.toml"));
+        assert!(!outside_tool_input("cargo.build", "../clippy.toml"));
+        assert!(outside_tool_input("dependency-policy", "../deny.toml"));
+        assert!(
+            !outside_tool_input("cargo.build", ".cargo/config.toml"),
+            "inside the workspace"
+        );
+    }
 
     #[test]
     fn scalar_dimensions_reject_non_scalars() {
