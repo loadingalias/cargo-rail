@@ -108,10 +108,9 @@ impl Fixture {
             &fixture.root,
             &["remote", "add", "origin", "git@github.com:owner/repo.git"],
         )?;
-        git(
-            &fixture.root,
-            &["config", "core.sshCommand", ssh.to_str().context("UTF-8")?],
-        )?;
+        // Git runs `core.sshCommand` through a POSIX shell, which reads `\` as an escape on Windows.
+        let ssh = format!("'{}'", ssh.to_str().context("UTF-8")?.replace('\\', "/"));
+        git(&fixture.root, &["config", "core.sshCommand", &ssh])?;
         git(
             &fixture.root,
             &["push", "--quiet", "--set-upstream", "origin", "main", "--tags"],

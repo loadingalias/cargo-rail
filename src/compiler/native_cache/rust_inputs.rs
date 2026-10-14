@@ -1468,6 +1468,8 @@ mod tests {
         }
     }
 
+    // Host paths are absolute Unix paths; on Windows, native result reuse bypasses.
+    #[cfg(unix)]
     #[test]
     fn bare_search_outside_every_root_binds_its_host_candidates() {
         let mut fixture = Fixture::new();
