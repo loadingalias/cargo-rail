@@ -7,7 +7,7 @@ images:
   cargo-rail-ci-windows-x64:
     platform: windows
     arch: x64
-    ami: ami-00836d523b37a565d
+    ami: ami-096d6502bd8b5345b
 runners:
   x86_64-linux:
     family: [c7a.2xlarge, c7i.2xlarge, c8a.2xlarge, c8i.2xlarge]
