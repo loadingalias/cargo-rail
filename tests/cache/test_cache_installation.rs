@@ -5280,10 +5280,12 @@ fn unsupported_shapes_bypass_before_acquisition_while_proc_macro_producers_and_c
         let cache_root = selected_profile_cache_root(&workspace.path, cargo_home.path())?;
         let before = directory_snapshot(&cache_root)?;
 
+        // Verbose output names each compiler invocation, so a failure shows the one that was not bypassed.
         let incremental = Command::new("cargo")
             .current_dir(&workspace.path)
-            .args(["check", "--quiet"])
+            .args(["check", "--verbose"])
             .env("CARGO_HOME", cargo_home.path())
+            .env("CARGO_RAIL_CACHE_TRACE", "1")
             .env_remove("CARGO_INCREMENTAL")
             .env_remove("RUSTC_FORCE_INCREMENTAL")
             .env_remove("RUSTC_WRAPPER")
@@ -5293,7 +5295,12 @@ fn unsupported_shapes_bypass_before_acquisition_while_proc_macro_producers_and_c
             incremental.status.success(),
             "incremental bypass failed: {incremental:?}"
         );
-        assert!(!installation.join("session.json").exists());
+        assert!(
+            !installation.join("session.json").exists(),
+            "incremental check started a compiler session: {}\n{}",
+            String::from_utf8_lossy(&incremental.stderr),
+            fs::read_to_string(installation.join("session.json")).unwrap_or_default()
+        );
         assert!(!installation.join("usage-v1.log").exists());
         assert!(installation.join("early-bypass-v1.log").is_file());
         assert_eq!(
@@ -6888,7 +6895,8 @@ fn external_macho_order_file_invalidates_reuse_without_changing_source() {
 
 /// Qualify native reuse with tiny, dependency-free Cargo workloads on each host,
 /// with embedded metadata and with nightly Cargo's separate metadata
-/// (`-Zno-embed-metadata`: stub rlibs, and each linked library passed as its rlib and rmeta),
+/// (`-Zembed-metadata=no`, `-Zno-embed-metadata` before Cargo 1.99: stub rlibs,
+/// and each linked library passed as its rlib and rmeta),
 /// also in its per-unit build directories (`-Zbuild-dir-new-layout`: `build/PACKAGE/HASH/out`).
 #[cfg(unix)]
 #[test]
@@ -7001,15 +7009,28 @@ host_macros = { path = "../macros" }
         };
         let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
         assert!(setup.status.success(), "cache setup failed: {setup:?}");
-        let separate_metadata = ["-Zno-embed-metadata"].as_slice();
-        let unit_layout = ["-Zno-embed-metadata", "-Zbuild-dir-new-layout"].as_slice();
+        // Cargo 1.99 renamed `-Zno-embed-metadata` to `-Zembed-metadata=no`. Ask the Cargo that builds the
+        // fixture, because a lane can pin a nightly from before the rename.
+        let unstable_flags = Command::new("cargo")
+            .current_dir(&workspace.path)
+            .args(["-Z", "help"])
+            .env("CARGO_HOME", cargo_home.path())
+            .output()?;
+        assert!(unstable_flags.status.success(), "cargo -Z help: {unstable_flags:?}");
+        let embed_metadata = if String::from_utf8_lossy(&unstable_flags.stdout).contains("no-embed-metadata") {
+            "-Zno-embed-metadata"
+        } else {
+            "-Zembed-metadata=no"
+        };
+        let separate_metadata = [embed_metadata];
+        let unit_layout = [embed_metadata, "-Zbuild-dir-new-layout"];
         for (unstable, phase, expected_status) in [
             ([].as_slice(), "cold", "miss"),
             ([].as_slice(), "warm", "hit"),
-            (separate_metadata, "cold separate-metadata", "miss"),
-            (separate_metadata, "warm separate-metadata", "hit"),
-            (unit_layout, "cold unit-layout", "miss"),
-            (unit_layout, "warm unit-layout", "hit"),
+            (separate_metadata.as_slice(), "cold separate-metadata", "miss"),
+            (separate_metadata.as_slice(), "warm separate-metadata", "hit"),
+            (unit_layout.as_slice(), "cold unit-layout", "miss"),
+            (unit_layout.as_slice(), "warm unit-layout", "hit"),
         ] {
             if expected_status == "miss" {
                 if target.exists() {
