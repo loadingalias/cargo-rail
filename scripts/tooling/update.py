@@ -1,10 +1,10 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run python
 """Local release selection for Cargo-Rail tooling and every Cargo manifest."""
-from datetime import datetime, timezone
 from functools import cache
 from pathlib import Path
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -14,7 +14,7 @@ import tomlkit
 
 from catalog import ROOT, PLATFORMS, read, validate
 REPOS = {'actionlint': 'rhysd/actionlint', 'cargo-binstall': 'cargo-bins/cargo-binstall', 'cmake': 'Kitware/CMake', 'llvm': 'llvm/llvm-project',
-         'git': 'git-for-windows/git'}
+         'git': 'git-for-windows/git', 'uv': 'astral-sh/uv'}
 
 def fetch(url):
     request = urllib.request.Request(url, headers={'User-Agent': 'Cargo-Rail tooling (local release updater)'})
@@ -116,26 +116,10 @@ def update_catalog():
     data = tomlkit.parse(path.read_text())
     for name in data['cargo']:
         data['cargo'][name] = crate_version(name)
-    for name in data['updater']:
-        data['updater'][name] = api(f'https://pypi.org/pypi/{name}/json')['info']['version']
     versions = data['versions']
     for name, repo in REPOS.items():
         versions[name] = release(repo)['tag_name'].removeprefix('v').removeprefix('llvmorg-')
     versions['rustup'] = tomllib.loads(fetch('https://static.rust-lang.org/rustup/release-stable.toml')[0].decode())['version']
-    releases = api('https://www.python.org/api/v2/downloads/release/')
-    versions['python'] = max((semver(item['name'].removeprefix('Python ')), item['name'].removeprefix('Python '))
-        for item in releases if item['is_published'] and not item['pre_release']
-        and semver(item['name'].removeprefix('Python ')))[1]
-    # Refresh the same Ubuntu series; changing runner OS is a separate choice.
-    snapshot = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-    series = {(data[platform].get('ubuntu', data['linux']['ubuntu']),
-               data[platform].get('codename', data['linux']['codename']))
-              for platform in PLATFORMS if platform.endswith('-linux')}
-    for ubuntu, codename in sorted(series):
-        text = fetch(f'https://snapshot.ubuntu.com/ubuntu/{snapshot}/dists/{codename}/Release')[0].decode()
-        if f'Version: {ubuntu}\n' not in text:
-            raise ValueError(f'Ubuntu snapshot does not match the configured release: {ubuntu}')
-    data['linux']['snapshot'] = snapshot
     channel_bytes, channel_url = fetch('https://aka.ms/vs/stable/channel')
     channel = json.loads(channel_bytes)
     vsman = next(item['payloads'][0] for item in channel['channelItems'] if item['id'] == 'Microsoft.VisualStudio.Manifests.VisualStudio')
@@ -158,6 +142,7 @@ def update_catalog():
         if not re.fullmatch('[0-9a-f]{64}', checksum):
             raise ValueError('invalid rustup checksum')
         assets['rustup'] = {'url': rustup_url, 'sha256': checksum}
+        assets['uv'] = github_asset(REPOS['uv'], f'uv-{host}.' + ('zip' if windows else 'tar.gz'))
         if 'cargo-nextest' in assets:
             version = data['cargo']['cargo-nextest']
             release_data = api(f'https://api.github.com/repos/nextest-rs/nextest/releases/tags/cargo-nextest-{version}')
@@ -176,12 +161,35 @@ def update_catalog():
         if 'llvm' in assets:
             assets['llvm'] = github_asset(REPOS['llvm'], f'clang+llvm-{versions["llvm"]}-{host}.tar.xz')
         if windows:
-            pyarch = 'arm64' if arch == 'aarch64' else 'amd64'
-            assets['python'] = pinned_url(f'https://www.python.org/ftp/python/{versions["python"]}/python-{versions["python"]}-embed-{pyarch}.zip')
             git_version = versions['git'].replace('.windows.', '.')
             assets['git'] = github_asset(REPOS['git'], f'Git-{git_version}-' + ('arm64' if arch == 'aarch64' else '64-bit') + '.exe')
+    data['aarch64-macos']['assets']['uv'] = github_asset(REPOS['uv'], 'uv-aarch64-apple-darwin.tar.gz')
     validate(data)
     write(path, data)
+
+
+def update_python():
+    """Select the newest patch of the pinned Python minor release and the newest tooling packages, then relock.
+
+    A new minor release is an explicit change: compiled wheels follow it later.
+    """
+    path = ROOT / '.python-version'
+    minor = path.read_text().strip().rsplit('.', 1)[0]
+    downloads = json.loads(run('uv', 'python', 'list', '--only-downloads', '--output-format', 'json', minor))
+    selected = max((item['version'] for item in downloads if item['implementation'] == 'cpython'
+                    and item['variant'] == 'default' and semver(item['version'])), key=semver) + '\n'
+    if selected != path.read_text():
+        print(f'Updating {path.relative_to(ROOT)}', flush=True)
+        path.write_text(selected)
+    project = ROOT / 'pyproject.toml'
+    document = tomlkit.parse(project.read_text())
+    tooling = document['dependency-groups']['tooling']
+    for index, requirement in enumerate(tooling):
+        name = requirement.split('==')[0]
+        tooling[index] = f'{name}=={api(f"https://pypi.org/pypi/{name}/json")["info"]["version"]}'
+    write(project, document)
+    environment = {key: value for key, value in os.environ.items() if key != 'UV_LOCKED'}
+    subprocess.run(['uv', 'lock'], cwd=ROOT, env=environment, check=True)
 
 
 def manifest_documents():
@@ -294,11 +302,14 @@ def main():
     if len(sys.argv) != 1:
         raise ValueError('usage: just update')
     update_catalog()
+    update_python()
     update_rust()
     documents = manifest_documents()
     update_manifests(documents)
     update_locks(documents)
-    for command in (['cargo', 'audit'], ['cargo', 'deny', '--locked', 'check', '-D', 'warnings', 'all']):
+    # The same dependency gate as `just check-dependencies`: optional providers widen the graph.
+    for command in (['cargo', 'audit'],
+                    ['cargo', 'deny', '--locked', '--workspace', '--all-features', 'check', '-D', 'warnings', 'all']):
         subprocess.run(command, cwd=ROOT, check=True)
     print('Update complete')
 

@@ -1,0 +1,12 @@
+# Images that dev-machines bakes from this repository's installer.
+# `dev-machine image-refresh cargo-rail` rebuilds those whose installer inputs
+# changed or that aged out. Linux hosts and runners keep their stock images:
+# their installation is already brief.
+
+# dev-machines SSH images.
+ssh = ["windows2025-x64"]
+
+# Each RunsOn image that .github/runs-on.yml selects, with every installer
+# operation its runners execute.
+[ci]
+windows25-full-x64 = ["ci", "package"]

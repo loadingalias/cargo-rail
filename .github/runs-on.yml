@@ -1,5 +1,13 @@
 # AWS runner profiles. Keep sizing here; workflows select names without shape overrides.
 # Public repositories resolve this catalog from the default branch.
+# dev-machines bakes these from scripts/tooling for the operations in .config/images.toml;
+# `dev-machine image-refresh cargo-rail` rebuilds stale ones. Rebuild within 25 days:
+# GitHub rejects runner agents older than 30 days.
+images:
+  cargo-rail-ci-windows-x64:
+    platform: windows
+    arch: x64
+    ami: ami-0125c4503826ede5d
 runners:
   x86_64-linux:
     family: [c7a.2xlarge, c7i.2xlarge, c8a.2xlarge, c8i.2xlarge]
@@ -17,6 +25,6 @@ runners:
   x86_64-win:
     family: [c7a.2xlarge, c8a.2xlarge]
     cpu: 8
-    image: windows25-full-x64
+    image: cargo-rail-ci-windows-x64
     spot: false
     volume: 200gb:gp3

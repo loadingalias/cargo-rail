@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 [[ $# == 1 ]] || { echo "usage: $0 <component-dir>" >&2; exit 2; }
 
-python3 - "$1" <<'PYTHON'
+uv run python - "$1" <<'PYTHON'
 import os
 from pathlib import Path
 import shlex

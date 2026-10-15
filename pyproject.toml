@@ -1,0 +1,17 @@
+# Python for scripts/. uv owns the interpreter (.python-version), these pins,
+# and their hashes (uv.lock). Every Python command runs through `uv run`.
+[project]
+name = "cargo-rail-scripts"
+version = "0.0.0"
+requires-python = "==3.14.*"
+dependencies = []
+
+[dependency-groups]
+# `just update` and the tooling tests.
+tooling = ["tomlkit==0.15.1"]
+
+[tool.uv]
+package = false
+default-groups = []
+# Every pin has a wheel. No package builds from source.
+no-build = true

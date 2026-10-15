@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run python
 """Publish one content-addressed compiler adapter pack and its checksum."""
 
 import hashlib

@@ -6,7 +6,7 @@ if [[ ${1:-} != --prepare || $# != 2 ]]; then
   exit 2
 fi
 
-python3 - "$2" <<'PYTHON'
+uv run python - "$2" <<'PYTHON'
 import json
 import os
 from pathlib import Path

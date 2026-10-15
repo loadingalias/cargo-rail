@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 if [[ ( ${1:-} == --prepare && ( $# == 2 || $# == 3 ) ) || ( ${1:-} == --prepare-source && $# == 2 ) ]]; then
-  python3 -B - "$2" "$1" "${3:-}" <<'PYTHON'
+  uv run python -B - "$2" "$1" "${3:-}" <<'PYTHON'
 import hashlib
 import json
 import os

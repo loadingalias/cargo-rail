@@ -50,11 +50,14 @@ paths = [
   ".config/tooling.toml",
   ".github/**",
   ".gitignore",
+  ".python-version",
   "Cargo.toml",
   "LICENSE",
   "justfile",
+  "pyproject.toml",
   "rust-toolchain.toml",
   "scripts/**",
+  "uv.lock",
 ]
 
 [plan.work.test-cache-host]

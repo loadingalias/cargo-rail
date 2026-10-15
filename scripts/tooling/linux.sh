@@ -5,8 +5,16 @@ export PYTHONDONTWRITEBYTECODE=1
 
 platform="${1:?native platform is required}"
 shift
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# uv runs every Python command with the interpreter and packages that the repository pins.
+export UV_PROJECT="$REPO_ROOT" UV_LOCKED=1
+# Any host, including the macOS workstation, can name the inputs of an installation.
+if [[ "$#" -eq 2 && "$1" == fingerprint ]]; then
+  exec uv run python "$SCRIPT_DIR/fingerprint.py" "$platform" "$2"
+fi
 [[ ( "$#" -eq 1 && ( "$1" == ci || "$1" == package || "$1" == cache-host ) ) || ( "$#" -eq 2 && "$1" == cross-build ) ]] || {
-  echo "usage: scripts/tooling/$platform.sh {ci|package|cache-host|cross-build TARGET-PLATFORM}" >&2; exit 64;
+  echo "usage: scripts/tooling/$platform.sh {ci|package|cache-host|cross-build TARGET-PLATFORM|fingerprint OPERATION}" >&2; exit 64;
 }
 operation="$1"
 cross_platform="${2:-}"
@@ -21,16 +29,12 @@ esac
 [[ "$(uname -s)" == Linux && "$(uname -m)" == "$machine" ]] || {
   echo "$platform requires a native ${platform%-linux} Linux host" >&2; exit 1;
 }
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
-# Ubuntu Server supplies Python; install it from the selected archive if absent.
-# Read bootstrap strings before the full TOML reader is available.
+# Read the required release before uv provides the full TOML reader.
 catalog="$REPO_ROOT/.config/tooling.toml"
 bootstrap_value() { sed -n '/^\['"${2:-linux}"'\]$/,/^\[/s/^'"$1"' = "\([^"]*\)"$/\1/p' "$catalog"; }
 ubuntu="$(bootstrap_value ubuntu "$platform")"
 ubuntu="${ubuntu:-$(bootstrap_value ubuntu)}"
-snapshot="$(bootstrap_value snapshot)"
 # shellcheck source=/dev/null
 source /etc/os-release
 [[ "$ID" == ubuntu && "$VERSION_ID" == "$ubuntu" ]] || {
@@ -39,60 +43,110 @@ source /etc/os-release
 sudo_cmd=()
 if [[ "$(id -u)" != 0 ]]; then sudo_cmd=(sudo); fi
 temporary="$(mktemp -d)"
-trap '"${sudo_cmd[@]}" rm -rf -- "$temporary"' EXIT
-# Minimal Ubuntu images may omit the HTTPS trust store and Python. Bootstrap
-# those through Ubuntu's signed archive, then converge them to the snapshot too.
-if ! command -v python3 >/dev/null || [[ ! -f /etc/ssl/certs/ca-certificates.crt ]]; then
-  "${sudo_cmd[@]}" apt-get -o APT::Update::Error-Mode=any update
-  "${sudo_cmd[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y python3 ca-certificates
+trap 'rm -rf -- "$temporary"' EXIT
+# Ubuntu packages come from the guest's own archive; a baked image pins them.
+apt=("${sudo_cmd[@]}" env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 -o APT::Update::Error-Mode=any)
+apt_updated=false
+apt_update() {
+  [[ "$apt_updated" == true ]] || "${apt[@]}" update
+  apt_updated=true
+}
+# Minimal Ubuntu images may omit curl and the HTTPS trust store.
+if ! command -v curl >/dev/null || [[ ! -f /etc/ssl/certs/ca-certificates.crt ]]; then
+  apt_update
+  "${apt[@]}" install -y curl ca-certificates
 fi
-codename="$(bootstrap_value codename "$platform")"
-codename="${codename:-$(bootstrap_value codename)}"
-mkdir -p "$temporary/lists/partial"
-chmod 755 "$temporary" "$temporary/lists" "$temporary/lists/partial"
-# Explicit snapshot URLs work on an empty package cache and on all supported architectures.
-# The archive remains signed; historical snapshots intentionally outlive Valid-Until.
-for suite in "$codename" "$codename-updates" "$codename-security"; do
-  printf 'deb [target=Packages check-valid-until=no signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/%s %s main universe\n' "$snapshot" "$suite"
-done > "$temporary/sources.list"
-# The snapshot service is the only package source and can return HTTP 502 and 503 for minutes.
-# apt retries transient errors after delays that double from 1 to 30 seconds; eight retries span about two minutes.
-apt_options=(-o "Dir::Etc::sourcelist=$temporary/sources.list" -o Dir::Etc::sourceparts=-
-  -o "Dir::State::lists=$temporary/lists" -o APT::Update::Error-Mode=any
-  -o Acquire::Retries=8 -o Acquire::https::Timeout=30 -o Acquire::Languages=none)
-apt=("${sudo_cmd[@]}" env DEBIAN_FRONTEND=noninteractive apt-get "${apt_options[@]}")
-"${apt[@]}" update
-catalog_get() { python3 "$SCRIPT_DIR/catalog.py" get "$@"; }
-python3 "$SCRIPT_DIR/catalog.py" validate
-catalog_select() { python3 "$SCRIPT_DIR/catalog.py" select "$platform" "$operation" "$@"; }
+uv_directory="$("$SCRIPT_DIR/uv.sh" "$platform")"
+export PATH="$uv_directory:$PATH"
+catalog_get() { uv run python "$SCRIPT_DIR/catalog.py" get "$@"; }
+catalog_select() { uv run python "$SCRIPT_DIR/catalog.py" select "$platform" "$operation" "$@"; }
 build_jobs="$(catalog_get "$platform" cargo-build-jobs 2>/dev/null || true)"
 if [[ -n "$build_jobs" ]]; then export CARGO_BUILD_JOBS="$build_jobs"; fi
-# Resolve the complete selection before package installation; process substitutions do not propagate failures.
+# Resolve the complete selection first; process substitutions do not propagate failures.
 catalog_select > /dev/null
-mapfile -t packages < <(catalog_select packages)
-# Ubuntu's perf dispatcher selects the complete running kernel release, including flavor.
-for package in "${packages[@]}"; do
-  if [[ "$package" == linux-tools-common ]]; then
-    packages+=("linux-tools-$(uname -r)")
-    break
-  fi
-done
-# Exact candidates come from the selected snapshot, including repeat installations.
-pinned_packages=()
-for package in "${packages[@]}"; do
-  version="$(apt-cache "${apt_options[@]}" madison "$package" | awk 'NR == 1 {print $3}')"
-  [[ -n "$version" && "$version" != '(none)' ]] || { echo "missing Ubuntu package $package in snapshot $snapshot (running kernel $(uname -r))" >&2; exit 1; }
-  pinned_packages+=("$package=$version")
-done
-"${apt[@]}" install -y --allow-downgrades --no-install-recommends "${pinned_packages[@]}"
-
 prefix="$HOME/.local/share/cargo-rail-tooling"
 mkdir -p "$prefix"
-python3 "$SCRIPT_DIR/catalog.py" download "$platform" rustup "$temporary/rustup-init"
-chmod +x "$temporary/rustup-init"
-channel="$(python3 "$SCRIPT_DIR/catalog.py" rust-channel "$platform" "$operation" ${cross_platform:+"$cross_platform"})"
-"$temporary/rustup-init" -y --no-modify-path --default-host "$(catalog_get "$platform" rust-host)" --default-toolchain none
+environment="$prefix/environment.sh"
+host="$(catalog_get "$platform" rust-host)"
+channel="$(uv run python "$SCRIPT_DIR/catalog.py" rust-channel "$platform" "$operation" ${cross_platform:+"$cross_platform"})"
 export PATH="$HOME/.cargo/bin:$PATH"
+mapfile -t cargo_tools < <(catalog_select cargo)
+# Each tool reports its own version through the selected toolchain, which nothing installs implicitly.
+pinned() { RUSTUP_AUTO_INSTALL=0 RUSTUP_TOOLCHAIN="$channel" uv run python "$SCRIPT_DIR/catalog.py" require "$@"; }
+
+# Archive tools retain their complete directory layouts. An installed archive is found by its receipt.
+install_archives() {
+  uv run python "$SCRIPT_DIR/catalog.py" install-archives "$platform" "$operation" "$prefix" > "$temporary/archives"
+  tool_paths=("$uv_directory")
+  while IFS=$'\t' read -r _name directory; do
+    if [[ -d "$directory/bin" ]]; then tool_paths+=("$directory/bin"); else tool_paths+=("$directory"); fi
+  done < "$temporary/archives"
+  tool_paths+=("$HOME/.cargo/bin")
+  PATH="$(IFS=:; echo "${tool_paths[*]}"):$PATH"
+  export PATH
+}
+# Persistent paths are shared by interactive shells and non-interactive Bash recipes.
+publish_environment() {
+  {
+    printf "export PATH=%q:\"\$PATH\"\n" "$(IFS=:; echo "${tool_paths[*]}")"
+    printf 'export RUSTUP_TOOLCHAIN=%q\n' "$channel"
+    if [[ -n "$build_jobs" ]]; then printf 'export CARGO_BUILD_JOBS=%q\n' "$build_jobs"; fi
+  } > "$environment"
+  if [[ -n "${GITHUB_PATH:-}" ]]; then printf '%s\n' "${tool_paths[@]}" >> "$GITHUB_PATH"; fi
+  if [[ -n "${GITHUB_ENV:-}" ]]; then
+    printf 'RUSTUP_TOOLCHAIN=%s\n' "$channel" >> "$GITHUB_ENV"
+    if [[ -n "$build_jobs" ]]; then printf 'CARGO_BUILD_JOBS=%s\n' "$build_jobs" >> "$GITHUB_ENV"; fi
+  fi
+  for startup in "$HOME/.profile" "$HOME/.bashrc"; do
+    line="source \"$environment\""
+    touch "$startup"
+    grep -Fxq "$line" "$startup" || printf '\n%s\n' "$line" >> "$startup"
+  done
+}
+# A complete run records the fingerprint of its inputs. While it matches, a converged
+# host or image republishes its environment for this operation once the pins answer.
+fingerprint=""
+if [[ "$operation" != cross-build ]]; then
+  fingerprint="$(uv run python "$SCRIPT_DIR/fingerprint.py" "$platform" "$operation")"
+fi
+if [[ -n "$fingerprint" && -f "$prefix/fingerprint.$operation" && "$(<"$prefix/fingerprint.$operation")" == "$fingerprint" ]]; then
+  install_archives
+  if RUSTUP_AUTO_INSTALL=0 rustc +"$channel" -vV >/dev/null 2>&1 && pinned rustup "${cargo_tools[@]}"; then
+    publish_environment
+    printf 'Tooling fingerprint %s matches; published %s.\n' "$fingerprint" "$environment"
+    exit 0
+  fi
+  echo "Tooling fingerprint $fingerprint matches, but a pinned tool is missing; converging." >&2
+fi
+
+uv run python "$SCRIPT_DIR/catalog.py" validate
+mapfile -t packages < <(catalog_select packages)
+# Ubuntu's perf dispatcher selects the complete running kernel release, including flavor.
+# A container shares its host's kernel, whose tools belong to that host.
+if [[ ! -f /.dockerenv && ! -f /run/.containerenv ]]; then
+  for package in "${packages[@]}"; do
+    if [[ "$package" == linux-tools-common ]]; then
+      packages+=("linux-tools-$(uname -r)")
+      break
+    fi
+  done
+fi
+# A host that already holds every package needs no archive update at all.
+# shellcheck disable=SC2016 # dpkg-query expands its own format fields.
+installed="$(dpkg-query -W -f='${db:Status-Abbrev}${Package}\n' "${packages[@]}" 2>/dev/null || true)"
+if [[ "$(awk '$1 == "ii" { print $2 }' <<<"$installed" | sort -u | wc -l)" -eq "$(printf '%s\n' "${packages[@]}" | sort -u | wc -l)" ]]; then
+  echo "Ubuntu packages are installed."
+else
+  apt_update
+  "${apt[@]}" install -y --no-install-recommends "${packages[@]}"
+fi
+
+# rustup reports its own version; only a missing or different pin is installed.
+if ! pinned rustup >/dev/null 2>&1; then
+  uv run python "$SCRIPT_DIR/catalog.py" download "$platform" rustup "$temporary/rustup-init"
+  chmod +x "$temporary/rustup-init"
+  "$temporary/rustup-init" -y --no-modify-path --default-host "$host" --default-toolchain none
+fi
 mapfile -t components < <(catalog_select components)
 toolchain_args=()
 for component in "${components[@]}"; do toolchain_args+=(--component "$component"); done
@@ -111,44 +165,21 @@ fi
 # cross targets and local development components when Cargo runs in this checkout.
 export RUSTUP_TOOLCHAIN="$channel"
 
-# Archive tools retain their complete directory layouts.
-python3 "$SCRIPT_DIR/catalog.py" install-archives "$platform" "$operation" "$prefix" > "$temporary/archives"
-tool_paths=()
-while IFS=$'\t' read -r _name directory; do
-  if [[ -d "$directory/bin" ]]; then tool_paths+=("$directory/bin"); else tool_paths+=("$directory"); fi
-done < "$temporary/archives"
-tool_paths+=("$HOME/.cargo/bin")
-PATH="$(IFS=:; echo "${tool_paths[*]}"):$PATH"
-export PATH
-mapfile -t cargo_tools < <(catalog_select cargo)
+install_archives
 for tool in "${cargo_tools[@]}"; do
+  # Each tool reports its own version; only a missing or different pin is installed.
+  if pinned "$tool" >/dev/null 2>&1; then continue; fi
   version="$(catalog_get cargo "$tool")"
-  # Cargo's install registry verifies exact installed package versions on reruns.
   if command -v cargo-binstall >/dev/null; then
     env -u RUSTC_WRAPPER -u CARGO_ENCODED_RUSTFLAGS \
-      cargo +"$channel" binstall --locked --no-confirm --targets "$(catalog_get "$platform" rust-host)" "$tool@$version"
+      cargo +"$channel" binstall --locked --no-confirm --targets "$host" "$tool@$version"
   else
     # No cargo-binstall release exists for this host; build the pinned version from its locked sources.
     env -u RUSTC_WRAPPER -u CARGO_ENCODED_RUSTFLAGS \
       cargo +"$channel" install --locked "$tool" --version "$version"
   fi
 done
-python3 "$SCRIPT_DIR/verify.py" "$platform" "$operation" ${cross_platform:+"$cross_platform"}
-# Persistent paths are shared by interactive shells and non-interactive Bash recipes.
-environment="$prefix/environment.sh"
-{
-  printf "export PATH=%q:\"\$PATH\"\n" "$(IFS=:; echo "${tool_paths[*]}")"
-  printf 'export RUSTUP_TOOLCHAIN=%q\n' "$channel"
-  if [[ -n "$build_jobs" ]]; then printf 'export CARGO_BUILD_JOBS=%q\n' "$build_jobs"; fi
-} > "$environment"
-if [[ -n "${GITHUB_PATH:-}" ]]; then printf '%s\n' "${tool_paths[@]}" >> "$GITHUB_PATH"; fi
-if [[ -n "${GITHUB_ENV:-}" ]]; then
-  printf 'RUSTUP_TOOLCHAIN=%s\n' "$channel" >> "$GITHUB_ENV"
-  if [[ -n "$build_jobs" ]]; then printf 'CARGO_BUILD_JOBS=%s\n' "$build_jobs" >> "$GITHUB_ENV"; fi
-fi
-for startup in "$HOME/.profile" "$HOME/.bashrc"; do
-  line="source \"$environment\""
-  touch "$startup"
-  grep -Fxq "$line" "$startup" || printf '\n%s\n' "$line" >> "$startup"
-done
+uv run python "$SCRIPT_DIR/verify.py" "$platform" "$operation" ${cross_platform:+"$cross_platform"}
+publish_environment
+[[ -z "$fingerprint" ]] || printf '%s\n' "$fingerprint" > "$prefix/fingerprint.$operation"
 printf 'Installed %s %s tooling. New shells load %s.\n' "$platform" "$operation" "$environment"

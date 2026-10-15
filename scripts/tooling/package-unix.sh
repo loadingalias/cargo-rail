@@ -15,24 +15,29 @@ case "$1" in
   *) echo "unsupported native package target: $1" >&2; exit 64 ;;
 esac
 [[ "$(uname -s)" == Darwin && "$(uname -m)" == arm64 ]] || { echo 'macOS packaging requires native Apple Silicon' >&2; exit 1; }
-# The macOS runner supplies Xcode, CMake, Python, and rustup; check native prerequisites before installing Rust tools.
-for tool in xcrun cc cmake python3 rustup cargo; do
+# The macOS runner supplies Xcode, CMake, and rustup; check native prerequisites before installing Rust tools.
+for tool in xcrun cc cmake rustup cargo; do
   command -v "$tool" >/dev/null || { echo "missing macOS package prerequisite: $tool" >&2; exit 127; }
 done
 xcrun --find clang
 cmake --version
-python3 "$SCRIPT_DIR/catalog.py" validate
+# uv runs every Python command, here and in later steps, with the interpreter and packages that the repository pins.
+export UV_PROJECT="$PWD" UV_LOCKED=1
+uv_directory="$("$SCRIPT_DIR/uv.sh" aarch64-macos)"
+export PATH="$uv_directory:$PATH"
+if [[ -n "${GITHUB_PATH:-}" ]]; then printf '%s\n' "$uv_directory" >> "$GITHUB_PATH"; fi
+uv run python "$SCRIPT_DIR/catalog.py" validate
 export RUSTUP_TOOLCHAIN
-RUSTUP_TOOLCHAIN="$(python3 "$SCRIPT_DIR/catalog.py" rust-channel)"
+RUSTUP_TOOLCHAIN="$(uv run python "$SCRIPT_DIR/catalog.py" rust-channel)"
 components=()
 while IFS= read -r component; do components+=(--component "$component"); done < <(
-  python3 "$SCRIPT_DIR/catalog.py" get operations "$operation" components
+  uv run python "$SCRIPT_DIR/catalog.py" get operations "$operation" components
 )
 rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal "${components[@]}"
 [[ "$(rustc -vV | sed -n 's/^host: //p')" == "$1" ]]
-cargo install cargo-binstall --version "$(python3 "$SCRIPT_DIR/catalog.py" get versions cargo-binstall)" --locked
+cargo install cargo-binstall --version "$(uv run python "$SCRIPT_DIR/catalog.py" get versions cargo-binstall)" --locked
 while IFS= read -r tool; do
   cargo binstall --locked --no-confirm --targets "$1" --strategies crate-meta-data \
-    "$tool@$(python3 "$SCRIPT_DIR/catalog.py" get cargo "$tool")"
-done < <(python3 "$SCRIPT_DIR/catalog.py" get operations "$operation" cargo)
+    "$tool@$(uv run python "$SCRIPT_DIR/catalog.py" get cargo "$tool")"
+done < <(uv run python "$SCRIPT_DIR/catalog.py" get operations "$operation" cargo)
 if [[ -n "${GITHUB_ENV:-}" ]]; then printf 'RUSTUP_TOOLCHAIN=%s\n' "$RUSTUP_TOOLCHAIN" >> "$GITHUB_ENV"; fi

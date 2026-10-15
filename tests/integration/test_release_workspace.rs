@@ -269,8 +269,8 @@ fn archive_host_manifest_matches_its_schema_and_declared_assets() {
         for name in files.iter().filter(|name| name.ends_with(".zip")) {
             std::fs::write(directory.path().join(name), b"fixture archive")?;
         }
-        let output = std::process::Command::new("python3")
-            .arg("-B")
+        let output = std::process::Command::new("uv")
+            .args(["run", "python", "-B"])
             .arg(root.join("scripts/package-archive-hosts.py"))
             .arg(directory.path())
             .output()?;

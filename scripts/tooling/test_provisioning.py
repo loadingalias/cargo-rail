@@ -10,6 +10,14 @@ import unittest
 
 import catalog
 
+# The pinned uv runs each helper as `python SCRIPT` would, in the interpreter that runs these tests.
+UV_STUB = """import pathlib, runpy, sys
+if sys.argv[1:3] == ['run', 'python']:
+    sys.argv = sys.argv[3:]
+    sys.path.insert(0, str(pathlib.Path(sys.argv[0]).parent))
+    runpy.run_path(sys.argv[0], run_name='__main__')
+"""
+
 
 class UnixPackageProvisioning(unittest.TestCase):
     def setUp(self):
@@ -18,10 +26,18 @@ class UnixPackageProvisioning(unittest.TestCase):
         self.root = Path(temporary.name)
         scripts = self.root / 'scripts/tooling'
         scripts.mkdir(parents=True)
-        for name in ['package-unix.sh', 'catalog.py']:
+        for name in ['package-unix.sh', 'uv.sh', 'catalog.py']:
             shutil.copy(catalog.ROOT / 'scripts/tooling' / name, scripts / name)
         shutil.copytree(catalog.ROOT / '.config', self.root / '.config')
-        shutil.copy(catalog.ROOT / 'rust-toolchain.toml', self.root)
+        for name in ['rust-toolchain.toml', '.python-version']:
+            shutil.copy(catalog.ROOT / name, self.root)
+        # The pinned uv is installed, so uv.sh finds it by its receipt.
+        sha = catalog.read()['aarch64-macos']['assets']['uv']['sha256']
+        self.uv_directory = self.root / '.local/share/cargo-rail-tooling/uv' / sha[:16]
+        self.uv_directory.mkdir(parents=True)
+        (self.uv_directory / '.rail-installed').write_text(sha + '\n')
+        (self.uv_directory / 'uv').write_text(f'#!{sys.executable}\n' + UV_STUB)
+        (self.uv_directory / 'uv').chmod(0o755)
         self.recorder = f'#!{sys.executable}\n' + '''
 import json, os, pathlib, sys
 name = pathlib.Path(sys.argv[0]).name
@@ -44,6 +60,7 @@ else:
             'HOME': str(self.root),
             'PROVISION_LOG': str(self.root / 'commands.jsonl'),
             'GITHUB_ENV': str(self.root / 'github-env'),
+            'GITHUB_PATH': str(self.root / 'github-path'),
         }
 
     def recording_command(self, path):
@@ -74,6 +91,8 @@ else:
              '--strategies', 'crate-meta-data', f"just@{catalog.read()['cargo']['just']}"],
         ])
         self.assertEqual((self.root / 'github-env').read_text(), f'RUSTUP_TOOLCHAIN={catalog.rust_channel()}\n')
+        # Later steps run Python through the same pinned uv.
+        self.assertEqual((self.root / 'github-path').read_text(), f'{self.uv_directory}\n')
 
     def test_macos_ci_operation_installs_the_cataloged_check_tools(self):
         calls = self.provision('aarch64-apple-darwin', 'ci')
@@ -113,80 +132,195 @@ else:
         self.assertEqual(self.provision('aarch64-apple-darwin', 'unknown', success=False), [])
 
 
-class LinuxPerfProvisioning(unittest.TestCase):
-    def provision(self, kernel, operation='ci', missing=False):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            scripts = root / 'scripts/tooling'
-            scripts.mkdir(parents=True)
-            for name in ('linux.sh', 'catalog.py'):
-                shutil.copy(catalog.ROOT / 'scripts/tooling' / name, scripts / name)
-            shutil.copytree(catalog.ROOT / '.config', root / '.config')
-            binaries = root / 'bin'
-            binaries.mkdir()
-            recorder = f'#!{sys.executable}\n' + '''
-import json, os, pathlib, sys
+LINUX_STUB = r"""import json, os, pathlib, runpy, sys, tomllib
 name = pathlib.Path(sys.argv[0]).name
+args = sys.argv[1:]
+with open(os.environ['FIXTURE_LOG'], 'a') as log:
+    log.write(json.dumps([name, *args]) + '\n')
 if name == 'uname':
-    print({'-s': 'Linux', '-m': 'x86_64', '-r': os.environ['FIXTURE_KERNEL']}[sys.argv[1]])
+    print({'-s': 'Linux', '-m': 'x86_64', '-r': os.environ['FIXTURE_KERNEL']}[args[0]])
 elif name == 'id':
     print('0')
-elif name == 'apt-cache':
-    if not (os.environ['FIXTURE_MISSING'] == '1' and sys.argv[-1] == 'linux-tools-' + os.environ['FIXTURE_KERNEL']):
-        print(sys.argv[-1] + ' | 1.2.3 | snapshot')
-elif name == 'apt-get':
-    with open(os.environ['FIXTURE_LOG'], 'a') as log:
-        log.write(json.dumps(sys.argv[1:]) + '\\n')
-    if '--allow-downgrades' in sys.argv:
-        sys.exit(23)
-'''
-            for name in ('uname', 'id', 'apt-cache', 'apt-get'):
-                path = binaries / name
-                path.write_text(recorder)
-                path.chmod(0o755)
-            environment = dict(os.environ, PATH=str(binaries) + os.pathsep + os.environ['PATH'],
-                               FIXTURE_KERNEL=kernel, FIXTURE_MISSING='1' if missing else '0',
-                               FIXTURE_LOG=str(root / 'commands.jsonl'))
-            # Supply the Ubuntu OS boundary while running the actual installer on this host.
-            command = '''
-source() {
+elif name == 'dpkg-query':
+    # Only a fixture that says so already holds every requested package.
+    if not os.environ.get('FIXTURE_PACKAGES_PRESENT'):
+        sys.exit(1)
+    for package in args[2:]:
+        print('ii ' + package)
+elif name == 'uv' and args[:2] == ['run', 'python']:
+    script, *rest = args[2:]
+    if pathlib.Path(script).name == 'catalog.py' and rest[0] == 'download':
+        pathlib.Path(rest[-1]).write_text('#!/bin/sh\nprintf \'["rustup-init"]\\n\' >> "$FIXTURE_LOG"\n')
+    elif pathlib.Path(script).name != 'verify.py':
+        # Run the helper in this interpreter, as `python SCRIPT` would.
+        sys.argv = [script, *rest]
+        sys.path.insert(0, str(pathlib.Path(script).parent))
+        runpy.run_path(script, run_name='__main__')
+elif args[-1:] == ['--version']:
+    # A converged host: each installed tool reports its catalog pin.
+    tool = 'cargo-' + args[-2] if name == 'cargo' else name
+    catalog = tomllib.loads(pathlib.Path(os.environ['FIXTURE_CATALOG']).read_text())
+    pins = {**catalog['versions'], **catalog['cargo']}
+    if not os.environ.get('FIXTURE_PINNED') or tool not in pins:
+        sys.exit(1)
+    print(f'{tool} {pins[tool]}')
+"""
+
+
+def package_installs(calls):
+    """The package lists of APT installations, after the bootstrap of curl and the trust store."""
+    installs = []
+    for call in calls:
+        if call[0] == 'apt-get' and 'install' in call:
+            packages = [arg for arg in call[call.index('install') + 1:] if not arg.startswith('-')]
+            if packages != ['curl', 'ca-certificates']:
+                installs.append(packages)
+    return installs
+
+
+# A container shares its host's kernel, so the installer omits that kernel's perf tools.
+CONTAINER = Path('/.dockerenv').exists() or Path('/run/.containerenv').exists()
+
+
+class LinuxProvisioning(unittest.TestCase):
+    """Run the real Linux installer against substitute host, package, and Rust commands."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        scripts = self.root / 'scripts/tooling'
+        scripts.mkdir(parents=True)
+        for name in ('linux.sh', 'uv.sh', 'x86_64-linux.sh', 'catalog.py', 'fingerprint.py', 'verify.py'):
+            shutil.copy(catalog.ROOT / 'scripts/tooling' / name, scripts / name)
+        shutil.copytree(catalog.ROOT / '.config', self.root / '.config')
+        for name in ('rust-toolchain.toml', '.python-version'):
+            shutil.copy(catalog.ROOT / name, self.root / name)
+        binaries = self.root / 'bin'
+        binaries.mkdir()
+        for name in ('uname', 'id', 'apt-get', 'dpkg-query', 'rustup', 'rustc', 'cargo', 'just'):
+            self.stub(binaries / name)
+        (binaries / 'bash').symlink_to(shutil.which('bash'))
+        # Pinned archives, including uv, are installed: each is found by its receipt.
+        self.home = self.root / 'home'
+        prefix = self.home / '.local/share/cargo-rail-tooling'
+        for name, asset in catalog.read()['x86_64-linux']['assets'].items():
+            if name != 'rustup':
+                directory = prefix / name / asset['sha256'][:16]
+                directory.mkdir(parents=True)
+                (directory / '.rail-installed').write_text(asset['sha256'] + '\n')
+        self.uv_directory = prefix / 'uv' / catalog.read()['x86_64-linux']['assets']['uv']['sha256'][:16]
+        self.stub(self.uv_directory / 'uv')
+        (self.root / 'temporary').mkdir()
+        bash_environment = self.root / 'bash-environment'
+        bash_environment.write_text("""source() {
   if [[ "$1" == /etc/os-release ]]; then
-    ID=ubuntu VERSION_ID=24.04 PRETTY_NAME=Ubuntu
+    ID=ubuntu VERSION_ID=24.04 PRETTY_NAME=fixture
   else
     builtin source "$@"
   fi
 }
-source "$1" x86_64-linux "$2"
-'''
-            result = subprocess.run(['bash', '-c', command, 'fixture', str(scripts / 'linux.sh'), operation],
-                                    env=environment, text=True, capture_output=True)
-            log = root / 'commands.jsonl'
-            calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
-            return result, calls
+""")
+        self.environment = {
+            'PATH': f'{binaries}:/usr/bin:/bin', 'HOME': str(self.home), 'TMPDIR': str(self.root / 'temporary'),
+            'BASH_ENV': str(bash_environment), 'FIXTURE_LOG': str(self.root / 'commands.jsonl'),
+            'FIXTURE_CATALOG': str(self.root / '.config/tooling.toml'), 'FIXTURE_KERNEL': '6.8.0-1030-aws',
+            'GITHUB_PATH': str(self.root / 'github-path'), 'GITHUB_ENV': str(self.root / 'github-env'),
+        }
 
-    def test_perf_installs_the_running_kernel_flavor_from_the_snapshot(self):
+    def stub(self, path):
+        path.write_text(f'#!{sys.executable}\n' + LINUX_STUB)
+        path.chmod(0o755)
+
+    def provision(self, *arguments, success=True, **environment):
+        log = Path(self.environment['FIXTURE_LOG'])
+        log.unlink(missing_ok=True)
+        result = subprocess.run([str(self.root / 'bin/bash'), str(self.root / 'scripts/tooling/linux.sh'),
+                                 'x86_64-linux', *arguments],
+                                env={**self.environment, **environment}, capture_output=True, text=True)
+        self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
+        calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        return result, calls
+
+    def fingerprint(self, operation):
+        return subprocess.check_output(
+            [sys.executable, str(self.root / 'scripts/tooling/fingerprint.py'), 'x86_64-linux', operation], text=True)
+
+    def test_ci_installs_guest_packages_and_publishes_the_pinned_uv(self):
+        _, calls = self.provision('ci')
+        selected = catalog.selection(catalog.read(), 'x86_64-linux', 'ci')
+        kernel_tools = [] if CONTAINER else ['linux-tools-6.8.0-1030-aws']
+        self.assertEqual(package_installs(calls), [selected['packages'] + kernel_tools])
+        for call in (call for call in calls if call[0] == 'apt-get'):
+            self.assertIn('Acquire::Retries=3', call)
+            self.assertFalse(any(argument.startswith('Dir::') for argument in call), call)
+            self.assertNotIn('--allow-downgrades', call)
+        self.assertIn(['uv', 'python', 'install'], calls)
+        self.assertIn(['rustup-init'], calls)
+        installs = [call[-3] for call in calls if call[:1] == ['cargo'] and 'install' in call]
+        self.assertEqual(installs, selected['cargo'])
+        self.assertEqual((self.root / 'github-path').read_text().splitlines()[0], str(self.uv_directory))
+        environment = (self.home / '.local/share/cargo-rail-tooling/environment.sh').read_text()
+        self.assertIn(str(self.uv_directory), environment)
+        self.assertEqual((self.home / '.local/share/cargo-rail-tooling/fingerprint.ci').read_text(), self.fingerprint('ci'))
+
+    @unittest.skipIf(CONTAINER, 'a container omits the kernel tools')
+    def test_perf_installs_the_running_kernel_flavor(self):
         for kernel in ('6.8.0-1030-aws', '6.8.0-79-generic', '6.8.0-79-generic-64k'):
             with self.subTest(kernel=kernel):
-                result, calls = self.provision(kernel)
-                self.assertEqual(result.returncode, 23, result.stderr)
-                install = calls[-1]
-                self.assertIn('install', install)
-                self.assertIn('linux-tools-common=1.2.3', install)
-                self.assertIn(f'linux-tools-{kernel}=1.2.3', install)
-                self.assertIn('Dir::Etc::sourceparts=-', install)
-
-    def test_missing_kernel_tools_fails_before_installation(self):
-        result, calls = self.provision('6.8.0-1030-aws', missing=True)
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn('missing Ubuntu package linux-tools-', result.stderr)
-        self.assertIn(catalog.read()['linux']['snapshot'], result.stderr)
-        self.assertIn('6.8.0-1030-aws', result.stderr)
-        self.assertFalse(any('--allow-downgrades' in call for call in calls))
+                _, calls = self.provision('ci', FIXTURE_KERNEL=kernel)
+                [packages] = package_installs(calls)
+                self.assertIn('linux-tools-common', packages)
+                self.assertEqual(packages[-1], f'linux-tools-{kernel}')
 
     def test_package_provisioning_does_not_require_kernel_tools(self):
-        result, calls = self.provision('6.8.0-1030-aws', operation='package', missing=True)
-        self.assertEqual(result.returncode, 23, result.stderr)
-        self.assertFalse(any(argument.startswith('linux-tools-') for argument in calls[-1]))
+        _, calls = self.provision('package')
+        [packages] = package_installs(calls)
+        self.assertEqual(packages, catalog.selection(catalog.read(), 'x86_64-linux', 'package')['packages'])
+
+    def test_installed_packages_skip_the_archive(self):
+        result, calls = self.provision('ci', FIXTURE_PACKAGES_PRESENT='1')
+        self.assertIn('Ubuntu packages are installed.', result.stdout)
+        self.assertEqual(package_installs(calls), [])
+
+    def test_converged_tools_are_kept_and_the_run_records_its_fingerprint(self):
+        _, calls = self.provision('ci', FIXTURE_PINNED='1')
+        self.assertNotIn(['rustup-init'], calls)
+        self.assertFalse(any(call[0] == 'cargo' and ('install' in call or 'binstall' in call) for call in calls))
+        self.assertTrue(any(call[:3] == ['rustup', 'toolchain', 'install'] for call in calls))
+        self.assertEqual((self.home / '.local/share/cargo-rail-tooling/fingerprint.ci').read_text(), self.fingerprint('ci'))
+
+    def test_a_matching_fingerprint_republishes_without_installing(self):
+        self.provision('ci', FIXTURE_PINNED='1')
+        (self.root / 'github-path').unlink()
+        result, calls = self.provision('ci', FIXTURE_PINNED='1')
+        self.assertIn(f"Tooling fingerprint {self.fingerprint('ci').strip()} matches", result.stdout)
+        self.assertEqual(package_installs(calls), [])
+        self.assertFalse(any(call[0] in ('cargo', 'rustup') and ('install' in call or 'binstall' in call) for call in calls))
+        self.assertFalse(any(Path(call[3]).name == 'verify.py' for call in calls if call[:3] == ['uv', 'run', 'python']))
+        self.assertEqual((self.root / 'github-path').read_text().splitlines()[0], str(self.uv_directory))
+        # Another operation has its own fingerprint, so it still converges.
+        result, _ = self.provision('package', FIXTURE_PINNED='1')
+        self.assertNotIn('matches', result.stdout)
+
+    def test_a_matching_fingerprint_with_a_missing_tool_converges(self):
+        self.provision('ci', FIXTURE_PINNED='1')
+        result, calls = self.provision('ci')
+        self.assertIn('a pinned tool is missing; converging', result.stderr)
+        installs = [call[-3] for call in calls if call[:1] == ['cargo'] and 'install' in call]
+        self.assertEqual(installs, catalog.selection(catalog.read(), 'x86_64-linux', 'ci')['cargo'])
+
+    def test_cross_build_always_converges(self):
+        self.provision('cross-build', 'riscv64-linux', FIXTURE_PINNED='1')
+        _, calls = self.provision('cross-build', 'riscv64-linux', FIXTURE_PINNED='1')
+        self.assertTrue(any(call[:3] == ['rustup', 'toolchain', 'install'] for call in calls))
+        self.assertFalse(any(Path(call[3]).name == 'fingerprint.py' for call in calls if call[:3] == ['uv', 'run', 'python']))
+        self.assertEqual(list((self.home / '.local/share/cargo-rail-tooling').glob('fingerprint.*')), [])
+
+    def test_unknown_operation_fails_before_provisioning(self):
+        result, calls = self.provision('typo', success=False)
+        self.assertEqual(result.returncode, 64)
+        self.assertEqual(calls, [])
 
 
 if __name__ == '__main__':

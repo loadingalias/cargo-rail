@@ -39,10 +39,10 @@ jobs:
           persist-credentials: false
       - name: Install release tooling
         run: scripts/tooling/package-unix.sh x86_64-unknown-linux-gnu
-      - uses: loadingalias/cargo-rail-action/cache@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
+      - uses: loadingalias/cargo-rail-action/cache@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
         id: cache
         with:
-          version: 0.30.1
+          version: 0.31.1
           remote: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}
           mode: read-write
           max-size: 10GiB
@@ -58,13 +58,13 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           BUMP: ${{ inputs.bump }}
         run: scripts/release.sh --bump "$BUMP"
-      - uses: loadingalias/cargo-rail-action/cache/collect@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
+      - uses: loadingalias/cargo-rail-action/cache/collect@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
         if: always() && steps.cache.outcome == 'success'
         id: cache-record
         with:
           job: release
           output-directory: ${{ runner.temp }}/cache-records
-      - uses: loadingalias/cargo-rail-action/cache/report@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
+      - uses: loadingalias/cargo-rail-action/cache/report@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
         if: always() && steps.cache-record.outcome == 'success'
         with:
           records-directory: ${{ runner.temp }}/cache-records

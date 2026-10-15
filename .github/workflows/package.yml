@@ -66,10 +66,10 @@ jobs:
           TARGET: ${{ matrix.target }}
           GITHUB_TOKEN: ${{ github.token }} # Authenticates cargo-binstall's GitHub API lookups.
         run: scripts/tooling/package-unix.sh "$TARGET"
-      - uses: loadingalias/cargo-rail-action/cache@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
+      - uses: loadingalias/cargo-rail-action/cache@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
         id: cache
         with:
-          version: 0.30.1
+          version: 0.31.1
           remote: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}
           mode: read-write
           max-size: 10GiB
@@ -89,24 +89,24 @@ jobs:
           [[ "$(rustc -vV | sed -n 's/^host: //p')" == "$TARGET" ]]
           just package-release "$RUNNER_TEMP/release"
       - name: Test release packaging
-        run: python3 -B -m unittest discover -s scripts/tooling -p 'test_package_release.py' -v
+        run: uv run python -B -m unittest discover -s scripts/tooling -p 'test_package_release.py' -v
       - name: Verify prebuilt installation without source fallback
-        run: python3 scripts/check-release-install.py "$RUNNER_TEMP/release"
+        run: uv run python scripts/check-release-install.py "$RUNNER_TEMP/release"
       - name: Require unchanged sources
         run: git diff --exit-code HEAD
-      - uses: loadingalias/cargo-rail-action/cache/collect@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
+      - uses: loadingalias/cargo-rail-action/cache/collect@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
         if: always() && steps.cache.outcome == 'success'
         id: cache-record
         with:
           job: ${{ matrix.target }}
           output-directory: ${{ runner.temp }}/cache-records
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always() && steps.cache-record.outcome == 'success'
         with:
           name: cache-record-package-${{ matrix.target }}
           path: ${{ steps.cache-record.outputs.record-file }}
           if-no-files-found: error
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: package-${{ matrix.target }}
           path: ${{ runner.temp }}/release/*
@@ -129,17 +129,20 @@ jobs:
         with:
           ref: ${{ inputs.release-tag }}
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: package-*
           path: ${{ runner.temp }}/packages
+      # This job runs no installer; Python still runs through the catalog-pinned uv.
+      - name: Install the pinned uv
+        run: scripts/tooling/uv.sh x86_64-linux >>"$GITHUB_PATH"
       - name: Collect authenticated component archives
         run: |
           mkdir "$RUNNER_TEMP/assets"
           cp "$RUNNER_TEMP"/packages/*/*.zip "$RUNNER_TEMP/assets/"
           cat "$RUNNER_TEMP"/packages/*/SHA256SUMS | sort > "$RUNNER_TEMP/assets/SHA256SUMS"
           cp LICENSE "$RUNNER_TEMP/assets/LICENSE"
-          python3 scripts/package-archive-hosts.py "$RUNNER_TEMP/assets"
+          uv run python scripts/package-archive-hosts.py "$RUNNER_TEMP/assets"
           (cd "$RUNNER_TEMP/assets"; sha256sum --check --strict SHA256SUMS)
       # `cargo rail release` publishes only assets attested by this repository's release run.
       - name: Attest release assets
@@ -152,7 +155,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release-tag }}
         run: gh release upload "$RELEASE_TAG" "$RUNNER_TEMP"/assets/* --clobber --repo "$GITHUB_REPOSITORY"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: inputs.release-tag == ''
         with:
           name: release-cargo-rail-${{ github.run_id }}-${{ github.run_attempt }}
@@ -170,13 +173,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         continue-on-error: true
         with:
           pattern: cache-record-package-*
           merge-multiple: true
           path: ${{ runner.temp }}/cache-records
-      - uses: loadingalias/cargo-rail-action/cache/report@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
+      - uses: loadingalias/cargo-rail-action/cache/report@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
         with:
           records-directory: ${{ runner.temp }}/cache-records
           expected-jobs: '["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]'

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run python
 """Exercise the installed native toolchain before repository checks start."""
 import os
 from pathlib import Path
@@ -46,7 +46,9 @@ def verify(platform, operation, target=None):
     jobs = data['windows']['cargo-build-jobs'] if platform.endswith('-win') else data[platform].get('cargo-build-jobs')
     if jobs is not None and os.environ.get('CARGO_BUILD_JOBS') != str(jobs):
         raise ValueError(f'CARGO_BUILD_JOBS does not match the {platform} tooling bound')
-    if 'linux-tools-common' in native.get('packages', []):
+    # A container shares its host's kernel, so the installer omits that kernel's perf tools.
+    container = Path('/.dockerenv').exists() or Path('/run/.containerenv').exists()
+    if 'linux-tools-common' in native.get('packages', []) and not container:
         run('perf', '--version')
     verify_rust(platform, operation, target)
     installed = run('rustup', 'component', 'list', '--installed').splitlines()
@@ -73,7 +75,7 @@ def verify(platform, operation, target=None):
         ('cmake', ['cmake', '--version']),
         ('llvm', ['clang', '--version']),
         ('git', ['git', '--version']),
-        ('python', [sys.executable, '--version']),
+        ('uv', ['uv', '--version']),
     ):
         if name in native['assets']:
             pinned_commands.append((name, command))

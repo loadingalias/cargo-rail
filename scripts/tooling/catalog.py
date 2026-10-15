@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run python
 """Read the tooling catalog and install its verified, platform-specific archives."""
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import os
 import re
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -125,6 +126,29 @@ def install_archive(name, asset, prefix):
     return destination
 
 
+def version_report(name):
+    """Return the first line that the tool selected by PATH prints for its version."""
+    command = ['cargo', name.removeprefix('cargo-'), '--version'] if name.startswith('cargo-') else [name, '--version']
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
+    lines = (result.stdout or result.stderr).strip().splitlines()
+    return lines[0] if result.returncode == 0 and lines else ''
+
+
+def require(data, names):
+    """Refuse installed tools whose reported version differs from the catalog pin."""
+    errors = []
+    for name in names:
+        version = data['cargo'].get(name) or data['versions'][name]
+        report = version_report(name)
+        if not re.search(r'(?<![\d.])' + re.escape(version) + r'(?![\d.])', report):
+            errors.append(f'{name} {version} is required by .config/tooling.toml; found {report or "no working executable"}.')
+    if errors:
+        raise ValueError('\n'.join(errors))
+
+
 def validate(data):
     bounded_platforms = {'windows': data['windows'], **{platform: data[platform] for platform in PLATFORMS}}
     for platform, config in bounded_platforms.items():
@@ -156,6 +180,9 @@ def validate(data):
         for name, asset in config['assets'].items():
             if not asset['url'].startswith('https://') or not re.fullmatch('[0-9a-f]{64}', asset['sha256']):
                 raise ValueError(f'{platform}: invalid {name} asset')
+        # Every installer starts from the pinned uv archive, which provides Python.
+        if f'/{data["versions"]["uv"]}/uv-{host}.' not in config['assets'].get('uv', {}).get('url', ''):
+            raise ValueError(f'{platform}: the uv asset must be uv {data["versions"]["uv"]} for {host}')
         for operation in () if platform in CACHE_HOSTS else ('ci', 'package') if config['cargo'] else ('ci',):
             selected = selection(data, platform, operation)
             if platform == 'x86_64-linux' and operation == 'ci' and 'ripgrep' not in selected['packages']:
@@ -175,29 +202,36 @@ def validate(data):
             prerequisites = set(config['assets']) - {'actionlint'}
             if not prerequisites <= set(selected['assets']):
                 raise ValueError(f'{platform}/{operation}: missing native build/bootstrap asset')
-            if platform.endswith('-linux') and not {'build-essential', 'ca-certificates', 'curl', 'git', 'git-man', 'python3'} <= set(selected['packages']):
+            if platform.endswith('-linux') and not {'build-essential', 'ca-certificates', 'curl', 'git', 'git-man'} <= set(selected['packages']):
                 raise ValueError(f'{platform}/{operation}: missing native build/bootstrap package')
     # Cache hosts run tests and tools that x86-64 cross-builds; they compile only the driver and test fixtures.
     runner_components = {'clippy', 'rustc-dev'}
-    runner_packages = {'build-essential', 'ca-certificates', 'curl', 'git', 'git-man', 'python3'}
+    runner_packages = {'build-essential', 'ca-certificates', 'curl', 'git', 'git-man'}
     policy = data['operations']['cache-host']
-    if (set(policy['components']) != runner_components or policy['cargo'] or set(policy['assets']) != {'rustup'}
+    if (set(policy['components']) != runner_components or policy['cargo'] or set(policy['assets']) != {'rustup', 'uv'}
             or set(policy['packages']) != runner_packages or policy.get('targets')):
         raise ValueError('cache-host must install only the runner compiler, Clippy, rustc-dev, and build packages')
     for platform in CACHE_HOSTS:
         config = data[platform]
         if (set(config['components']) != runner_components or config['cargo'] or config.get('targets')
-                or set(config['assets']) != {'rustup'} or set(config['packages']) != runner_packages):
+                or set(config['assets']) != {'rustup', 'uv'} or set(config['packages']) != runner_packages):
             raise ValueError(f'{platform}: the cache host installs only its compiler, Clippy, rustc-dev, and build packages')
         selection(data, platform, 'cache-host')
 
     cross = selection(data, 'x86_64-linux', 'cross-build')
-    if set(cross['components']) != {'clippy', 'rustc-dev'} or set(cross['cargo']) != {'just', 'cargo-nextest'} or set(cross['assets']) != {'rustup', 'cargo-binstall', 'cmake'}:
+    if set(cross['components']) != {'clippy', 'rustc-dev'} or set(cross['cargo']) != {'just', 'cargo-nextest'} or set(cross['assets']) != {'rustup', 'uv', 'cargo-binstall', 'cmake'}:
         raise ValueError('cross-build must install only archive build tools')
     compilers = {f'{tool}-{prefix}' for prefix in CROSS_PREFIXES.values() for tool in ('gcc', 'g++')}
     libraries = {'libc6-dev-riscv64-cross', 'libc6-dev-s390x-cross', 'libc6-dev-ppc64el-cross'}
-    if not {'build-essential', 'ca-certificates', 'curl', 'git', 'git-man', 'python3', 'perl'} | compilers | libraries <= set(cross['packages']):
+    if not {'build-essential', 'ca-certificates', 'curl', 'git', 'git-man', 'perl'} | compilers | libraries <= set(cross['packages']):
         raise ValueError('cross-build is missing cross compiler prerequisites')
+    # The macOS package runner supplies Xcode, CMake, and rustup, and bootstraps the same uv.
+    macos = data.get('aarch64-macos', {}).get('assets', {}).get('uv', {})
+    if not macos.get('url', '').endswith(f'/{data["versions"]["uv"]}/uv-aarch64-apple-darwin.tar.gz') \
+            or not re.fullmatch('[0-9a-f]{64}', macos.get('sha256', '')):
+        raise ValueError(f'aarch64-macos: the uv asset must be uv {data["versions"]["uv"]} for aarch64-apple-darwin')
+    if not re.fullmatch(r'\d+\.\d+\.\d+\n', (ROOT / '.python-version').read_text()):
+        raise ValueError('.python-version must hold one exact Python version')
 
 
 def main():
@@ -228,6 +262,8 @@ def main():
             print(json.dumps(value))
     elif command == 'rust-channel':
         print(rust_channel(*args))
+    elif command == 'require':
+        require(data, args)
     elif command == 'cross-prefix':
         print(CROSS_PREFIXES[cross_target(*args)])
     elif command == 'validate':
@@ -239,7 +275,8 @@ def main():
     elif command == 'install-archives':
         platform, operation, prefix = args
         for name, asset in selection(data, platform, operation)['assets'].items():
-            if name == 'rustup':
+            # The installers acquire rustup and uv before they read the catalog.
+            if name in ('rustup', 'uv'):
                 continue
             directory = install_archive(name, asset, prefix)
             print(f'{name}\t{directory}')

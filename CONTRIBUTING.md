@@ -37,16 +37,17 @@ Install these tools:
 - Rust through `rustup`.
   `rust-toolchain.toml` selects the repository toolchain and components.
 - `just`, `cargo-nextest`, and `cargo-deny`.
-- For `just build` and `just test`: Python 3.11 or newer and `rustc-dev` for the selected toolchain.
+- uv, which runs each repository Python script with the Python that `.python-version` names
+  and the packages that `uv.lock` pins.
+- For `just build` and `just test`: `rustc-dev` for the selected toolchain.
 - For `just check` and `just ci-check`: `rustc-dev` for the selected toolchain.
 - For `just check` on macOS: Zig, `cargo-zigbuild`, `cargo-xwin`, and the LLVM tools that cargo-xwin requires.
-- For `just check-tooling`: Python 3.11 or newer, ShellCheck, Actionlint,
-  and ripgrep (`rg`).
+- For `just check-tooling`: ShellCheck, Actionlint, and ripgrep (`rg`).
 - For `just test` on macOS: clang with COFF support, `lld-link`, and `ld64.lld` on `PATH`.
   Also install `cargo-xwin` with its x86_64 MSVC SDK already cached.
   The cross-link test runs offline.
 
-To verify the binary installation of a native archive, run `python3 scripts/check-release-install.py OUTPUT_DIRECTORY` after `just package-release OUTPUT_DIRECTORY`.
+To verify the binary installation of a native archive, run `uv run python scripts/check-release-install.py OUTPUT_DIRECTORY` after `just package-release OUTPUT_DIRECTORY`.
 This check requires cargo-binstall.
 The check uses a temporary installation.
 It disables source fallback.
@@ -57,8 +58,14 @@ The tooling catalog selects the Cargo tools, Rust components,
 and native prerequisites for the operation.
 Package provisioning keeps the compiler development components and the native build tools.
 It does not include the check and test tools.
+Each installer first installs the pinned uv, which provides Python.
+Ubuntu packages come from the archive of the host.
+An installer skips each tool that is already at its pin.
+A complete run records the fingerprint of the files that the installer reads.
+While that fingerprint matches, a rerun only publishes the environment again.
+`scripts/tooling/x86_64-linux.sh fingerprint ci` prints the fingerprint on any host.
 Unix release jobs use `scripts/tooling/package-unix.sh` with their native target. macOS packaging requires the Xcode tools, CMake,
-Python, and rustup of the runner.
+and rustup of the runner.
 
 ## Make a change
 

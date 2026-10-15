@@ -61,11 +61,11 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }} # Authenticates cargo-binstall's GitHub API lookups.
         run: ./scripts/tooling/x86_64-win.ps1 -Operation ci
       # Cache setup changes Cargo configuration, so planning must capture it afterward.
-      - uses: loadingalias/cargo-rail-action/cache@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
+      - uses: loadingalias/cargo-rail-action/cache@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
         if: github.event_name != 'pull_request'
         id: cache
         with:
-          version: 0.30.1
+          version: 0.31.1
           remote: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}
           mode: read-write
           max-size: 10GiB
@@ -74,9 +74,9 @@ jobs:
       # Until CI pins Cargo-Rail 0.32: no released Cargo-Rail reads this repository's configuration,
       # so the candidate plans every work item and serves each later `cargo rail` command.
       # The Action still supplies the independent plan consumer that checks each selection.
-      - uses: loadingalias/cargo-rail-action/setup@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
+      - uses: loadingalias/cargo-rail-action/setup@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
         with:
-          version: 0.30.1
+          version: 0.31.1
       - name: Build the candidate planner
         run: |
           suffix=""
@@ -93,7 +93,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/cargo-rail-plan"
           cargo-rail rail plan --all --json > "$plan"
           [[ "$(cargo-rail-action plan is-required "$plan" cargo.fmt)" == true ]]
-          required="$(python3 -c 'import json, sys; print(json.dumps(json.load(open(sys.argv[1]))["required"], separators=(",", ":")))' "$plan")"
+          required="$(uv run python -c 'import json, sys; print(json.dumps(json.load(open(sys.argv[1]))["required"], separators=(",", ":")))' "$plan")"
           printf 'plan-file=%s\nrequired-work=%s\n' "$plan" "$required" >> "$GITHUB_OUTPUT"
       - name: Check tooling and workflows
         if: matrix.platform == 'x86_64-linux' && contains(fromJSON(steps.rail.outputs.required-work), 'check-tooling')
@@ -161,13 +161,13 @@ jobs:
             printf '%s\n' "$status"
             exit 1
           fi
-      - uses: loadingalias/cargo-rail-action/cache/collect@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
+      - uses: loadingalias/cargo-rail-action/cache/collect@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
         if: always() && github.event_name != 'pull_request' && steps.cache.outcome == 'success'
         id: cache-record
         with:
           job: ${{ matrix.platform }}
           output-directory: ${{ runner.temp }}/cache-records
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always() && steps.cache-record.outcome == 'success'
         with:
           name: cache-record-${{ matrix.platform }}
@@ -239,9 +239,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }} # Authenticates cargo-binstall's GitHub API lookups.
         run: scripts/tooling/x86_64-linux.sh cross-build "$PLATFORM"
-      - uses: loadingalias/cargo-rail-action/cache@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
+      - uses: loadingalias/cargo-rail-action/cache@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
         with:
-          version: 0.30.1
+          version: 0.31.1
           remote: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}
           mode: read-write
           max-size: 10GiB
@@ -253,14 +253,14 @@ jobs:
         run: scripts/check-cache-host.sh prepare "$TARGET" "$RUNNER_TEMP/tests-archive"
       - name: Build the runner's cargo-nextest
         run: scripts/check-cache-host.sh runner-tools "$TARGET" "$RUNNER_TEMP/runner-tools"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tests-${{ matrix.platform }}
           path: ${{ runner.temp }}/tests-archive/*
           if-no-files-found: error
           retention-days: 2
           compression-level: 0
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: runner-tools-${{ matrix.platform }}
           path: ${{ runner.temp }}/runner-tools/bin/cargo-nextest
@@ -291,11 +291,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tests-${{ matrix.platform }}
           path: ${{ runner.temp }}/tests-archive
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: runner-tools-${{ matrix.platform }}
           path: ${{ runner.temp }}/runner-tools
@@ -329,13 +329,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         continue-on-error: true
         with:
           pattern: cache-record-*
           merge-multiple: true
           path: ${{ runner.temp }}/cache-records
-      - uses: loadingalias/cargo-rail-action/cache/report@4d7bebe671430eee0db376de3f943d8de26e78de # v10.1.0
+      - uses: loadingalias/cargo-rail-action/cache/report@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
         with:
           records-directory: ${{ runner.temp }}/cache-records
           expected-jobs: '["x86_64-linux", "aarch64-linux", "x86_64-win"]'

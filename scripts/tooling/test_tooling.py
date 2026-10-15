@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from unittest.mock import patch
 
 import tomlkit
 import catalog
+import fingerprint
 import update
 import verify
 
@@ -33,6 +35,10 @@ class RepositoryHygiene(unittest.TestCase):
             cwd=catalog.ROOT,
             check=True,
         )
+
+    def test_uv_environment_is_ignored(self):
+        # CI fails on untracked files, and every `uv run` creates the project environment.
+        subprocess.run(['git', 'check-ignore', '--quiet', '--no-index', '.venv/bin/python'], cwd=catalog.ROOT, check=True)
 
 
 class CatalogCommand(unittest.TestCase):
@@ -225,15 +231,15 @@ class CatalogPolicy(unittest.TestCase):
                 self.assertEqual(set(ci['components']), {'clippy', 'rustfmt', 'rustc-dev', 'llvm-tools'})
                 self.assertEqual(package['cargo'], ['just'])
                 self.assertEqual(package['components'], ['rustc-dev', 'llvm-tools'])
-                required = {'rustup', 'cargo-binstall', 'cmake'}
+                required = {'rustup', 'uv', 'cargo-binstall', 'cmake'}
                 if platform.endswith('-win'):
-                    required |= {'llvm', 'python', 'git'}
+                    required |= {'llvm', 'git'}
                 self.assertEqual(set(package['assets']), required)
                 self.assertEqual(set(ci['assets']), required | ({'actionlint'} if platform == 'x86_64-linux' else set()))
                 if platform == 'x86_64-linux':
                     self.assertIn('ripgrep', ci['packages'], 'tooling tests execute real manifest discovery through rg')
                 if platform.endswith('-linux'):
-                    self.assertFalse({'shellcheck', 'python3-venv', 'ripgrep', 'jq'} & set(package['packages']))
+                    self.assertFalse({'shellcheck', 'ripgrep', 'jq'} & set(package['packages']))
                 # Integration tests build a foreign Linux target to prove cross-compiler diagnostics.
                 foreign = {'x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu'} - {data[platform]['rust-host']}
                 self.assertTrue(foreign & set(ci['targets']), 'ci installs a foreign Linux target')
@@ -248,9 +254,8 @@ class CatalogPolicy(unittest.TestCase):
                 self.assertEqual(set(selected['components']), {'clippy', 'rustc-dev'})
                 self.assertEqual(selected['cargo'], [])
                 self.assertEqual(selected['targets'], [])
-                self.assertEqual(set(selected['assets']), {'rustup'})
-                self.assertEqual(set(selected['packages']),
-                                 {'build-essential', 'ca-certificates', 'curl', 'git', 'git-man', 'python3'})
+                self.assertEqual(set(selected['assets']), {'rustup', 'uv'})
+                self.assertEqual(set(selected['packages']), {'build-essential', 'ca-certificates', 'curl', 'git', 'git-man'})
                 for operation in ('ci', 'package'):
                     with self.assertRaises(ValueError):
                         catalog.selection(catalog.read(), platform, operation)
@@ -267,13 +272,13 @@ class CatalogPolicy(unittest.TestCase):
         selected = catalog.selection(catalog.read(), 'x86_64-linux', 'cross-build')
         self.assertEqual(selected['components'], ['clippy', 'rustc-dev'])
         self.assertEqual(selected['cargo'], ['cargo-nextest', 'just'])
-        self.assertEqual(set(selected['assets']), {'rustup', 'cargo-binstall', 'cmake'})
+        self.assertEqual(set(selected['assets']), {'rustup', 'uv', 'cargo-binstall', 'cmake'})
         self.assertTrue({'git', 'git-man'} <= set(selected['packages']),
-                        'snapshot Git and its version-coupled manual package must be installed together')
+                        'Git and its version-coupled manual package must be installed together')
         for prefix in ('riscv64-linux-gnu', 's390x-linux-gnu', 'powerpc64le-linux-gnu'):
             self.assertTrue({f'gcc-{prefix}', f'g++-{prefix}'} <= set(selected['packages']), prefix)
         self.assertTrue({'libc6-dev-riscv64-cross', 'libc6-dev-s390x-cross', 'libc6-dev-ppc64el-cross'} <= set(selected['packages']))
-        self.assertFalse({'shellcheck', 'python3-venv', 'ripgrep', 'openssl'} & set(selected['packages']))
+        self.assertFalse({'shellcheck', 'ripgrep', 'openssl'} & set(selected['packages']))
         missing = catalog.read()
         missing['operations']['cross-build']['components'] = ['rustc-dev']
         with self.assertRaisesRegex(ValueError, 'cross-build must install'):
@@ -311,7 +316,7 @@ class CatalogPolicy(unittest.TestCase):
         selected = json.loads(output)
         self.assertEqual(selected['cargo'], ['just'])
         self.assertEqual(selected['components'], ['rustc-dev', 'llvm-tools'])
-        self.assertEqual(set(selected['assets']), {'rustup', 'cargo-binstall', 'llvm', 'cmake', 'python', 'git'})
+        self.assertEqual(set(selected['assets']), {'rustup', 'uv', 'cargo-binstall', 'llvm', 'cmake', 'git'})
 
     def test_rust_override_requires_a_dated_nightly(self):
         for channel in ('nightly', 'stable', 'nightly-latest'):
@@ -327,15 +332,62 @@ class CatalogPolicy(unittest.TestCase):
             for field, value in [('cargo', ['cargo-nextest']), ('cargo', ['just']), ('components', []),
                                  ('components', ['rustc-dev']), ('components', ['rustc-dev', 'llvm-tools', 'clippy']),
                                  ('packages', []), ('packages', ['build-essential', 'ca-certificates', 'cmake', 'curl',
-                                                                 'git', 'git-man', 'python3']),
+                                                                 'git', 'git-man']),
                                  ('targets', ['x86_64-unknown-linux-gnu']), ('rust-host', 'x86_64-unknown-linux-gnu')]:
                 changed = copy.deepcopy(data)
                 changed[name][field] = value
                 with self.assertRaises(ValueError): catalog.validate(changed)
 
+    def test_every_platform_bootstraps_the_pinned_uv(self):
+        for platform in (*catalog.PLATFORMS, 'aarch64-macos'):
+            for change in ('missing', 'version', 'host'):
+                data = catalog.read()
+                assets = data[platform]['assets']
+                if change == 'missing':
+                    del assets['uv']
+                elif change == 'version':
+                    assets['uv']['url'] = assets['uv']['url'].replace(data['versions']['uv'], '0.0.1')
+                else:
+                    other = 'x86_64-unknown-linux-gnu' if platform != 'x86_64-linux' else 'aarch64-unknown-linux-gnu'
+                    assets['uv']['url'] = re.sub(r'uv-[^/]+?\.(tar\.gz|zip)$', f'uv-{other}.tar.gz', assets['uv']['url'])
+                with self.subTest(platform=platform, change=change), self.assertRaisesRegex(ValueError, 'uv'):
+                    catalog.validate(data)
+
+    def test_python_version_names_one_exact_release(self):
+        for content in ('3.14.8\n', '3.14\n', '3.14.8', 'cpython@3.14.8\n'):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / '.python-version').write_text(content)
+                with patch.object(catalog, 'ROOT', root):
+                    if content == '3.14.8\n':
+                        catalog.validate(catalog.read())
+                    else:
+                        with self.assertRaisesRegex(ValueError, '.python-version'):
+                            catalog.validate(catalog.read())
+
+    def test_required_tools_must_report_their_exact_pin(self):
+        data = catalog.read()
+        version = data['cargo']['cargo-nextest']
+        for report, accepted in [(f'cargo-nextest {version} (abc 2026-10-01)', True),
+                                 (f'cargo-nextest {version}1', False), (f'cargo-nextest 1{version}', False),
+                                 ('', False)]:
+            with self.subTest(report=report), patch.object(catalog, 'version_report', return_value=report):
+                if accepted:
+                    catalog.require(data, ['cargo-nextest'])
+                else:
+                    with self.assertRaisesRegex(ValueError, f'cargo-nextest {re.escape(version)} is required'):
+                        catalog.require(data, ['cargo-nextest'])
+        with patch.object(catalog.subprocess, 'run', side_effect=FileNotFoundError):
+            self.assertEqual(catalog.version_report('rustup'), '')
+        with patch.object(catalog.subprocess, 'run') as run:
+            run.return_value = subprocess.CompletedProcess([], 0, 'cargo-deny 1.0.0\nmore\n', '')
+            self.assertEqual(catalog.version_report('cargo-deny'), 'cargo-deny 1.0.0')
+            self.assertEqual(run.call_args.args[0], ['cargo', 'deny', '--version'])
+
 
 class Archives(unittest.TestCase):
     def test_package_archive_installation_omits_workflow_validator(self):
+        # The installers bootstrap rustup and uv themselves.
         with patch.object(sys, 'argv', ['catalog.py', 'install-archives', 'x86_64-linux', 'package', '/fixture']), \
              patch.object(catalog, 'install_archive', return_value=Path('/installed')) as install, \
              patch('sys.stdout', new_callable=io.StringIO):
@@ -399,7 +451,7 @@ class SelectedVerification(unittest.TestCase):
              patch.object(verify, 'verify_rust'), patch.object(verify, 'run', side_effect=run), \
              patch.object(verify, 'verify_version') as version:
             verify.verify('x86_64-linux', 'package')
-        self.assertEqual([call.args[0] for call in version.call_args_list], ['rustup', 'cargo-binstall', 'cmake', 'just'])
+        self.assertEqual([call.args[0] for call in version.call_args_list], ['rustup', 'cargo-binstall', 'cmake', 'uv', 'just'])
 
 
 class ToolingLane(unittest.TestCase):
@@ -425,7 +477,8 @@ class ToolingLane(unittest.TestCase):
             root = Path(temporary)
             shutil.copytree(catalog.ROOT / 'scripts', root / 'scripts')
             shutil.copytree(catalog.ROOT / '.config', root / '.config')
-            shutil.copy(catalog.ROOT / 'justfile', root / 'justfile')
+            for name in ('justfile', 'pyproject.toml', 'uv.lock', '.python-version'):
+                shutil.copy(catalog.ROOT / name, root / name)
             (root / '.git').mkdir()
             workflows = root / '.github/workflows'
             workflows.mkdir(parents=True)
@@ -444,6 +497,116 @@ jobs:
                                     capture_output=True, text=True, timeout=30)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('unexpected-tooling-key', result.stdout + result.stderr)
+
+
+class Fingerprint(unittest.TestCase):
+    INSTALLATIONS = (('x86_64-linux', 'ci'), ('x86_64-linux', 'package'), ('aarch64-linux', 'ci'),
+                     ('riscv64-linux', 'cache-host'), ('x86_64-win', 'ci'), ('x86_64-win', 'package'))
+
+    def test_each_platform_counts_only_its_installer_inputs(self):
+        data = catalog.read()
+        source = catalog.ROOT
+        with tempfile.TemporaryDirectory() as temporary, patch.object(catalog, 'ROOT', Path(temporary)):
+            root = Path(temporary)
+            names = {name for platform, _ in self.INSTALLATIONS for name in fingerprint.inputs(platform)}
+            for name in names | {'Cargo.toml', 'scripts/package-release.py', 'scripts/tooling/test_tooling.py',
+                                 'scripts/tooling/aarch64-win.ps1'}:
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_bytes((source / name).read_bytes())
+
+            def current():
+                return {installation: fingerprint.fingerprint(data, *installation) for installation in self.INSTALLATIONS}
+            original = current()
+            self.assertEqual(len(set(original.values())), len(original))
+            self.assertTrue(all(re.fullmatch('[0-9a-f]{64}', value) for value in original.values()))
+            linux = {installation for installation in original if installation[0].endswith('-linux')}
+            windows = set(original) - linux
+            for name, changed in [('scripts/tooling/linux.sh', linux),
+                                  ('scripts/tooling/uv.sh', linux),
+                                  ('scripts/tooling/x86_64-linux.sh', {('x86_64-linux', 'ci'), ('x86_64-linux', 'package')}),
+                                  ('scripts/tooling/riscv64-linux.sh', {('riscv64-linux', 'cache-host')}),
+                                  ('scripts/tooling/windows.ps1', windows),
+                                  ('scripts/tooling/x86_64-win.ps1', windows),
+                                  ('scripts/tooling/aarch64-win.ps1', set()),
+                                  ('scripts/tooling/catalog.py', set(original)),
+                                  ('scripts/tooling/verify.py', set(original)),
+                                  ('scripts/tooling/fingerprint.py', set(original)),
+                                  ('.config/tooling.toml', set(original)),
+                                  ('rust-toolchain.toml', set(original)),
+                                  ('.python-version', set(original)),
+                                  ('Cargo.toml', set()),
+                                  ('scripts/package-release.py', set()),
+                                  ('scripts/tooling/test_tooling.py', set())]:
+                with self.subTest(name=name):
+                    path = root / name
+                    original_bytes = path.read_bytes()
+                    path.write_bytes(original_bytes + b'\n# changed\n')
+                    updated = current()
+                    self.assertEqual({key for key in original if updated[key] != original[key]}, changed)
+                    path.write_bytes(original_bytes)
+            self.assertEqual(current(), original)
+
+    def test_only_reusable_installations_have_a_fingerprint(self):
+        data = catalog.read()
+        for platform, operation, reason in [('x86_64-linux', 'cross-build', 'no reusable cross-build'),
+                                            ('x86_64-linux', 'typo', 'unknown tooling operation'),
+                                            ('x86_64-linux', 'cache-host', 'cache hosts'),
+                                            ('riscv64-linux', 'ci', 'hosts that build'),
+                                            ('x86_64-win', 'cache-host', 'cache hosts'),
+                                            ('x86_64-macos', 'ci', 'unknown tooling platform')]:
+            with self.subTest(platform=platform, operation=operation), self.assertRaisesRegex(ValueError, reason):
+                fingerprint.fingerprint(data, platform, operation)
+
+    def test_inputs_cover_every_script_an_installer_reads(self):
+        scripts = {path.relative_to(catalog.ROOT).as_posix()
+                   for directory in ('scripts', 'scripts/tooling')
+                   for path in (catalog.ROOT / directory).iterdir() if path.is_file()}
+        for platform in catalog.PLATFORMS:
+            with self.subTest(platform=platform):
+                inputs = set(fingerprint.inputs(platform))
+                for name in inputs:
+                    text = (catalog.ROOT / name).read_text()
+                    if name.endswith('.py'):
+                        # Python helpers import their siblings by module name.
+                        for module in re.findall(r'^(?:from|import) (\w+)', text, re.MULTILINE):
+                            if (catalog.ROOT / 'scripts/tooling' / f'{module}.py').is_file():
+                                self.assertIn(f'scripts/tooling/{module}.py', inputs, f'{name} imports {module}')
+                    else:
+                        # Shell and PowerShell installers name the helpers they run.
+                        for script in scripts:
+                            if re.search(r'(?<![\w.-])' + re.escape(Path(script).name) + r'\b', text):
+                                self.assertIn(script, inputs, f'{name} reads {script}')
+
+    def test_every_host_names_the_inputs_of_an_operation(self):
+        # No substitute host: the subcommand runs before any host check.
+        def named(*arguments):
+            return subprocess.run(['bash', str(catalog.ROOT / 'scripts/tooling/x86_64-linux.sh'), 'fingerprint', *arguments],
+                                  capture_output=True, text=True)
+        for operation in ('ci', 'package'):
+            with self.subTest(operation=operation):
+                result = named(operation)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertRegex(result.stdout, r'^[0-9a-f]{64}\n$')
+                self.assertEqual(result.stdout, subprocess.check_output(
+                    [sys.executable, str(catalog.ROOT / 'scripts/tooling/fingerprint.py'), 'x86_64-linux', operation], text=True))
+        refused = named('cross-build')
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('no reusable cross-build installation', refused.stderr)
+        # The installer has no default operation, so neither has its fingerprint.
+        self.assertEqual(named().returncode, 64)
+
+    @unittest.skipUnless(shutil.which('pwsh') or shutil.which('powershell'), 'requires PowerShell')
+    def test_windows_front_door_names_the_same_fingerprint(self):
+        shell = shutil.which('pwsh') or shutil.which('powershell')
+        for operation in ('ci', 'package'):
+            with self.subTest(operation=operation):
+                result = subprocess.run([shell, '-NoProfile', '-NonInteractive', '-File',
+                                         str(catalog.ROOT / 'scripts/tooling/x86_64-win.ps1'), 'fingerprint', operation],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.strip(), subprocess.check_output(
+                    [sys.executable, str(catalog.ROOT / 'scripts/tooling/fingerprint.py'), 'x86_64-win', operation],
+                    text=True).strip())
 
 
 if __name__ == '__main__': unittest.main()

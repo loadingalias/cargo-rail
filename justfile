@@ -50,7 +50,7 @@ check-dependencies:
 
 # Qualify one native release archive beyond --version on this host.
 check-installation archive *args:
-    python3 scripts/check-installation.py {{quote(archive)}} {{args}}
+    uv run python scripts/check-installation.py {{quote(archive)}} {{args}}
 
 check-docs:
     RUSTDOCFLAGS="${RUSTDOCFLAGS:+$RUSTDOCFLAGS }-D warnings" cargo doc --workspace --no-deps --all-features --locked
@@ -88,7 +88,7 @@ test profile="default":
     fi
     component_directory="$(
         cargo metadata --no-deps --format-version 1 --locked --offline |
-            python3 -c 'import json, pathlib, sys; print((pathlib.Path(json.load(sys.stdin)["target_directory"]) / "debug").as_posix())'
+            uv run python -c 'import json, pathlib, sys; print((pathlib.Path(json.load(sys.stdin)["target_directory"]) / "debug").as_posix())'
     )"
     if [[ "$(uname -s)" == Darwin ]]; then
         scripts/prepare-cranelift.sh "$component_directory"
@@ -121,7 +121,7 @@ build:
     set -euo pipefail
     component_directory="$(
         cargo metadata --no-deps --format-version 1 --locked --offline |
-            python3 -c 'import json, pathlib, sys; print((pathlib.Path(json.load(sys.stdin)["target_directory"]) / "debug").as_posix())'
+            uv run python -c 'import json, pathlib, sys; print((pathlib.Path(json.load(sys.stdin)["target_directory"]) / "debug").as_posix())'
     )"
     scripts/check-compiler-fact-driver.sh --prepare "$component_directory"
     source "$component_directory/compiler-driver-authority.env"
@@ -132,14 +132,14 @@ build-release:
     set -euo pipefail
     component_directory="$(
         cargo metadata --no-deps --format-version 1 --locked --offline |
-            python3 -c 'import json, pathlib, sys; print((pathlib.Path(json.load(sys.stdin)["target_directory"]) / "release").as_posix())'
+            uv run python -c 'import json, pathlib, sys; print((pathlib.Path(json.load(sys.stdin)["target_directory"]) / "release").as_posix())'
     )"
     scripts/check-compiler-fact-driver.sh --prepare "$component_directory"
     source "$component_directory/compiler-driver-authority.env"
     cargo build --workspace --bins --all-features --release --locked
 
 package-release output-directory: build-release
-    python3 scripts/package-release.py {{quote(output-directory)}}
+    uv run python scripts/package-release.py {{quote(output-directory)}}
 
 # Publish the protocol-compatible source pack independently of Cargo-Rail core.
 package-compiler-adapter output-directory:
@@ -147,10 +147,10 @@ package-compiler-adapter output-directory:
     set -euo pipefail
     component_directory="$(
         cargo metadata --no-deps --format-version 1 --locked --offline |
-            python3 -c 'import json, pathlib, sys; print((pathlib.Path(json.load(sys.stdin)["target_directory"]) / "release").as_posix())'
+            uv run python -c 'import json, pathlib, sys; print((pathlib.Path(json.load(sys.stdin)["target_directory"]) / "release").as_posix())'
     )"
     scripts/check-compiler-fact-driver.sh --prepare-source "$component_directory"
-    python3 scripts/package-compiler-adapter.py "$component_directory/cargo-rail-fact-driver-source-v1.json" {{quote(output-directory)}}
+    uv run python scripts/package-compiler-adapter.py "$component_directory/cargo-rail-fact-driver-source-v1.json" {{quote(output-directory)}}
 
 update:
     @scripts/update-all.sh
@@ -165,7 +165,7 @@ bench *args: build-release
     set -euo pipefail
     component_directory="$(
         cargo metadata --no-deps --format-version 1 --locked --offline |
-            python3 -c 'import json, pathlib, sys; print((pathlib.Path(json.load(sys.stdin)["target_directory"]) / "release").as_posix())'
+            uv run python -c 'import json, pathlib, sys; print((pathlib.Path(json.load(sys.stdin)["target_directory"]) / "release").as_posix())'
     )"
     exec "$component_directory/cargo-rail-bench" local "$@"
 
