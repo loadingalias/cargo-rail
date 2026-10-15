@@ -7,8 +7,9 @@
 //! - the arguments it appends from `CLIPPY_ARGS`, and whether it runs lints at all;
 //! - environment it reads without recording it in dep-info;
 //! - the configuration file lookup, which checks every ancestor directory until one holds a file;
-//! - the inputs of `cargo metadata`, which the `clippy::cargo` lints run during linting.
-//!   A source attribute can enable those lints, so every Clippy action binds them.
+//! - the inputs of `cargo metadata`, which the `clippy::cargo` lints run during linting, including whether
+//!   each package has a default README. A source attribute can enable those lints, so every Clippy action
+//!   binds them.
 //!
 //! The capture below is part of the base action. A change to any bound input selects another action.
 //! An input that cannot be bound exactly keeps the invocation on the ordinary compiler path.
@@ -23,11 +24,12 @@ use serde::Serialize;
 use crate::error::{RailError, RailResult};
 
 use super::cargo_inputs::{
-    CargoInputs, EnvironmentValue, PathKind, PathState, PortableRoots, environment_value, file_state, path_state,
+    CargoInputs, CargoQuery, EnvironmentValue, PathKind, PathState, PortableRoots, environment_value, file_state,
+    path_state,
 };
 use super::{NativeCaptureBudget, NativeInputFailure, NativeMetadataGuard, capture_guarded_file};
 
-const CLIPPY_CAPTURE_VERSION: u32 = 2;
+const CLIPPY_CAPTURE_VERSION: u32 = 3;
 /// `cargo clippy` joins the arguments after `--` with this separator in `CLIPPY_ARGS`.
 const CLIPPY_ARGUMENT_SEPARATOR: &str = "__CLIPPY_HACKERY__";
 /// Clippy checks both names in each directory, in this order.
@@ -131,7 +133,14 @@ impl ClippyActionCapture {
                 .map(PathBuf::from)
                 .filter(|path| path.is_absolute())
                 .ok_or_else(|| RailError::message("Clippy's cargo executable is not an absolute CARGO path"))?;
-            CargoInputs::capture(&current_directory, &current_directory, &cargo, roots, budget)
+            CargoInputs::capture(
+                &current_directory,
+                &current_directory,
+                &cargo,
+                CargoQuery::Metadata,
+                roots,
+                budget,
+            )
         })()
         .map_err(|error| failure_from(CARGO_REASON, error))?;
         Ok(Self {

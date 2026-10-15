@@ -7618,6 +7618,14 @@ fn remapped_clippy_results_restore_across_checkout_roots_until_an_input_changes(
         edit(&cargo_configuration, "[term]\nverbose = false\n")?;
         changed("repository Cargo configuration", &[])?;
         fs::remove_file(&cargo_configuration)?;
+        // `cargo metadata` names a default README, which `clippy::cargo_common_metadata` reads. Its presence
+        // binds; its contents do not.
+        let readme = second.join("member/README.md");
+        edit(&readme, "one\n")?;
+        changed("default README presence", &[])?;
+        fs::write(&readme, "two\n")?;
+        restore("edited README contents", "verified_local_result")?;
+        fs::remove_file(&readme)?;
         // Setup enrolled the wrapper in this file, so the change appends to it.
         let home_configuration = second_home.path().join("config.toml");
         let enrolled = fs::read_to_string(&home_configuration)?;
@@ -7645,7 +7653,7 @@ fn procedural_macro_consumers_reuse_only_while_every_observed_read_is_unchanged(
         };
         write(
             "Cargo.toml",
-            "[workspace]\nmembers = [\"reader\", \"facade\", \"direct\", \"reexport\", \"scriptless\", \"spawner\", \"spawning\", \"locator\", \"locating\"]\nresolver = \"3\"\n",
+            "[workspace]\nmembers = [\"reader\", \"facade\", \"direct\", \"reexport\", \"scriptless\", \"spawner\", \"spawning\", \"locator\", \"locating\", \"searcher\", \"searching\"]\nresolver = \"3\"\n",
         )?;
         // The macro reads a file, a directory listing, a missing path, and a variable. Rustc records none of
         // them, and no build script declares them.
@@ -7716,12 +7724,37 @@ pub fn data(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
 }
 "#,
         )?;
+        // An upward search like the `.env` lookup of `sqlx` 0.9: the metadata of each directory up to the
+        // file-system root, then the searched name in it.
+        write(
+            "searcher/Cargo.toml",
+            "[package]\nname = \"searcher\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\nproc-macro = true\n",
+        )?;
+        write(
+            "searcher/src/lib.rs",
+            r#"extern crate proc_macro;
+
+#[proc_macro]
+pub fn data(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let package = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("package"));
+    let mut found = String::from("none");
+    for directory in package.ancestors() {
+        let _ = std::fs::metadata(directory);
+        if let Ok(text) = std::fs::read_to_string(directory.join(".cargo-rail-test-settings")) {
+            found = text.trim().to_string();
+        }
+    }
+    proc_macro::TokenTree::Literal(proc_macro::Literal::string(&found)).into()
+}
+"#,
+        )?;
         for (package, dependency, build_script) in [
             ("direct", "reader", true),
             ("reexport", "facade", true),
             ("scriptless", "reader", false),
             ("spawning", "spawner", false),
             ("locating", "locator", false),
+            ("searching", "searcher", false),
         ] {
             write(
                 &format!("{package}/Cargo.toml"),
@@ -7790,7 +7823,7 @@ pub fn data(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
                 "build diagnostics".to_string(),
                 (String::from_utf8_lossy(&output.stderr).into_owned(), String::new()),
             );
-            for package in ["direct", "reexport", "scriptless", "spawning", "locating"] {
+            for package in ["direct", "reexport", "scriptless", "spawning", "locating", "searching"] {
                 let event = events
                     .iter()
                     .find(|event| {
@@ -7833,9 +7866,17 @@ pub fn data(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
                 "{outcomes:?}"
             );
         };
+        let searched = |outcomes: &BTreeMap<String, (String, String)>, status: &str, value: &str| {
+            assert_eq!(
+                outcomes.get("searching"),
+                Some(&(status.to_string(), value.to_string())),
+                "{outcomes:?}"
+            );
+        };
         let cold = build("cold", true, "a")?;
         expect_all(&cold, "miss", "one|1|false|a");
         located(&cold, "miss");
+        searched(&cold, "miss", "none");
         assert_eq!(
             cold.get("spawning reason").map(|(reason, _)| reason.as_str()),
             Some("procedural_macro_process_unmodeled"),
@@ -7844,6 +7885,21 @@ pub fn data(_: proc_macro::TokenStream) -> proc_macro::TokenStream {
         let warm = build("warm", true, "a")?;
         expect_all(&warm, "hit", "one|1|false|a");
         located(&warm, "hit");
+        searched(&warm, "hit", "none");
+
+        // The searched name appears above the workspace, outside the repository. The stored result must not
+        // restore, and the unit compiles with the new value. Once the name is gone, the stored result restores.
+        let above = root.path().join(".cargo-rail-test-settings");
+        fs::write(&above, "above\n")?;
+        let appeared = build("name above the workspace", true, "a")?;
+        searched(&appeared, "bypassed", "above");
+        assert_eq!(
+            appeared.get("searching reason").map(|(reason, _)| reason.as_str()),
+            Some("compiler_dynamic_input_selector_unavailable"),
+            "{appeared:?}"
+        );
+        fs::remove_file(&above)?;
+        searched(&build("name above the workspace removed", true, "a")?, "hit", "none");
 
         // The Cargo query binds the workspace manifest; the file reads do not.
         let manifest = fs::read_to_string(workspace.join("Cargo.toml"))?;

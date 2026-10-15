@@ -5,7 +5,15 @@
 //! inputs: the `cargo` executable, Cargo configuration from files and non-secret `CARGO_*` variables, the
 //! manifest search from the package up to the workspace root, the workspace manifests with every path
 //! dependency they reach, and the lockfile. The lockfile pins registry and Git packages, whose sources are
-//! immutable once unpacked. Binding this superset keeps a hit valid exactly while Cargo's answer is.
+//! immutable once unpacked. Binding this superset keeps a `locate-project` hit valid exactly while Cargo's
+//! answer is.
+//!
+//! `cargo metadata` also reports the default README of each package without a `readme` key: the first of
+//! `README.md`, `README.txt`, and `README` that is a regular file. `clippy::cargo_common_metadata` reads that
+//! name, so a metadata capture also binds whether each default README name is a regular file. Its contents
+//! stay out of the key, because Cargo reports only the name. The metadata output also lists the targets that
+//! Cargo discovers from files such as `src/bin/*.rs`. No `clippy::cargo` lint reads them, so a metadata
+//! capture binds only what those lints read.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -30,6 +38,15 @@ const DEPENDENCY_TABLES: [&str; 5] = [
 ];
 const MAX_CARGO_MANIFESTS: usize = 4096;
 const MAX_CARGO_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+/// The names that Cargo checks, in this order, for the README of a package without a `readme` key.
+const DEFAULT_README_NAMES: [&str; 3] = ["README.md", "README.txt", "README"];
+
+/// The Cargo query whose answer a capture binds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CargoQuery {
+    LocateProject,
+    Metadata,
+}
 
 /// Cargo's inputs for one query, captured from the current process environment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,18 +74,27 @@ impl CargoInputs {
             .map(|input| super::PostExecutionPath::Present(PathBuf::from(&input.path)))
     }
 
-    /// Capture what `cargo` reads for a query about the package in `manifest_directory`, run from
+    /// Capture what `cargo` reads for `query` about the package in `manifest_directory`, run from
     /// `current_directory` with this process's environment.
     /// `roots` selects portable spelling; without it every path is spelled as the host names it.
     pub(super) fn capture(
         manifest_directory: &Path,
         current_directory: &Path,
         cargo: &Path,
+        query: CargoQuery,
         roots: Option<&PortableRoots>,
         budget: &mut NativeCaptureBudget,
     ) -> RailResult<Self> {
         let cargo_home = crate::cargo::CargoConfigSnapshot::cargo_home(current_directory)?;
-        Self::capture_with_home(manifest_directory, current_directory, cargo, &cargo_home, roots, budget)
+        Self::capture_with_home(
+            manifest_directory,
+            current_directory,
+            cargo,
+            &cargo_home,
+            query,
+            roots,
+            budget,
+        )
     }
 
     fn capture_with_home(
@@ -76,6 +102,7 @@ impl CargoInputs {
         current_directory: &Path,
         cargo: &Path,
         cargo_home: &Path,
+        query: CargoQuery,
         roots: Option<&PortableRoots>,
         budget: &mut NativeCaptureBudget,
     ) -> RailResult<Self> {
@@ -101,9 +128,14 @@ impl CargoInputs {
                 entry.insert(state);
             }
         }
-        let mut record = |path: PathBuf, budget: &mut NativeCaptureBudget| -> RailResult<()> {
+        // `presence` binds only whether the path is a regular file, as Cargo checks a default README name.
+        let mut record = |path: PathBuf, presence: bool, budget: &mut NativeCaptureBudget| -> RailResult<()> {
             if let std::collections::btree_map::Entry::Vacant(entry) = inputs.entry(path) {
-                let state = file_state(entry.key(), roots, started, budget, guards)?;
+                let state = if presence {
+                    regular_file_presence(entry.key())?
+                } else {
+                    file_state(entry.key(), roots, started, budget, guards)?
+                };
                 entry.insert(state);
             }
             Ok(())
@@ -114,7 +146,7 @@ impl CargoInputs {
         let mut package_root = None;
         for directory in manifest_directory.ancestors() {
             let manifest = directory.join("Cargo.toml");
-            record(manifest.clone(), budget)?;
+            record(manifest.clone(), false, budget)?;
             let Some(document) = read_manifest(&manifest)? else {
                 continue;
             };
@@ -138,7 +170,7 @@ impl CargoInputs {
         let root = root
             .or(package_root)
             .ok_or_else(|| RailError::message("the queried package has no Cargo manifest"))?;
-        record(root.join("Cargo.lock"), budget)?;
+        record(root.join("Cargo.lock"), false, budget)?;
 
         let mut pending = vec![root.join("Cargo.toml")];
         let mut visited = BTreeSet::new();
@@ -149,13 +181,18 @@ impl CargoInputs {
             if visited.len() > MAX_CARGO_MANIFESTS {
                 return Err(RailError::message("the workspace manifest closure exceeds its bound"));
             }
-            record(manifest.clone(), budget)?;
+            record(manifest.clone(), false, budget)?;
             let Some(document) = read_manifest(&manifest)? else {
                 continue;
             };
             let directory = manifest
                 .parent()
                 .ok_or_else(|| RailError::message("Cargo manifest has no directory"))?;
+            if query == CargoQuery::Metadata && document.get("package").is_some() {
+                for name in DEFAULT_README_NAMES {
+                    record(directory.join(name), true, budget)?;
+                }
+            }
             if manifest == root.join("Cargo.toml")
                 && let Some(members) = document
                     .get("workspace")
@@ -307,6 +344,20 @@ pub(super) fn file_state(
         content_digest,
         bytes,
     })
+}
+
+/// Whether `path` is a regular file, following symbolic links as Cargo's README check does.
+fn regular_file_presence(path: &Path) -> RailResult<PathKind> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(PathKind::Present),
+        Ok(metadata) if metadata.is_dir() => Ok(PathKind::Directory),
+        Ok(_) => Err(RailError::message(format!(
+            "Cargo input '{}' is neither a regular file nor a directory",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(PathKind::Absent),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// A variable's value digest. Under portable spelling, a value that names a path below a bound root
@@ -479,6 +530,8 @@ pub(super) struct PathState {
 pub(super) enum PathKind {
     Absent,
     Directory,
+    /// A regular file whose existence, not its contents, is bound.
+    Present,
     File {
         target: String,
         content_digest: String,
@@ -532,17 +585,19 @@ mod tests {
         let cargo_home = base.join("cargo-home");
         fs::create_dir(&cargo_home).expect("Cargo home");
         let package = workspace.join(native("crates/a"));
-        let capture = || {
+        let capture_query = |query| {
             CargoInputs::capture_with_home(
                 &package,
                 &package,
                 &base.join("toolchain/cargo"),
                 &cargo_home,
+                query,
                 None,
                 &mut budget(),
             )
             .map(|inputs| inputs.inputs)
         };
+        let capture = || capture_query(CargoQuery::Metadata);
 
         let inputs = capture().expect("Cargo inputs");
         let bound = |inputs: &[PathState], path: &Path| {
@@ -592,6 +647,45 @@ mod tests {
             write(&change, "[package]\nname = \"changed\"\n");
             assert_ne!(capture().expect("after"), before, "{label} is bound");
         }
+
+        // `cargo metadata` names the first default README that is a regular file, so only its presence binds.
+        // The virtual workspace manifest has no package and so no README.
+        let readme = package.join("README.md");
+        assert_eq!(bound(&capture().expect("metadata"), &readme), Some(PathKind::Absent));
+        assert_eq!(bound(&capture().expect("metadata"), &workspace.join("README.md")), None);
+        for name in DEFAULT_README_NAMES {
+            let path = workspace.join(native("crates/b")).join(name);
+            assert_eq!(bound(&inputs, &path), Some(PathKind::Absent), "{}", path.display());
+        }
+        let locate_project = capture_query(CargoQuery::LocateProject).expect("locate-project inputs");
+        assert_eq!(
+            bound(&locate_project, &readme),
+            None,
+            "locate-project never reads a README"
+        );
+        let before = capture().expect("before README");
+        write(&readme, "one\n");
+        let present = capture().expect("with README");
+        assert_eq!(bound(&present, &readme), Some(PathKind::Present));
+        assert_ne!(present, before, "a new default README changes the metadata answer");
+        write(&readme, "two\n");
+        assert_eq!(
+            capture().expect("edited README"),
+            present,
+            "README contents stay out of the key"
+        );
+        assert_eq!(
+            capture_query(CargoQuery::LocateProject).expect("locate-project inputs"),
+            locate_project
+        );
+        fs::remove_file(&readme).expect("remove README");
+        fs::create_dir(&readme).expect("README directory");
+        assert_eq!(
+            bound(&capture().expect("README directory"), &readme),
+            Some(PathKind::Directory),
+            "Cargo does not report a directory as the README"
+        );
+        fs::remove_dir(&readme).expect("remove README directory");
 
         write(
             &package.join("Cargo.toml"),
@@ -665,6 +759,7 @@ mod tests {
                 &package,
                 &base.join("toolchain/bin/cargo"),
                 &base.join("home"),
+                CargoQuery::Metadata,
                 portable.then_some(&roots),
                 &mut budget(),
             )
@@ -742,6 +837,7 @@ mod tests {
                 &workspace,
                 &toolchain.join("bin/cargo"),
                 &home,
+                CargoQuery::Metadata,
                 Some(&roots),
                 &mut budget(),
             )

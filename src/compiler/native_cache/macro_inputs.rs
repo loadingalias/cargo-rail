@@ -13,7 +13,11 @@
 //!   build-script output, is already bound;
 //! - `cargo locate-project`, which `proc-macro-crate` runs to find the workspace, binds what Cargo reads to
 //!   answer it;
+//! - an upward search above the workspace root, such as the `.env` lookup of `sqlx`, binds the absence of
+//!   the searched name in every directory above the root. Directories outside the repository decide that
+//!   absence, so such a result stays in the local cache;
 //! - any other read or process, a read through a symbolic link, and every unobservable effect bypass by name.
+//!   The cache report names every effect, process, and read that stops the binding, not only the first.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -30,7 +34,7 @@ use crate::compiler::observation::{EnvironmentObservation, is_secret_name};
 use crate::error::{RailError, RailResult};
 use crate::source::ContentDigest;
 
-use super::cargo_inputs::CargoInputs;
+use super::cargo_inputs::{CargoInputs, CargoQuery};
 use super::{NATIVE_CAPTURE_LIMITS, NativeCaptureBudget, capture_guarded_file, native_relative_path, semantic_mode};
 
 /// At most this many paths bind one action; a macro that reads more bypasses.
@@ -51,6 +55,9 @@ pub(crate) struct MacroPathSelector {
     /// The path is the package directory of a `cargo locate-project` query, relative to this root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cargo_query: Option<CargoQueryRoot>,
+    /// The path is one name, absent from every directory above the workspace root.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) above_root: bool,
 }
 
 /// Where the package directory of a Cargo query is rooted.
@@ -66,6 +73,7 @@ impl MacroPathSelector {
     fn validate(&self) -> RailResult<()> {
         // The empty path names the workspace root itself.
         if self.cargo_query.is_some() && self.listing
+            || self.above_root && (self.listing || self.cargo_query.is_some() || !is_single_name(&self.path))
             || self.path.len() > super::MAX_DYNAMIC_REPOSITORY_PATH_BYTES
             || !self.path.is_empty() && native_relative_path(Path::new(&self.path)).ok().as_deref() != Some(&self.path)
         {
@@ -75,6 +83,15 @@ impl MacroPathSelector {
         }
         Ok(())
     }
+}
+
+/// One normal path component, as an upward search joins it to each directory.
+fn is_single_name(name: &str) -> bool {
+    !name.contains(['/', '\\'])
+        && matches!(
+            Path::new(name).components().collect::<Vec<_>>().as_slice(),
+            [Component::Normal(_)]
+        )
 }
 
 pub(crate) fn validate_selectors(selectors: &[MacroPathSelector]) -> RailResult<()> {
@@ -127,6 +144,8 @@ pub(crate) struct MacroPathInput {
     listing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cargo_query: Option<CargoQueryRoot>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    above_root: bool,
     state: MacroPathState,
 }
 
@@ -136,12 +155,49 @@ impl MacroPathInput {
             path: self.path.clone(),
             listing: self.listing,
             cargo_query: self.cargo_query,
+            above_root: self.above_root,
         }
     }
 }
 
+const OUTSIDE: &str = "procedural_macro_read_outside_repository";
+const SYMLINK: &str = "procedural_macro_read_through_symlink";
+const PROCESS: &str = "procedural_macro_process_unmodeled";
+/// Each detail section names at most this many processes or paths, then their count.
+const MAX_DETAIL_SUBJECTS: usize = 4;
+
+/// Why a unit that loaded procedural macros bypasses reuse.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct MacroBypass {
+    /// The first blocking condition in report order: effects, secret variables, processes, then reads.
+    pub(super) reason: &'static str,
+    /// Every blocking effect, process, and read, for the cache report.
+    pub(super) detail: String,
+}
+
+/// Bind every observed read, or name every condition that stops the binding.
+///
+/// The bypass keeps one reason, so the counts of the cache report still add up to the bypassed units. Its
+/// detail names each blocking condition, so one cold build shows every class that one unit must clear.
+pub(super) fn select(
+    observation: &NativeMacroObservation,
+    workspace_root: &Path,
+    source_root_spelling: &Path,
+    captured: &[&Path],
+) -> Result<Vec<MacroPathSelector>, MacroBypass> {
+    let selected = path_selectors(observation, workspace_root, source_root_spelling, captured);
+    let Some(reason) = bypass_reason(observation) else {
+        return selected;
+    };
+    let mut detail = bypass_detail(observation);
+    if let Err(paths) = selected {
+        detail = format!("{detail}; {}", paths.detail);
+    }
+    Err(MacroBypass { reason, detail })
+}
+
 /// The bypass reason for effects that no key can bind, if the macro produced any.
-pub(super) fn bypass_reason(observation: &NativeMacroObservation) -> Option<&'static str> {
+fn bypass_reason(observation: &NativeMacroObservation) -> Option<&'static str> {
     if let Some(reason) = observation.unobservable.first() {
         return Some(match reason {
             Unobservable::ObservationUnavailable => "procedural_macro_observation_unavailable",
@@ -168,28 +224,41 @@ pub(super) fn bypass_reason(observation: &NativeMacroObservation) -> Option<&'st
     None
 }
 
-/// What a bypassed macro did, for the cache report: the imports that no table classifies, or the effects.
-pub(super) fn bypass_detail(observation: &NativeMacroObservation) -> String {
+/// What a bypassed macro did, for the cache report: the imports that no table classifies, the effects, and
+/// the secret-named variables that it read.
+fn bypass_detail(observation: &NativeMacroObservation) -> String {
+    let mut sections = Vec::new();
     if !observation.unobservable_imports.is_empty() {
-        return format!(
+        sections.push(format!(
             "procedural-macro imports without a classification: {}",
             observation.unobservable_imports.join(", ")
-        );
+        ));
     }
-    if observation.unobservable.is_empty() {
-        let secret = observation.environment.iter().filter(|name| is_secret_name(name));
-        return format!(
+    if !observation.unobservable.is_empty() {
+        let effects = observation.unobservable.iter().map(|effect| {
+            serde_json::to_value(effect)
+                .ok()
+                .and_then(|name| name.as_str().map(str::to_owned))
+                .unwrap_or_else(|| format!("{effect:?}"))
+        });
+        sections.push(format!(
+            "procedural-macro effects: {}",
+            effects.collect::<Vec<_>>().join(", ")
+        ));
+    }
+    let secret = observation
+        .environment
+        .iter()
+        .filter(|name| is_secret_name(name))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if !secret.is_empty() {
+        sections.push(format!(
             "procedural macro read secret-named variables: {}",
-            secret.map(String::as_str).collect::<Vec<_>>().join(", ")
-        );
+            secret.join(", ")
+        ));
     }
-    let effects = observation.unobservable.iter().map(|effect| {
-        serde_json::to_value(effect)
-            .ok()
-            .and_then(|name| name.as_str().map(str::to_owned))
-            .unwrap_or_else(|| format!("{effect:?}"))
-    });
-    format!("procedural-macro effects: {}", effects.collect::<Vec<_>>().join(", "))
+    sections.join("; ")
 }
 
 /// The variables a macro read, as compiler environment reads with their current values.
@@ -205,7 +274,7 @@ pub(super) fn environment_reads(observation: &NativeMacroObservation) -> impl It
     })
 }
 
-/// Map observed path reads to repository selectors, or name why one cannot bind.
+/// Map observed reads and processes to selectors, or name every one that cannot bind.
 ///
 /// `source_root_spelling` is the spelling Cargo used for the workspace root, which resolves to
 /// `workspace_root`. `captured` names canonical directories the action already binds whole.
@@ -214,30 +283,64 @@ pub(super) fn path_selectors(
     workspace_root: &Path,
     source_root_spelling: &Path,
     captured: &[&Path],
-) -> Result<Vec<MacroPathSelector>, &'static str> {
-    const OUTSIDE: &str = "procedural_macro_read_outside_repository";
-    const SYMLINK: &str = "procedural_macro_read_through_symlink";
-    let canonical_root = crate::utils::canonicalize_existing(workspace_root).map_err(|_| OUTSIDE)?;
+) -> Result<Vec<MacroPathSelector>, MacroBypass> {
+    let canonical_root = crate::utils::canonicalize_existing(workspace_root).map_err(|_| MacroBypass {
+        reason: OUTSIDE,
+        detail: format!("the workspace root '{}' cannot be resolved", workspace_root.display()),
+    })?;
+    // Only a read outside the repository needs the directories above the root.
+    let mut above = None;
     let mut selectors = BTreeSet::new();
+    let mut blocked = Blocked::default();
     for spawn in &observation.spawns {
-        selectors.insert(cargo_query_selector(spawn, &canonical_root).ok_or("procedural_macro_process_unmodeled")?);
+        match cargo_query_selector(spawn, &canonical_root) {
+            Some(selector) => {
+                selectors.insert(selector);
+            }
+            None => blocked.add(PROCESS, process_name(spawn)),
+        }
     }
     for read in &observation.paths {
         let spelled = Path::new(&read.path);
         if STATELESS_DEVICES.contains(&read.path.as_str()) {
             continue;
         }
-        if resolved_location(spelled).is_some_and(|resolved| captured.iter().any(|root| resolved.starts_with(root))) {
+        let resolved = resolved_location(spelled);
+        if resolved
+            .as_deref()
+            .is_some_and(|resolved| captured.iter().any(|root| resolved.starts_with(root)))
+        {
             continue;
         }
-        let remainder = [canonical_root.as_path(), workspace_root, source_root_spelling]
+        let Some(remainder) = [canonical_root.as_path(), workspace_root, source_root_spelling]
             .into_iter()
             .find_map(|root| spelled.strip_prefix(root).ok())
-            .ok_or(OUTSIDE)?;
-        let relative = normalize_within(&canonical_root, remainder).map_err(|error| match error {
-            PathError::Outside => OUTSIDE,
-            PathError::Symlink => SYMLINK,
-        })?;
+        else {
+            let above =
+                above.get_or_insert_with(|| directories_above(&canonical_root, [workspace_root, source_root_spelling]));
+            match resolved
+                .as_deref()
+                .map(|resolved| above_root_read(resolved, read.access, above))
+            {
+                Some(AboveRoot::Directory) => {}
+                Some(AboveRoot::Absent(selector)) => {
+                    selectors.insert(selector);
+                }
+                Some(AboveRoot::Unbound) | None => blocked.add(OUTSIDE, read.path.clone()),
+            }
+            continue;
+        };
+        let relative = match normalize_within(&canonical_root, remainder) {
+            Ok(relative) => relative,
+            Err(PathError::Outside) => {
+                blocked.add(OUTSIDE, read.path.clone());
+                continue;
+            }
+            Err(PathError::Symlink) => {
+                blocked.add(SYMLINK, read.path.clone());
+                continue;
+            }
+        };
         let absolute = canonical_root.join(&relative);
         if captured.iter().any(|root| absolute.starts_with(root)) {
             continue;
@@ -246,12 +349,132 @@ pub(super) fn path_selectors(
             path: relative,
             listing: read.access == NativeMacroPathAccess::Listing,
             cargo_query: None,
+            above_root: false,
         });
     }
+    if let Some(bypass) = blocked.bypass() {
+        return Err(bypass);
+    }
     if selectors.len() > MAX_MACRO_PATH_INPUTS {
-        return Err("procedural_macro_observation_limit");
+        return Err(MacroBypass {
+            reason: "procedural_macro_observation_limit",
+            detail: format!("procedural macro read more than {MAX_MACRO_PATH_INPUTS} paths"),
+        });
     }
     Ok(selectors.into_iter().collect())
+}
+
+/// Processes and reads that cannot bind, grouped by reason in the order they were first found.
+#[derive(Default)]
+struct Blocked {
+    sections: Vec<(&'static str, Vec<String>)>,
+}
+
+impl Blocked {
+    fn add(&mut self, reason: &'static str, subject: String) {
+        match self.sections.iter_mut().find(|(known, _)| *known == reason) {
+            Some((_, subjects)) => subjects.push(subject),
+            None => self.sections.push((reason, vec![subject])),
+        }
+    }
+
+    fn bypass(self) -> Option<MacroBypass> {
+        let reason = self.sections.first()?.0;
+        let detail = self
+            .sections
+            .iter()
+            .map(|(reason, subjects)| {
+                let label = match *reason {
+                    PROCESS => "procedural-macro processes without a model",
+                    SYMLINK => "procedural-macro reads through a symbolic link",
+                    _ => "procedural-macro reads outside the repository",
+                };
+                let shown = subjects.iter().take(MAX_DETAIL_SUBJECTS).map(String::as_str);
+                let more = subjects.len().saturating_sub(MAX_DETAIL_SUBJECTS);
+                let more = if more == 0 {
+                    String::new()
+                } else {
+                    format!(", and {more} more")
+                };
+                format!(
+                    "{label} ({}): {}{more}",
+                    subjects.len(),
+                    shown.collect::<Vec<_>>().join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        Some(MacroBypass { reason, detail })
+    }
+}
+
+/// The program name and subcommand of a process, such as `cargo metadata`. Other arguments can carry
+/// values that a report must not show.
+fn process_name(spawn: &NativeMacroSpawn) -> String {
+    let program = Path::new(&spawn.program)
+        .file_name()
+        .map_or_else(|| spawn.program.clone(), |name| name.to_string_lossy().into_owned());
+    match spawn.arguments.get(1) {
+        Some(subcommand) if !subcommand.starts_with('-') => format!("{program} {subcommand}"),
+        _ => program,
+    }
+}
+
+/// Every existing directory above the workspace root, in canonical form, as each root spelling reaches it.
+///
+/// A macro searches upward from the spelling that it got, such as `CARGO_MANIFEST_DIR`, or from the canonical
+/// working directory. A spelling through a symbolic link reaches other directories than the canonical root.
+fn directories_above<'a>(canonical_root: &Path, spellings: impl IntoIterator<Item = &'a Path>) -> BTreeSet<PathBuf> {
+    let mut directories = canonical_root
+        .ancestors()
+        .skip(1)
+        .map(Path::to_path_buf)
+        .collect::<BTreeSet<_>>();
+    for spelling in spellings {
+        for directory in spelling.ancestors().skip(1) {
+            if let Ok(directory) = crate::utils::canonicalize_existing(directory)
+                && !directory.starts_with(canonical_root)
+            {
+                directories.insert(directory);
+            }
+        }
+    }
+    directories
+}
+
+/// How a read outside the repository relates to the directories above the workspace root.
+enum AboveRoot {
+    /// The metadata of a directory above the root, which exists while the root does.
+    Directory,
+    /// A missing name in a directory above the root, which binds as absent from all of them.
+    Absent(MacroPathSelector),
+    Unbound,
+}
+
+fn above_root_read(resolved: &Path, access: NativeMacroPathAccess, above: &BTreeSet<PathBuf>) -> AboveRoot {
+    if above.contains(resolved) {
+        return if access == NativeMacroPathAccess::Entry {
+            AboveRoot::Directory
+        } else {
+            AboveRoot::Unbound
+        };
+    }
+    let (Some(parent), Some(name)) = (resolved.parent(), resolved.file_name().and_then(OsStr::to_str)) else {
+        return AboveRoot::Unbound;
+    };
+    if access == NativeMacroPathAccess::Listing || !above.contains(parent) || !is_single_name(name) {
+        return AboveRoot::Unbound;
+    }
+    // A name that exists above the root is a host file, possibly with credentials, so it does not bind.
+    match fs::symlink_metadata(resolved) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => AboveRoot::Absent(MacroPathSelector {
+            path: name.to_string(),
+            listing: false,
+            cargo_query: None,
+            above_root: true,
+        }),
+        Ok(_) | Err(_) => AboveRoot::Unbound,
+    }
 }
 
 enum PathError {
@@ -335,6 +558,7 @@ fn cargo_query_selector(spawn: &NativeMacroSpawn, workspace_root: &Path) -> Opti
         path: native_relative_path(relative).ok()?,
         listing: false,
         cargo_query: Some(root),
+        above_root: false,
     })
 }
 
@@ -370,7 +594,14 @@ fn cargo_query_inputs(
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .ok_or_else(|| RailError::message("the compiler's cargo executable is not an absolute CARGO path"))?;
-    CargoInputs::capture(&base.join(relative), &current_directory, &cargo, None, budget)
+    CargoInputs::capture(
+        &base.join(relative),
+        &current_directory,
+        &cargo,
+        CargoQuery::LocateProject,
+        None,
+        budget,
+    )
 }
 
 /// Resolve `.` and `..` lexically below `root`, which is valid only while every traversed component is a
@@ -426,26 +657,68 @@ fn reject_symlink_components(root: &Path, relative: &Path) -> RailResult<()> {
 }
 
 /// Capture the current state of every selected path.
+///
+/// `source_root_spelling` is the spelling Cargo used for the workspace root. A name above the root binds in
+/// every directory that the canonical root and that spelling reach.
 pub(super) fn capture(
     workspace_root: &Path,
+    source_root_spelling: &Path,
     selectors: &[MacroPathSelector],
     started: Instant,
     budget: &mut NativeCaptureBudget,
 ) -> RailResult<Vec<MacroPathInput>> {
     validate_selectors(selectors)?;
     let canonical_root = crate::utils::canonicalize_existing(workspace_root)?;
+    let above = selectors
+        .iter()
+        .any(|selector| selector.above_root)
+        .then(|| directories_above(&canonical_root, [workspace_root, source_root_spelling]));
     selectors
         .iter()
         .map(|selector| {
             budget.account_entry(&selector.path)?;
+            let state = match &above {
+                Some(above) if selector.above_root => capture_above_root(above, &selector.path, started, budget)?,
+                _ => capture_state(&canonical_root, selector, started, budget)?,
+            };
             Ok(MacroPathInput {
                 path: selector.path.clone(),
                 listing: selector.listing,
                 cargo_query: selector.cargo_query,
-                state: capture_state(&canonical_root, selector, started, budget)?,
+                above_root: selector.above_root,
+                state,
             })
         })
         .collect()
+}
+
+/// `name` must be absent from every directory above the root. A name that exists there is a host file that
+/// the action cannot bind, so the capture fails and the unit compiles.
+fn capture_above_root(
+    above: &BTreeSet<PathBuf>,
+    name: &str,
+    started: Instant,
+    budget: &mut NativeCaptureBudget,
+) -> RailResult<MacroPathState> {
+    for directory in above {
+        let path = directory.join(name);
+        match fs::symlink_metadata(&path) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Ok(_) => {
+                return Err(RailError::message(format!(
+                    "procedural-macro input '{}' exists above the workspace root",
+                    path.display()
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        budget.check(0, started.elapsed())?;
+    }
+    Ok(MacroPathState::Absent)
 }
 
 fn capture_state(
@@ -519,13 +792,17 @@ fn capture_state(
 }
 
 /// Every bound path. A Cargo query binds what Cargo reads, so it is recaptured, and it must still match.
+///
+/// A name above the workspace root is left out. Directories such as the home directory change for unrelated
+/// reasons at any time, as do the directories where Cargo probes for configuration. The capture and every
+/// revalidation still check the absence.
 pub(super) fn post_execution_paths(
     workspace_root: &Path,
     inputs: &[MacroPathInput],
 ) -> RailResult<Vec<super::PostExecutionPath>> {
     let canonical_root = crate::utils::canonicalize_existing(workspace_root)?;
     let mut paths = Vec::new();
-    for input in inputs {
+    for input in inputs.iter().filter(|input| !input.above_root) {
         let relative = Path::new(&input.path);
         match (&input.state, input.cargo_query) {
             (MacroPathState::CargoQuery { .. }, Some(root)) => {
@@ -546,10 +823,15 @@ pub(super) fn post_execution_paths(
 }
 
 /// Recapture every input and fail if any state changed since the action was captured.
-pub(super) fn revalidate(workspace_root: &Path, inputs: &[MacroPathInput]) -> RailResult<()> {
+pub(super) fn revalidate(
+    workspace_root: &Path,
+    source_root_spelling: &Path,
+    inputs: &[MacroPathInput],
+) -> RailResult<()> {
     let selectors = inputs.iter().map(MacroPathInput::selector).collect::<Vec<_>>();
     let current = capture(
         workspace_root,
+        source_root_spelling,
         &selectors,
         Instant::now(),
         &mut NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS),
@@ -567,7 +849,9 @@ pub(crate) fn validate_inputs(inputs: &[MacroPathInput]) -> RailResult<()> {
     validate_selectors(&selectors)?;
     for input in inputs {
         let valid = match &input.state {
-            MacroPathState::Absent | MacroPathState::Directory => true,
+            MacroPathState::Absent => true,
+            _ if input.above_root => false,
+            MacroPathState::Directory => true,
             MacroPathState::File { content_digest, .. } => super::validate_sha256(content_digest).is_ok(),
             MacroPathState::Listing { listing_digest, .. } => {
                 input.listing && super::validate_sha256(listing_digest).is_ok()
@@ -587,6 +871,9 @@ pub(crate) fn validate_inputs(inputs: &[MacroPathInput]) -> RailResult<()> {
 mod tests {
     use super::*;
     use crate::compiler::native_input_protocol::NativeMacroPathRead;
+
+    /// A name that no directory above a test workspace holds.
+    const PROBE: &str = ".cargo-rail-above-root-probe";
 
     fn observation(root: &Path, reads: &[(&str, NativeMacroPathAccess)]) -> NativeMacroObservation {
         let mut paths = reads
@@ -608,7 +895,26 @@ mod tests {
             path: path.into(),
             listing,
             cargo_query: None,
+            above_root: false,
         }
+    }
+
+    fn above_root(name: &str) -> MacroPathSelector {
+        MacroPathSelector {
+            above_root: true,
+            ..selector(name, false)
+        }
+    }
+
+    fn read(path: &Path, access: NativeMacroPathAccess) -> NativeMacroPathRead {
+        NativeMacroPathRead {
+            path: path.to_str().expect("UTF-8 test path").into(),
+            access,
+        }
+    }
+
+    fn reasons(selected: Result<Vec<MacroPathSelector>, MacroBypass>) -> Result<Vec<MacroPathSelector>, &'static str> {
+        selected.map_err(|bypass| bypass.reason)
     }
 
     #[test]
@@ -647,7 +953,7 @@ mod tests {
             });
         let captured = root.join("crates/a/src");
         assert_eq!(
-            path_selectors(&observed, &root, &root, &[captured.as_path()]),
+            reasons(path_selectors(&observed, &root, &root, &[captured.as_path()])),
             Ok(vec![
                 selector("", false),
                 selector("Cargo.toml", false),
@@ -668,24 +974,24 @@ mod tests {
         std::os::unix::fs::symlink(&root, &spelling).unwrap();
         let through_spelling = observation(&spelling, &[("real", NativeMacroPathAccess::Entry)]);
         assert_eq!(
-            path_selectors(&through_spelling, &root, &spelling, &[]),
+            reasons(path_selectors(&through_spelling, &root, &spelling, &[])),
             Ok(vec![selector("real", false)])
         );
         let outside = observation(&root, &[("../elsewhere", NativeMacroPathAccess::Contents)]);
         assert_eq!(
-            path_selectors(&outside, &root, &root, &[]),
+            reasons(path_selectors(&outside, &root, &root, &[])),
             Err("procedural_macro_read_outside_repository")
         );
         let unrelated = observation(Path::new("/etc"), &[("hosts", NativeMacroPathAccess::Contents)]);
         assert_eq!(
-            path_selectors(&unrelated, &root, &root, &[]),
+            reasons(path_selectors(&unrelated, &root, &root, &[])),
             Err("procedural_macro_read_outside_repository")
         );
         std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
         for read in ["link/file", "link/../real"] {
             let through_link = observation(&root, &[(read, NativeMacroPathAccess::Contents)]);
             assert_eq!(
-                path_selectors(&through_link, &root, &root, &[]),
+                reasons(path_selectors(&through_link, &root, &root, &[])),
                 Err("procedural_macro_read_through_symlink"),
                 "{read}"
             );
@@ -708,6 +1014,7 @@ mod tests {
         let capture_now = || {
             capture(
                 &root,
+                &root,
                 &selectors,
                 Instant::now(),
                 &mut NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS),
@@ -727,7 +1034,7 @@ mod tests {
             serde_json::from_slice::<Vec<MacroPathInput>>(&encoded).unwrap(),
             initial
         );
-        revalidate(&root, &initial).unwrap();
+        revalidate(&root, &root, &initial).unwrap();
 
         for change in [
             |root: &Path| fs::write(root.join("setting.txt"), "two").unwrap(),
@@ -736,7 +1043,7 @@ mod tests {
         ] {
             let before = capture_now();
             change(&root);
-            assert!(revalidate(&root, &before).is_err());
+            assert!(revalidate(&root, &root, &before).is_err());
             assert_ne!(capture_now(), before);
         }
     }
@@ -748,5 +1055,252 @@ mod tests {
         assert!(validate_selectors(&[selector("a/../b", false)]).is_err());
         assert!(validate_selectors(&[selector("/a", false)]).is_err());
         validate_selectors(&[selector("", true), selector("a", false), selector("a", true)]).unwrap();
+    }
+
+    #[test]
+    fn a_bypass_keeps_the_first_reason_and_names_every_blocking_condition() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = crate::utils::canonicalize_existing(workspace.path()).unwrap();
+        fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let metadata = NativeMacroSpawn {
+            program: "/elsewhere/bin/cargo".into(),
+            arguments: [
+                "cargo",
+                "metadata",
+                "--format-version=1",
+                "--no-deps",
+                "--manifest-path=/secret",
+            ]
+            .map(String::from)
+            .to_vec(),
+        };
+        let mut observed = observation(&root, &[("link/file", NativeMacroPathAccess::Contents)]);
+        observed.spawns = vec![metadata];
+        observed.paths.extend(
+            [
+                "/etc/one",
+                "/etc/two",
+                "/etc/three",
+                "/etc/four",
+                "/etc/five",
+                "/etc/six",
+            ]
+            .map(|path| read(Path::new(path), NativeMacroPathAccess::Contents)),
+        );
+        observed.paths.sort_unstable();
+
+        // Without an effect, the process is the first reason, and every read still appears.
+        let bypass = select(&observed, &root, &root, &[]).unwrap_err();
+        assert_eq!(bypass.reason, "procedural_macro_process_unmodeled");
+        assert_eq!(
+            bypass.detail,
+            format!(
+                "procedural-macro processes without a model (1): cargo metadata; \
+                 procedural-macro reads outside the repository (6): /etc/five, /etc/four, /etc/one, /etc/six, and 2 more; \
+                 procedural-macro reads through a symbolic link (1): {}",
+                root.join("link/file").display()
+            )
+        );
+        assert!(!bypass.detail.contains("/secret"), "{}", bypass.detail);
+
+        // An effect stays the reason, and the detail adds the processes and reads behind it.
+        observed.unobservable = vec![Unobservable::ProcessControl, Unobservable::EnvironmentEnumeration];
+        observed.environment = vec!["SERVICE_API_TOKEN".into()];
+        let bypass = select(&observed, &root, &root, &[]).unwrap_err();
+        assert_eq!(bypass.reason, "procedural_macro_process_control");
+        assert!(
+            bypass.detail.starts_with(
+                "procedural-macro effects: process_control, environment_enumeration; \
+                 procedural macro read secret-named variables: SERVICE_API_TOKEN; \
+                 procedural-macro processes without a model (1): cargo metadata; \
+                 procedural-macro reads outside the repository (6)"
+            ),
+            "{}",
+            bypass.detail
+        );
+
+        // A unit with nothing to report binds its reads.
+        let clean = observation(&root, &[("real", NativeMacroPathAccess::Entry)]);
+        assert_eq!(
+            reasons(select(&clean, &root, &root, &[])),
+            Ok(vec![selector("real", false)])
+        );
+    }
+
+    #[test]
+    fn a_missing_name_above_the_root_binds_while_it_stays_absent_everywhere_above() {
+        let temporary = tempfile::tempdir().unwrap();
+        let above = crate::utils::canonicalize_existing(temporary.path()).unwrap();
+        let root = above.join("workspace");
+        fs::create_dir_all(root.join("member")).unwrap();
+        // An upward search from the member: each directory, and the searched name in each of them.
+        let mut observed = observation(
+            &root,
+            &[
+                ("member", NativeMacroPathAccess::Entry),
+                (&format!("member/{PROBE}"), NativeMacroPathAccess::Contents),
+                ("", NativeMacroPathAccess::Entry),
+                (PROBE, NativeMacroPathAccess::Contents),
+            ],
+        );
+        for directory in above.ancestors() {
+            observed.paths.push(read(directory, NativeMacroPathAccess::Entry));
+            observed
+                .paths
+                .push(read(&directory.join(PROBE), NativeMacroPathAccess::Contents));
+        }
+        observed.paths.sort_unstable();
+        let expected = vec![
+            selector("", false),
+            selector(PROBE, false),
+            above_root(PROBE),
+            selector("member", false),
+            selector(&format!("member/{PROBE}"), false),
+        ];
+        assert_eq!(
+            reasons(path_selectors(&observed, &root, &root, &[])),
+            Ok(expected.clone())
+        );
+
+        let capture_now = |spelling: &Path| {
+            capture(
+                &root,
+                spelling,
+                &expected,
+                Instant::now(),
+                &mut NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS),
+            )
+        };
+        let initial = capture_now(&root).unwrap();
+        validate_inputs(&initial).unwrap();
+        let encoded = serde_json::to_vec(&initial).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Vec<MacroPathInput>>(&encoded).unwrap(),
+            initial
+        );
+        revalidate(&root, &root, &initial).unwrap();
+        // The after-execution check leaves out directories above the root, which change for unrelated reasons.
+        let checked = post_execution_paths(&root, &initial).unwrap();
+        assert!(
+            checked.iter().all(|path| match path {
+                super::super::PostExecutionPath::Absent(path) | super::super::PostExecutionPath::Present(path) =>
+                    path.starts_with(&root),
+            }),
+            "{checked:?}"
+        );
+
+        // The name appears above the root: no stored result revalidates, and a new observation bypasses.
+        fs::write(above.join(PROBE), "SETTING=1\n").unwrap();
+        assert!(revalidate(&root, &root, &initial).is_err());
+        capture_now(&root).expect_err("an existing name above the root stops the capture");
+        let bypass = path_selectors(&observed, &root, &root, &[]).unwrap_err();
+        assert_eq!(bypass.reason, "procedural_macro_read_outside_repository");
+        assert!(
+            bypass.detail.contains(&above.join(PROBE).display().to_string()),
+            "{}",
+            bypass.detail
+        );
+        fs::remove_file(above.join(PROBE)).unwrap();
+        revalidate(&root, &root, &initial).unwrap();
+
+        // Only the metadata of a directory above the root and a missing name in one bind. An existing sibling
+        // of the workspace is a host entry.
+        fs::create_dir(above.join("sibling")).unwrap();
+        for (path, access) in [
+            (above.clone(), NativeMacroPathAccess::Listing),
+            (above.clone(), NativeMacroPathAccess::Contents),
+            (above.join(PROBE), NativeMacroPathAccess::Listing),
+            (above.join("other").join(PROBE), NativeMacroPathAccess::Contents),
+            (above.join("sibling"), NativeMacroPathAccess::Entry),
+        ] {
+            let mut unbound = observation(&root, &[]);
+            unbound.paths.push(read(&path, access));
+            assert_eq!(
+                reasons(path_selectors(&unbound, &root, &root, &[])),
+                Err("procedural_macro_read_outside_repository"),
+                "{} {access:?}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_name_above_the_root_binds_every_directory_that_the_root_spelling_reaches() {
+        let (real, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let root = crate::utils::canonicalize_existing(real.path())
+            .unwrap()
+            .join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        let other = crate::utils::canonicalize_existing(other.path()).unwrap();
+        let spelling = other.join("link");
+        std::os::unix::fs::symlink(&root, &spelling).unwrap();
+        // The macro searches upward from the spelling that Cargo gave it.
+        let mut observed = observation(&root, &[]);
+        observed
+            .paths
+            .push(read(&other.join(PROBE), NativeMacroPathAccess::Contents));
+        assert_eq!(
+            reasons(path_selectors(&observed, &root, &spelling, &[])),
+            Ok(vec![above_root(PROBE)])
+        );
+        assert_eq!(
+            reasons(path_selectors(&observed, &root, &root, &[])),
+            Err("procedural_macro_read_outside_repository"),
+            "a directory that no root spelling reaches does not bind"
+        );
+        let capture_with = |spelling: &Path| {
+            capture(
+                &root,
+                spelling,
+                &[above_root(PROBE)],
+                Instant::now(),
+                &mut NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS),
+            )
+        };
+        let initial = capture_with(&spelling).unwrap();
+        fs::write(other.join(PROBE), "").unwrap();
+        capture_with(&spelling).expect_err("the spelling reaches the existing name");
+        assert!(revalidate(&root, &spelling, &initial).is_err());
+        assert_eq!(
+            capture_with(&root).unwrap(),
+            initial,
+            "the canonical root does not reach the spelling's parent"
+        );
+    }
+
+    #[test]
+    fn a_name_above_the_root_is_one_normal_component_with_an_absent_state() {
+        for invalid in [
+            MacroPathSelector {
+                listing: true,
+                ..above_root(PROBE)
+            },
+            MacroPathSelector {
+                cargo_query: Some(CargoQueryRoot::Repository),
+                ..above_root(PROBE)
+            },
+            above_root("nested/name"),
+            above_root(".."),
+            above_root("."),
+            above_root(""),
+        ] {
+            assert!(
+                validate_selectors(std::slice::from_ref(&invalid)).is_err(),
+                "{invalid:?}"
+            );
+        }
+        validate_selectors(&[selector(PROBE, false), above_root(PROBE)]).unwrap();
+        // Stored selectors from before this field bind repository paths.
+        let stored: MacroPathSelector = serde_json::from_str(r#"{"path":".env"}"#).unwrap();
+        assert!(!stored.above_root);
+        let present = MacroPathInput {
+            path: PROBE.into(),
+            listing: false,
+            cargo_query: None,
+            above_root: true,
+            state: MacroPathState::Directory,
+        };
+        assert!(validate_inputs(&[present]).is_err());
     }
 }

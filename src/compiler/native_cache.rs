@@ -697,6 +697,12 @@ impl NativeDynamicInputSelector {
         Ok(selector)
     }
 
+    /// Whether remote storage can share results selected by these inputs. A procedural-macro name above the
+    /// workspace root binds directories outside the repository, so its results stay in the local cache.
+    pub(crate) fn shares_remotely(&self) -> bool {
+        !self.macro_paths.iter().any(|path| path.above_root)
+    }
+
     pub(crate) fn validate(&self) -> RailResult<()> {
         if self.version != 4 {
             return Err(RailError::message(
@@ -1295,6 +1301,8 @@ pub(crate) struct NativeInputFailure {
 const SOURCE_NAMESPACE_ENTRY_UNSUPPORTED: &str = "source_namespace_entry_unsupported";
 const GENERATED_NAMESPACE_ENTRY_UNSUPPORTED: &str = "generated_namespace_entry_unsupported";
 const ACTION_CAPTURE_BOUND_EXCEEDED: &str = "action_capture_bound_exceeded";
+/// Remote storage neither publishes nor restores a result that binds a procedural-macro name above the root.
+const REMOTE_MACRO_INPUT_ABOVE_WORKSPACE: &str = "remote_macro_input_above_workspace";
 
 impl NativeInputFailure {
     pub(crate) fn new(reason: &'static str, error: RailError) -> Self {
@@ -1696,7 +1704,13 @@ impl NativeActionCapture {
         selectors: &[macro_inputs::MacroPathSelector],
     ) -> RailResult<()> {
         let mut budget = NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS);
-        let inputs = macro_inputs::capture(workspace_root, selectors, Instant::now(), &mut budget)?;
+        let inputs = macro_inputs::capture(
+            workspace_root,
+            &self.source_root_spelling,
+            selectors,
+            Instant::now(),
+            &mut budget,
+        )?;
         self.bytes_hashed = self.bytes_hashed.saturating_add(budget.bytes_hashed);
         self.macro_inputs = inputs;
         Ok(())
@@ -2202,7 +2216,7 @@ impl NativeActionCapture {
         if let Some(clippy) = &self.clippy {
             clippy.revalidate(&mut NativeCaptureBudget::new(NATIVE_CAPTURE_LIMITS))?;
         }
-        macro_inputs::revalidate(workspace_root, &self.macro_inputs)?;
+        macro_inputs::revalidate(workspace_root, workspace_root_spelling, &self.macro_inputs)?;
 
         let environment_names = self
             .approved_environment
@@ -9625,7 +9639,9 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
                     body,
                     bytes,
                     compressed_bytes,
-                }) if selection.approves_environment_names(&selector.environment_names) => {
+                }) if selection.approves_environment_names(&selector.environment_names)
+                    && selector.shares_remotely() =>
+                {
                     match cas.publish_native_environment_selector(&base_action, &selector) {
                         Ok(crate::cache::cas::NativeEnvironmentSelectorPublication::Created)
                         | Ok(crate::cache::cas::NativeEnvironmentSelectorPublication::Converged) => {
@@ -9643,6 +9659,9 @@ pub(crate) fn configure_outer(program: &OsStr, arguments: &[OsString], command: 
                             selector_miss_reason = "remote_environment_selector_admission_failed";
                         }
                     }
+                }
+                Ok(crate::remote_cache::RemoteLookup::Unique { selector, .. }) if !selector.shares_remotely() => {
+                    selector_miss_reason = REMOTE_MACRO_INPUT_ABOVE_WORKSPACE;
                 }
                 Ok(crate::remote_cache::RemoteLookup::Unique { .. }) => {
                     selector_miss_reason = "remote_environment_not_shareable";
@@ -10654,6 +10673,9 @@ fn attempt_direct_remote_reuse(request: DirectRemoteReuseRequest<'_>) -> DirectR
         output_paths,
         metrics,
     } = request;
+    if !selector.shares_remotely() {
+        return DirectRemoteReuse::Cold(REMOTE_MACRO_INPUT_ABOVE_WORKSPACE);
+    }
     let lookup = match remote_entry {
         Some(entry) => Ok(entry),
         None => {
@@ -16757,6 +16779,7 @@ fn publish_direct_remote_result(
         }
     };
     let selector = match cached.validate_remote_publication(base_action_key) {
+        Ok(selector) if !selector.shares_remotely() => return Some(REMOTE_MACRO_INPUT_ABOVE_WORKSPACE),
         Ok(selector) if selection.approves_environment_names(&selector.environment_names) => selector,
         Ok(_) | Err(_) => return Some("remote_environment_not_shareable"),
     };
@@ -17195,22 +17218,16 @@ pub(crate) fn run_and_store(mut command: Command, store: OuterCacheStore, contex
         let captured = std::iter::once(capture.source_root.as_path())
             .chain(generated)
             .collect::<Vec<_>>();
-        let selected = match macro_inputs::bypass_reason(macros) {
-            Some(reason) => {
-                note_outcome_detail(macro_inputs::bypass_detail(macros));
-                Err(reason)
-            }
-            None => macro_inputs::path_selectors(macros, source_root, source_root_spelling, &captured),
-        };
-        match selected {
+        match macro_inputs::select(macros, source_root, source_root_spelling, &captured) {
             Ok(selected) => {
                 raw.environment_reads.extend(macro_inputs::environment_reads(macros));
                 macro_paths = selected;
             }
-            Err(reason) => {
+            Err(bypass) => {
+                note_outcome_detail(bypass.detail);
                 drop(publish_and_record_cold_observation(
                     &mut raw,
-                    reason,
+                    bypass.reason,
                     None,
                     capture.bytes_hashed,
                     cache_bytes_read,
@@ -21548,6 +21565,30 @@ pub(crate) mod tests {
         missing_observation_name
             .validate_object()
             .expect_err("the observation cannot omit an authoritative environment name");
+    }
+
+    #[test]
+    fn selectors_with_a_macro_name_above_the_root_stay_out_of_remote_storage() {
+        let mut selector = NativeDynamicInputSelector::new(Vec::new(), Vec::new()).expect("empty selector");
+        selector.macro_paths = vec![macro_inputs::MacroPathSelector {
+            path: ".env".into(),
+            listing: false,
+            cargo_query: None,
+            above_root: false,
+        }];
+        selector.validate().expect("repository selector");
+        assert!(
+            selector.shares_remotely(),
+            "a repository path shares through remote storage"
+        );
+        selector.macro_paths[0].above_root = true;
+        selector.validate().expect("above-root selector");
+        assert!(!selector.shares_remotely(), "a name above the root stays local");
+        // The local store keeps the field, so a later lookup recaptures the same absence.
+        let stored = serde_json::to_vec(&selector).expect("selector JSON");
+        let restored = serde_json::from_slice::<NativeDynamicInputSelector>(&stored).expect("stored selector");
+        assert_eq!(restored, selector);
+        assert!(!restored.shares_remotely());
     }
 
     #[test]

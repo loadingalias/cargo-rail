@@ -279,12 +279,16 @@ A Clippy action binds its rustc-equivalent action and every input that Clippy ad
   - `RUSTC` and `RUSTUP_TOOLCHAIN`;
   - each `.cargo/config.toml` and `.cargo/config` that Cargo reads, including those in the Cargo home;
   - the workspace manifests and every path dependency that they reach;
-  - `Cargo.lock`.
+  - `Cargo.lock`;
+  - for each package, whether `README.md`, `README.txt`, and `README` are regular files.
+    `cargo metadata` reports the first one as the README of a package without a `readme` key, and `clippy::cargo_common_metadata` reads that name.
+    The contents of a README are not bound.
 
 A source attribute can enable a `clippy::cargo` lint.
 Thus, every Clippy action binds the Cargo inputs.
 A change to a workspace manifest, the lockfile,
 or Cargo configuration therefore causes a miss for every Clippy result in that workspace.
+A new or removed default README has the same effect.
 `CLIPPY_TERMINAL_WIDTH` is not bound.
 Clippy uses it only to lay out configuration errors, and Cargo-Rail never stores a failed result.
 
@@ -352,6 +356,17 @@ The action then binds each observed read:
   Examples are the sources of the crate and the output of its build script.
 - `proc-macro-crate` runs `cargo locate-project` to find the workspace.
   That query binds the Cargo inputs that answer it.
+- An upward search above the workspace root binds the absence of the searched name in every
+  directory above the root.
+  For example, `sqlx` 0.9 looks for a `.env` file in each directory up to the file-system root.
+  Cargo-Rail checks each directory that the canonical root and the root spelling of Cargo reach.
+  If a file with that name exists above the root, the unit runs on the ordinary compiler path.
+  Directories outside the repository decide this absence.
+  Thus, remote storage neither publishes nor restores such a result (`remote_macro_input_above_workspace`).
+  The check after the compiler exits leaves out these directories,
+  as it does for the directories where Cargo looks for configuration.
+  Other processes change such directories at any time.
+  Each capture and each restore still checks the absence.
 
 Thus, a hit is stricter than Cargo freshness.
 Cargo freshness does not detect a macro read that no build script declares.
@@ -360,7 +375,7 @@ These units run without reuse:
 
 | Reason                                     | Condition |
 | ------------------------------------------ | --------- |
-| `procedural_macro_read_outside_repository` | The macro reads a path outside the repository and outside the captured namespaces |
+| `procedural_macro_read_outside_repository` | The macro reads a path outside the repository and outside the captured namespaces, other than a missing name in a directory above the workspace root |
 | `procedural_macro_read_through_symlink`    | The macro reads a repository path through a symbolic link |
 | `procedural_macro_process_unmodeled`       | The macro starts a process other than a modeled `cargo locate-project` query |
 | `procedural_macro_process_control`         | The macro forks, replaces its process, changes its user, group, or session, or starts a process with a changed environment, directory, or descriptors |
@@ -380,6 +395,11 @@ These units run without reuse:
 | `procedural_macro_path_unavailable`        | A path that the macro used cannot be resolved to a stable name |
 | `procedural_macro_observation_limit`       | The macro reads more paths or variables than an action binds |
 | `procedural_macro_observation_unavailable` | The platform cannot observe macros, as the host list below describes |
+
+A unit reports one reason.
+An effect comes first, then a secret-named variable, then a process, and then a read.
+The [cache report](#aggregate-cache-measurements) example names every effect, process, and read that stops the unit.
+Thus, one cold build shows every condition that the unit must clear.
 
 Linking a function is not calling it.
 A macro library often links code that expansion never runs.
@@ -914,6 +934,8 @@ The recording contains bounded aggregate counters and reason counts.
 In `details`, the finished interval also names one example for each of the first eight bypass reasons.
 An example can be the source entry, native-library candidate, macro import,
 or session or admission error that caused the reason.
+For a unit that loads procedural macros, the example names every effect, process,
+and read that stops the unit, not only the condition that the reason names.
 Examples can name host paths.
 Examples never enter the measurements, a cache key, or restore authority.
 Text output lists each bypass reason with its example.
