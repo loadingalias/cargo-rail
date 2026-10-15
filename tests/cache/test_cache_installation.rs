@@ -2057,8 +2057,13 @@ fn elf_linker_reuse(linker_name: &str, default_gcc: bool) {
                     "{phase}"
                 );
             }
-            let executed = Command::new("python3")
+            // uv supplies the repository's pinned Python; hosts need not install one.
+            let executed = Command::new("uv")
                 .args([
+                    "run",
+                    "--quiet",
+                    "--locked",
+                    "python",
                     "-c",
                     "import ctypes, sys; print(ctypes.CDLL(sys.argv[1]).cache_linker_value())",
                 ])

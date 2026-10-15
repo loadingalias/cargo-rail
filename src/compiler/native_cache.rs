@@ -24415,8 +24415,13 @@ pub(crate) mod tests {
                 Ok(())
             };
             let execute = |expected: u32| -> RailResult<()> {
-                let output = Command::new("python3")
+                // uv supplies the repository's pinned Python; hosts need not install one.
+                let output = Command::new("uv")
                     .args([
+                        "run",
+                        "--quiet",
+                        "--locked",
+                        "python",
                         "-c",
                         "import ctypes, sys; print(ctypes.CDLL(sys.argv[1]).observed_value())",
                     ])
