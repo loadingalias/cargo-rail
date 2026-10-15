@@ -1837,7 +1837,7 @@ fn elf_linker_reuse(linker_name: &str, default_gcc: bool) {
                 ("ld.bfd", "-print-prog-name=ld.bfd", true),
                 ("liblto_plugin.so", "-print-file-name=liblto_plugin.so", true),
                 ("lto-wrapper", "-print-prog-name=lto-wrapper", false),
-                ("crtbeginS.o", "-print-file-name=crtbeginS.o", false),
+                ("crtbeginS.o", "-print-file-name=crtbeginS.o", true),
                 ("crtendS.o", "-print-file-name=crtendS.o", false),
             ] {
                 let selection = query(query_argument)?;
@@ -7981,6 +7981,105 @@ fn one_member_archive(contents: &[u8; 3]) -> Vec<u8> {
     // Members start at even offsets.
     archive.push(b'\n');
     archive
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[test]
+fn native_search_directory_containing_gcc_startup_objects_reuses_linked_outputs() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let result: Result<()> = (|| {
+        let workspace = TestWorkspace::new_single_crate("native-startup", "0.1.0")?;
+        let cargo_home = tempfile::tempdir()?;
+        let startup = Command::new("gcc").arg("-print-file-name=Scrt1.o").output()?;
+        anyhow::ensure!(startup.status.success(), "GCC startup prerequisite: {startup:?}");
+        let startup = fs::canonicalize(String::from_utf8(startup.stdout)?.trim())?;
+        let native = startup.parent().context("GCC startup directory")?;
+        fs::remove_file(workspace.path.join("src/lib.rs"))?;
+        fs::write(
+            workspace.path.join("src/main.rs"),
+            "fn main() { println!(\"startup input\"); }\n",
+        )?;
+        fs::write(
+            workspace.path.join("build.rs"),
+            format!(
+                "fn main() {{ println!(\"cargo::rustc-link-search=native={}\"); }}\n",
+                native.display()
+            ),
+        )?;
+        fs::create_dir(workspace.path.join(".cargo"))?;
+        fs::write(
+            workspace.path.join(".cargo/config.toml"),
+            "[build]\nrustflags = [\"-Clinker=gcc\", \"-Clinker-flavor=gcc\", \"-Clink-arg=-fuse-ld=bfd\"]\n",
+        )?;
+        let target = workspace.path.join("target");
+        let build = |coverage: &Path| -> Result<Output> {
+            Ok(Command::new("cargo")
+                .current_dir(&workspace.path)
+                .args(["build", "--offline", "--quiet"])
+                .env("CARGO_HOME", cargo_home.path())
+                .env("CARGO_TARGET_DIR", &target)
+                .env("CARGO_INCREMENTAL", "0")
+                .env("CARGO_RAIL_CACHE", "__cargo_rail_benchmark_coverage_v1")
+                .env("CARGO_RAIL_BENCH_NATIVE_COVERAGE_DIRECTORY", coverage)
+                .env_remove("CARGO_BUILD_TARGET")
+                .env_remove("RUSTC_WRAPPER")
+                .env_remove("RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WRAPPER")
+                .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
+                .env_remove("RUSTFLAGS")
+                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+                .env_remove("CARGO_RAIL_CACHE_REMOTE")
+                .env_remove("CARGO_RAIL_CACHE_MODE")
+                .env_remove("CARGO_RAIL_CACHE_REMOTE_ENVIRONMENT")
+                .env_remove("CARGO_RAIL_CACHE_REPORT")
+                .output()?)
+        };
+        let baseline_coverage = tempfile::tempdir()?;
+        let baseline = build(baseline_coverage.path())?;
+        anyhow::ensure!(baseline.status.success(), "ordinary GCC build: {baseline:?}");
+        let executable = target.join("debug/native-startup");
+        let expected = fs::read(&executable)?;
+        let setup = rail(&workspace.path, cargo_home.path(), &["rail", "cache", "setup"])?;
+        anyhow::ensure!(setup.status.success(), "cache setup: {setup:?}");
+        for (phase, status) in [("cold", "miss"), ("warm", "hit")] {
+            fs::remove_dir_all(&target)?;
+            let coverage = tempfile::tempdir()?;
+            fs::set_permissions(coverage.path(), fs::Permissions::from_mode(0o700))?;
+            let output = build(coverage.path())?;
+            anyhow::ensure!(output.status.success(), "{phase} GCC build: {output:?}");
+            let events = coverage_events(coverage.path())?;
+            let outcomes = events
+                .iter()
+                .map(|event| (&event["action"]["crate_name"], &event["status"], &event["reason"]))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["reason"] == "native_library_search_unreported")
+                    .count(),
+                0,
+                "{phase}: {outcomes:?}"
+            );
+            let linked = events
+                .iter()
+                .filter(|event| {
+                    event["action"]["crate_name"] == "native_startup" && event["action"]["action_class"] == "binary"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(linked.len(), 1, "{phase}: {outcomes:?}");
+            assert_eq!(linked[0]["status"], status, "{phase}: {outcomes:?}");
+            assert_eq!(output.stdout, baseline.stdout, "{phase}");
+            assert_eq!(output.stderr, baseline.stderr, "{phase}");
+            assert_eq!(fs::read(&executable)?, expected, "{phase} linked bytes");
+            let executed = Command::new(&executable).output()?;
+            assert!(executed.status.success(), "{phase}: {executed:?}");
+            assert_eq!(executed.stdout, b"startup input\n", "{phase}");
+            assert!(executed.stderr.is_empty(), "{phase}: {executed:?}");
+        }
+        Ok(())
+    })();
+    crate::helpers::finish_test(result);
 }
 
 /// GH18: a build script's `rustc-link-search` directory reaches every dependent. Each dependent binds only

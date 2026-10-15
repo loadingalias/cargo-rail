@@ -867,6 +867,84 @@ mod tests {
         assert_ne!(elf, descriptor.result_key().expect("COFF result identity"));
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn elf_descriptor_fits_at_linker_count_and_encoded_path_bounds() {
+        use super::super::{
+            LinkerWitness, MAX_FILE_LINK_PATH_BYTES, MAX_LINK_FOUND_FILES, MAX_LINK_MISSING_PATHS,
+            validate_file_linker_witness,
+        };
+
+        let mut witness = super::super::tests::ElfWitnessFixture::new()
+            .capture()
+            .expect("file witness");
+        for index in witness.found.len()..MAX_LINK_FOUND_FILES - 2 {
+            let mut file = witness.driver.clone();
+            file.path = format!("/found/{index:05}");
+            file.canonical_path = file.path.clone();
+            file.bytes = u64::MAX;
+            file.mode = 0o777;
+            witness.found.push(file);
+        }
+        witness.found.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        witness.missing = (0..MAX_LINK_MISSING_PATHS)
+            .map(|index| format!("/missing/{index:05}"))
+            .collect();
+        // Count with the actual encoder, independently of the witness's conservative budget.
+        let path_bytes = std::iter::once(witness.driver_selection.as_str())
+            .chain(
+                [&witness.driver, &witness.linker]
+                    .into_iter()
+                    .chain(&witness.found)
+                    .flat_map(|file| [file.path.as_str(), file.canonical_path.as_str()]),
+            )
+            .chain(witness.missing.iter().map(String::as_str))
+            .map(|path| serde_json::to_vec(path).expect("encoded path").len() - 2)
+            .sum::<usize>();
+        let remaining = MAX_FILE_LINK_PATH_BYTES - path_bytes;
+        let last = witness.missing.last_mut().expect("missing path");
+        last.push_str(&"\u{1}".repeat(remaining / 6));
+        last.push_str(&"x".repeat(remaining % 6));
+        validate_file_linker_witness(&witness).expect("maximum admitted witness");
+
+        let validation = super::super::tests::cas_validation_with_stdout(b"");
+        let mut descriptor = descriptor_from_validation(&validation).expect("result descriptor");
+        descriptor.witness.target_format = crate::compiler::collector::NativeTargetFormat::Elf;
+        descriptor.witness.linker = Some(LinkerWitness::Elf(witness.clone()));
+        let bytes = descriptor
+            .encode()
+            .expect("maximum linker witness fits the stored descriptor");
+        assert!(bytes.len() <= MAX_DESCRIPTOR_BYTES);
+        assert!(
+            bytes.len() > MAX_FILE_LINK_PATH_BYTES,
+            "the descriptor includes more than paths"
+        );
+
+        let mut too_many_found = witness.clone();
+        too_many_found.found.push(witness.driver.clone());
+        assert_eq!(
+            validate_file_linker_witness(&too_many_found)
+                .expect_err("found bound")
+                .to_string(),
+            "ELF linker witness exceeds its input bound"
+        );
+        let mut too_many_missing = witness.clone();
+        too_many_missing.missing.push("/extra".to_string());
+        assert_eq!(
+            validate_file_linker_witness(&too_many_missing)
+                .expect_err("missing bound")
+                .to_string(),
+            "ELF linker witness exceeds its input bound"
+        );
+        witness.missing.last_mut().expect("missing path").push('x');
+        assert_eq!(
+            validate_file_linker_witness(&witness)
+                .expect_err("encoded path bound")
+                .to_string(),
+            "ELF linker witness exceeds its bounds"
+        );
+    }
+
     #[test]
     fn coff_descriptor_binds_auxiliary_outputs_in_one_ordered_contract() {
         let validation = super::super::tests::cas_validation_with_stdout(b"");

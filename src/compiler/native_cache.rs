@@ -38,6 +38,7 @@ use crate::source::ContentDigest;
 mod cargo_inputs;
 mod clippy;
 pub(crate) mod coff;
+mod elf_search;
 pub(crate) mod macro_inputs;
 pub(crate) mod native_libraries;
 pub(crate) mod pack;
@@ -108,6 +109,10 @@ const MAX_COMPILER_ENVIRONMENT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_APPLE_LINK_CERTIFICATE_LEN: usize = 8 * 1024 * 1024;
 const MAX_LINK_INPUTS: usize = 16 * 1024;
 const MAX_LINK_PATH_BYTES: usize = 16 * 1024 * 1024;
+const MAX_LINK_FOUND_FILES: usize = 16 * 1024;
+const MAX_LINK_MISSING_PATHS: usize = 16 * 1024;
+// Encoded paths leave room for per-file metadata and the rest of the 8 MiB result descriptor.
+const MAX_FILE_LINK_PATH_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LINK_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ELF_LINK_DEPENDENCY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LINK_RESPONSE_FILES: usize = 64;
@@ -917,6 +922,7 @@ struct ElfLinkDriverEvidence {
     default_search_guards: BTreeMap<String, String>,
     library_names: Vec<String>,
     direct_inputs: Vec<String>,
+    compiler_inputs: Vec<String>,
     response_files: Vec<LinkResponseFileWitness>,
     expanded_arguments: Vec<String>,
     execution: Option<LinkDriverExecution>,
@@ -2821,21 +2827,20 @@ fn validate_apple_linker_generations(
 }
 
 fn validate_file_linker_witness(witness: &FileLinkerWitness) -> RailResult<()> {
+    validate_file_linker_counts(witness.found.len(), witness.missing.len())?;
     validate_link_driver_probe(&witness.driver_probe)?;
     validate_link_runtime_files(&witness.driver_probe, &witness.driver, &witness.linker, &witness.found)?;
     if witness.version != 3
         || witness.driver_selection.is_empty()
         || witness.driver_selection.len() > MAX_DYNAMIC_REPOSITORY_PATH_BYTES
         || witness.driver_selection.as_bytes().contains(&0)
-        || witness.found.len() > MAX_LINK_INPUTS
-        || witness.missing.len() > MAX_LINK_INPUTS
         || witness.endogenous_objects == 0
         || !strictly_sorted_unique_strings(&witness.missing)
         || !strictly_sorted_unique_strings(&witness.dependency_archives)
     {
         return Err(RailError::message("ELF linker witness is invalid"));
     }
-    let mut path_bytes = 0usize;
+    let mut path_bytes = link_path_encoded_bytes(&witness.driver_selection);
     let mut previous = None::<&str>;
     for file in std::iter::once(&witness.driver)
         .chain(std::iter::once(&witness.linker))
@@ -2843,8 +2848,8 @@ fn validate_file_linker_witness(witness: &FileLinkerWitness) -> RailResult<()> {
     {
         validate_link_file(file)?;
         path_bytes = path_bytes
-            .saturating_add(file.path.len())
-            .saturating_add(file.canonical_path.len());
+            .saturating_add(link_path_encoded_bytes(&file.path))
+            .saturating_add(link_path_encoded_bytes(&file.canonical_path));
     }
     for file in &witness.found {
         if previous.is_some_and(|previous| previous >= file.path.as_str()) {
@@ -2860,9 +2865,9 @@ fn validate_file_linker_witness(witness: &FileLinkerWitness) -> RailResult<()> {
                 "ELF linker witness contains an invalid missing path",
             ));
         }
-        path_bytes = path_bytes.saturating_add(path.len());
+        path_bytes = path_bytes.saturating_add(link_path_encoded_bytes(path));
     }
-    if path_bytes > MAX_LINK_PATH_BYTES
+    if path_bytes > MAX_FILE_LINK_PATH_BYTES
         || witness
             .dependency_archives
             .iter()
@@ -2871,6 +2876,23 @@ fn validate_file_linker_witness(witness: &FileLinkerWitness) -> RailResult<()> {
         return Err(RailError::message("ELF linker witness exceeds its bounds"));
     }
     Ok(())
+}
+
+fn validate_file_linker_counts(found: usize, missing: usize) -> RailResult<()> {
+    if found.saturating_add(2) > MAX_LINK_FOUND_FILES || missing > MAX_LINK_MISSING_PATHS {
+        return Err(RailError::message("ELF linker witness exceeds its input bound"));
+    }
+    Ok(())
+}
+
+fn link_path_encoded_bytes(path: &str) -> usize {
+    path.bytes()
+        .map(|byte| match byte {
+            b'"' | b'\\' => 2,
+            0..=0x1f => 6,
+            _ => 1,
+        })
+        .sum()
 }
 
 fn validate_link_file(file: &LinkFileWitness) -> RailResult<()> {
@@ -3537,6 +3559,11 @@ fn capture_elf_linker_witness(
     let mut found_paths = BTreeSet::new();
     let mut dependency_archives = BTreeSet::new();
     let mut endogenous_objects = 0u32;
+    let mut selected_names = evidence.library_names.iter().cloned().collect::<BTreeSet<_>>();
+    let mut direct_names = BTreeSet::new();
+    let mut scripts = Vec::new();
+    let mut search_metadata_bytes = MAX_LINK_BYTES;
+    let mut opaque_searches = false;
     for dependency in dependencies {
         let spelling = if dependency.is_absolute() {
             dependency
@@ -3576,11 +3603,36 @@ fn capture_elf_linker_witness(
         if canonical == linked_path {
             continue;
         }
+        if !direct_inputs.contains(&canonical) {
+            opaque_searches |= elf_search::implicit_names(&canonical, &mut selected_names, &mut search_metadata_bytes)?;
+        }
         if matches!(spelling.extension().and_then(OsStr::to_str), Some("rlib" | "a"))
             && let Some(dependency) = dependency_by_file.get(file_name)
         {
             dependency_archives.insert((*dependency).to_string());
             continue;
+        }
+        let mut header = Vec::with_capacity(20);
+        File::open(&canonical)?.take(20).read_to_end(&mut header)?;
+        let archive = header.starts_with(b"!<arch>\n") || header.starts_with(b"!<thin>\n");
+        let bitcode = header.starts_with(b"BC\xc0\xde") || header.starts_with(b"\xde\xc0\x17\x0b");
+        let elf = header.starts_with(b"\x7fELF");
+        let relocatable = elf
+            && matches!(
+                (header.get(5), header.get(16..18)),
+                (Some(1), Some([1, 0])) | (Some(2), Some([0, 1]))
+            );
+        if direct_inputs.contains(&canonical)
+            && canonical.file_name() == spelling.file_name()
+            && (archive || bitcode || relocatable)
+            && file_name.bytes().all(elf_search_name_byte)
+        {
+            direct_names.insert(file_name.to_string());
+        } else {
+            selected_names.insert(file_name.to_string());
+        }
+        if !archive && !bitcode && !elf {
+            scripts.push(spelling.clone());
         }
         found_paths.insert(spelling);
     }
@@ -3590,16 +3642,13 @@ fn capture_elf_linker_witness(
         ));
     }
 
-    // Positive linker dependency files do not record failed search attempts.
-    // Bind every same-name candidate in every selected driver/linker search
-    // directory and record every absence. Any later path-selection change then
-    // invalidates the witness before outputs can be restored.
-    let mut selected_names = found_paths
-        .iter()
-        .filter_map(|path| path.file_name().and_then(OsStr::to_str))
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>();
-    selected_names.extend(evidence.library_names.iter().cloned());
+    // A direct input can also be requested by a script or binary metadata.
+    // Omit only unrequested candidates; retain every positive file binding.
+    if opaque_searches {
+        selected_names.extend(direct_names);
+    } else {
+        elf_script_search_names(&scripts, &direct_names, &mut selected_names)?;
+    }
     for name in selected_names.clone() {
         if let Some(stem) = name.strip_suffix(".a").filter(|stem| stem.starts_with("lib")) {
             selected_names.insert(format!("{stem}.so"));
@@ -3629,7 +3678,7 @@ fn capture_elf_linker_witness(
                 }
                 Err(error) => return Err(error.into()),
             }
-            if found_paths.len().saturating_add(missing.len()) > MAX_LINK_INPUTS {
+            if found_paths.len() > MAX_LINK_FOUND_FILES || missing.len() > MAX_LINK_MISSING_PATHS {
                 return Err(RailError::message("ELF linker witness exceeds its input bound"));
             }
         }
@@ -3646,6 +3695,9 @@ fn capture_elf_linker_witness(
                 .map(|path| path.to_string_lossy().into_owned()),
         );
     }
+    found_paths.remove(Path::new(&evidence.driver));
+    found_paths.remove(Path::new(&evidence.linker));
+    validate_file_linker_counts(found_paths.len(), missing.len())?;
     let started = Instant::now();
     let mut budget = NativeCaptureBudget::new(LINK_CAPTURE_LIMITS);
     let mut files = LinkFileCapture::default();
@@ -3673,8 +3725,6 @@ fn capture_elf_linker_witness(
     }
     let (driver, driver_generation) = capture_elf_file(&driver_path, &mut budget)?;
     let (linker, linker_generation) = capture_elf_file(Path::new(&evidence.linker), &mut budget)?;
-    found_paths.remove(Path::new(&evidence.driver));
-    found_paths.remove(Path::new(&evidence.linker));
     let found = found_paths
         .into_iter()
         .map(|path| capture_elf_file(&path, &mut budget))
@@ -3714,6 +3764,68 @@ fn capture_elf_linker_witness(
     Ok((witness, generations, budget.bytes_hashed))
 }
 
+fn elf_search_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+}
+
+fn elf_script_search_names(
+    scripts: &[PathBuf],
+    direct_names: &BTreeSet<String>,
+    selected_names: &mut BTreeSet<String>,
+) -> RailResult<()> {
+    if direct_names.is_empty() {
+        return Ok(());
+    }
+    let mut bytes = 0usize;
+    for script in scripts {
+        let remaining = MAX_ELF_LINK_DEPENDENCY_BYTES.saturating_sub(bytes);
+        let mut contents = Vec::new();
+        File::open(script)?
+            .take(remaining as u64 + 1)
+            .read_to_end(&mut contents)?;
+        if contents.len() > remaining {
+            return Err(RailError::message("ELF linker scripts exceed their byte bound"));
+        }
+        bytes = bytes.saturating_add(contents.len());
+        retain_elf_script_names(&contents, direct_names, selected_names);
+    }
+    Ok(())
+}
+
+fn retain_elf_script_names(contents: &[u8], direct_names: &BTreeSet<String>, selected_names: &mut BTreeSet<String>) {
+    // Simple names remain contiguous in script text, including quotes and
+    // comments. Escaping or opaque input prevents that proof, so retain all names.
+    let text = match std::str::from_utf8(contents) {
+        Ok(text) if !text.contains(['\\', '\0']) => text,
+        _ => {
+            selected_names.extend(direct_names.iter().cloned());
+            return;
+        }
+    };
+    let library_names = direct_names
+        .iter()
+        .filter_map(|name| name.strip_prefix("lib"))
+        .filter_map(|name| name.strip_suffix(".a").or_else(|| name.strip_suffix(".so")))
+        .collect::<BTreeSet<_>>();
+    for token in text
+        .split(|character: char| !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-' | '.'))
+        .filter(|token| !token.is_empty())
+    {
+        if direct_names.contains(token) {
+            selected_names.insert(token.to_string());
+        }
+        let name = token.strip_prefix("-l").unwrap_or(token);
+        if library_names.contains(name) {
+            for suffix in ["a", "so"] {
+                let candidate = format!("lib{name}.{suffix}");
+                if direct_names.contains(&candidate) {
+                    selected_names.insert(candidate);
+                }
+            }
+        }
+    }
+}
+
 fn read_elf_link_driver_evidence(path: &Path) -> RailResult<ElfLinkDriverEvidence> {
     let bytes = read_bounded(path, MAX_ELF_LINK_DEPENDENCY_BYTES)?;
     let evidence: ElfLinkDriverEvidence = serde_json::from_slice(&bytes)?;
@@ -3731,13 +3843,15 @@ fn read_elf_link_driver_evidence(path: &Path) -> RailResult<ElfLinkDriverEvidenc
         .len()
         .saturating_add(evidence.search_directories.len())
         .saturating_add(evidence.default_search_guards.len());
-    if evidence.version != 7
+    if evidence.version != 8
         || path_count > MAX_LINK_INPUTS
+        || evidence.compiler_inputs.len() > MAX_LINK_INPUTS
         || serde_json::to_vec(&evidence)? != bytes
         || !Path::new(&evidence.current_directory).is_absolute()
         || !Path::new(&evidence.driver).is_absolute()
         || !Path::new(&evidence.linker).is_absolute()
         || !strictly_sorted_unique_strings(&evidence.direct_inputs)
+        || !strictly_sorted_unique_strings(&evidence.compiler_inputs)
         || !strictly_sorted_unique_strings(&evidence.search_directories)
         || !strictly_sorted_unique_strings(&evidence.library_names)
         || evidence.library_names.len() > MAX_LINK_INPUTS
@@ -3749,6 +3863,7 @@ fn read_elf_link_driver_evidence(path: &Path) -> RailResult<ElfLinkDriverEvidenc
         || evidence
             .direct_inputs
             .iter()
+            .chain(&evidence.compiler_inputs)
             .chain(&evidence.search_directories)
             .any(|path| !Path::new(path).is_absolute() || path.as_bytes().contains(&0))
     {
@@ -4191,7 +4306,7 @@ fn verify_unchanged_since(
     Ok(())
 }
 
-/// The files that a linked action's linker received by path, as its evidence records them.
+/// The compiler-supplied file inputs whose native-library searches require attribution.
 fn linked_direct_inputs(
     observation: &RawCompilerInvocation,
     target_format: NativeTargetFormat,
@@ -4203,7 +4318,7 @@ fn linked_direct_inputs(
     let inputs = if apple_linked_observation(observation, target_format) {
         read_apple_link_driver_evidence(&observation_directory.join(APPLE_LINK_DRIVER_INPUTS_FILE))?.direct_inputs
     } else if elf_linked_observation(observation, target_format) {
-        read_elf_link_driver_evidence(&observation_directory.join(ELF_LINK_DRIVER_INPUTS_FILE))?.direct_inputs
+        read_elf_link_driver_evidence(&observation_directory.join(ELF_LINK_DRIVER_INPUTS_FILE))?.compiler_inputs
     } else if target_format == NativeTargetFormat::Coff {
         return coff::direct_inputs(&observation_directory.join(coff::EVIDENCE_FILE));
     } else {
@@ -4212,8 +4327,8 @@ fn linked_direct_inputs(
     Ok(inputs.into_iter().map(PathBuf::from).collect())
 }
 
-/// Fail when the linker received a file by path from a native search directory that no bound native-library
-/// search selected.
+/// Fail when rustc passed a file by path from a native search directory that no bound native-library search
+/// selected.
 ///
 /// Rustc names some libraries to the linker by path after it searches the native search directories itself,
 /// and the compiler driver reports each such search. A file from those directories that no reported search
@@ -4488,7 +4603,7 @@ const NATIVE_CAPTURE_LIMITS: NativeCaptureLimits = NativeCaptureLimits {
 // namespace. Bound its work by files, path bytes and content bytes; a source
 // discovery deadline would reject complete evidence on slower native hosts.
 const LINK_CAPTURE_LIMITS: NativeCaptureLimits = NativeCaptureLimits {
-    entries: MAX_LINK_INPUTS,
+    entries: MAX_LINK_FOUND_FILES,
     depth: MAX_LINK_RESPONSE_DEPTH,
     path_bytes: MAX_LINK_PATH_BYTES,
     bytes_hashed: MAX_LINK_BYTES,
@@ -16015,6 +16130,7 @@ pub(crate) fn configure_elf_link_adapter(command: &mut Command, arguments: &[OsS
 fn capture_elf_link_driver_evidence(driver: &Path, arguments: &[OsString]) -> RailResult<ElfLinkDriverEvidence> {
     let current_directory = crate::utils::canonicalize_existing(&std::env::current_dir()?)?;
     let driver = crate::executable::resolve_executable_selection(driver.as_os_str(), &current_directory)?;
+    let compiler_inputs = direct_link_file_inputs(arguments, &current_directory)?;
     let execution = if native_clang_driver(&driver, &current_directory) {
         let arguments = arguments
             .iter()
@@ -16059,20 +16175,11 @@ fn capture_elf_link_driver_evidence(driver: &Path, arguments: &[OsString]) -> Ra
         .map(OsString::from)
         .collect::<Vec<_>>();
     let arguments = actual_linker_arguments.as_slice();
-    let mut direct_inputs = BTreeSet::new();
+    let direct_inputs = direct_link_file_inputs(arguments, &current_directory)?;
     let mut search_directories = BTreeSet::new();
     let mut index = 0usize;
     while index < arguments.len() {
         let argument = &arguments[index];
-        let path = Path::new(argument);
-        let absolute = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            current_directory.join(path)
-        };
-        if fs::metadata(&absolute).is_ok_and(|metadata| metadata.is_file()) {
-            direct_inputs.insert(crate::utils::canonicalize_existing(&absolute)?);
-        }
         let mut library = None::<&OsStr>;
         if argument == "-L" {
             library = arguments.get(index + 1).map(OsString::as_os_str);
@@ -16099,6 +16206,19 @@ fn capture_elf_link_driver_evidence(driver: &Path, arguments: &[OsString]) -> Ra
     }
 
     let mut default_search_guards = BTreeMap::new();
+    let mut library_names = elf_link_library_names(arguments)?.into_iter().collect::<BTreeSet<_>>();
+    let direct_names = direct_inputs
+        .iter()
+        .filter_map(|path| path.file_name().and_then(OsStr::to_str))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let mut search_metadata_bytes = MAX_LINK_BYTES;
+    for path in &direct_inputs {
+        if elf_search::implicit_names(path, &mut library_names, &mut search_metadata_bytes)? {
+            library_names.extend(direct_names.iter().cloned());
+            break;
+        }
+    }
     let gcc_search = if execution.probe.runtimes.len() == 3
         && native_gcc_driver(&driver, &current_directory)
         && run_link_driver_probe(&linker, &["--version".to_string()], &current_directory)?
@@ -16128,6 +16248,7 @@ fn capture_elf_link_driver_evidence(driver: &Path, arguments: &[OsString]) -> Ra
             .ok_or_else(|| RailError::message("BFD default search has no sysroot selector"))?;
         let script =
             std::str::from_utf8(&output.stdout).map_err(|_| RailError::message("BFD default script is not UTF-8"))?;
+        retain_elf_script_names(script.as_bytes(), &direct_names, &mut library_names);
         let mut default_directories = BTreeSet::new();
         for directory in elf_linker_script_search_directories(script) {
             default_directories.insert(resolve_elf_search_directory(
@@ -16181,7 +16302,7 @@ fn capture_elf_link_driver_evidence(driver: &Path, arguments: &[OsString]) -> Ra
         Ok(paths)
     };
     let evidence = ElfLinkDriverEvidence {
-        version: 7,
+        version: 8,
         completed: false,
         current_directory: current_directory
             .into_os_string()
@@ -16197,8 +16318,9 @@ fn capture_elf_link_driver_evidence(driver: &Path, arguments: &[OsString]) -> Ra
             .map_err(|_| RailError::message("ELF linker path is not valid UTF-8"))?,
         search_directories: to_strings(search_directories)?,
         default_search_guards,
-        library_names: elf_link_library_names(arguments)?,
+        library_names: library_names.into_iter().collect(),
         direct_inputs: to_strings(direct_inputs)?,
+        compiler_inputs: to_strings(compiler_inputs)?,
         response_files: Vec::new(),
         expanded_arguments: arguments
             .iter()
@@ -16210,6 +16332,17 @@ fn capture_elf_link_driver_evidence(driver: &Path, arguments: &[OsString]) -> Ra
         return Err(RailError::message("ELF linker driver exposed no direct file inputs"));
     }
     Ok(evidence)
+}
+
+fn direct_link_file_inputs(arguments: &[OsString], current_directory: &Path) -> RailResult<BTreeSet<PathBuf>> {
+    let mut inputs = BTreeSet::new();
+    for argument in arguments {
+        let absolute = current_directory.join(argument);
+        if fs::metadata(&absolute).is_ok_and(|metadata| metadata.is_file()) {
+            inputs.insert(crate::utils::canonicalize_existing(&absolute)?);
+        }
+    }
+    Ok(inputs)
 }
 
 fn capture_elf_default_search_guards(
@@ -23726,7 +23859,8 @@ pub(crate) mod tests {
         let handoff = driver_inputs.with_extension("rsp");
         let unrelated = root_path.join("keep.txt");
         let evidence = ElfLinkDriverEvidence {
-            version: 7,
+            version: 8,
+            compiler_inputs: Vec::new(),
             completed: false,
             current_directory: root_path.to_string_lossy().into_owned(),
             driver: root_path.join("driver").to_string_lossy().into_owned(),
@@ -24251,6 +24385,18 @@ pub(crate) mod tests {
                 evidence.direct_inputs.contains(&startup.to_string_lossy().into_owned()),
                 "GCC startup object is an input"
             );
+            fs::write(
+                directory.join(ELF_LINK_DRIVER_INPUTS_FILE),
+                serde_json::to_vec(&evidence)?,
+            )?;
+            let mut observation = graduated_observation();
+            observation.crate_types = BTreeSet::from(["bin".to_string()]);
+            observation.emit_modes = BTreeSet::from(["dep-info".to_string(), "link".to_string()]);
+            assert_eq!(
+                linked_direct_inputs(&observation, NativeTargetFormat::Elf, &directory)?,
+                vec![object],
+                "native-library attribution must inspect only the compiler's file arguments"
+            );
             let execution = evidence.execution.expect("complete GCC execution");
             assert_eq!(execution.probe.runtimes.len(), 3);
             assert!(
@@ -24541,6 +24687,291 @@ pub(crate) mod tests {
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(super) struct ElfWitnessFixture {
+        _root: tempfile::TempDir,
+        directory: PathBuf,
+        outputs: NativeOutputPaths,
+        evidence: ElfLinkDriverEvidence,
+        inputs: Vec<PathBuf>,
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    impl ElfWitnessFixture {
+        pub(super) fn new() -> Self {
+            let root = tempfile::tempdir().expect("ELF fixture");
+            let directory = crate::utils::canonicalize_existing(root.path()).expect("fixture directory");
+            let output = directory.join("fixture-bin");
+            let object = directory.join("fixture.fixture.rcgu.o");
+            fs::write(&output, b"linked output").expect("output");
+            fs::write(&object, b"rustc object").expect("object");
+            let driver =
+                crate::executable::resolve_executable_selection(OsStr::new("ld"), &directory).expect("system linker");
+            let execution = capture_direct_link_driver(&driver, &[], &directory).expect("linker runtime");
+            Self {
+                _root: root,
+                outputs: NativeOutputPaths {
+                    dep_info: directory.join("fixture-bin.d"),
+                    artifacts: vec![crate::compiler::observation::NativeOutputArtifact {
+                        role: NativeOutputRole::Executable,
+                        path: output,
+                    }],
+                    debug_object_prefix: None,
+                },
+                evidence: ElfLinkDriverEvidence {
+                    version: 8,
+                    compiler_inputs: Vec::new(),
+                    completed: true,
+                    current_directory: directory.to_string_lossy().into_owned(),
+                    driver: driver.to_string_lossy().into_owned(),
+                    linker: driver.to_string_lossy().into_owned(),
+                    direct_inputs: vec![object.to_string_lossy().into_owned()],
+                    search_directories: Vec::new(),
+                    default_search_guards: BTreeMap::new(),
+                    library_names: Vec::new(),
+                    response_files: Vec::new(),
+                    expanded_arguments: Vec::new(),
+                    execution: Some(execution),
+                },
+                directory,
+                inputs: vec![object],
+            }
+        }
+
+        pub(super) fn capture(&mut self) -> RailResult<FileLinkerWitness> {
+            self.evidence.direct_inputs.sort_unstable();
+            self.evidence.direct_inputs.dedup();
+            self.evidence.search_directories.sort_unstable();
+            let dependencies = self.directory.join("link.d");
+            fs::write(
+                &dependencies,
+                format!(
+                    "{}: {}\n",
+                    self.outputs.artifacts[0].path.display(),
+                    self.inputs
+                        .iter()
+                        .map(|path| path.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+            )?;
+            let driver_inputs = self.directory.join("driver.json");
+            fs::write(&driver_inputs, serde_json::to_vec(&self.evidence)?)?;
+            capture_elf_linker_witness(
+                &graduated_observation(),
+                &self.outputs,
+                &dependencies,
+                &driver_inputs,
+                &self.evidence.driver,
+                None,
+            )
+            .map(|(witness, _, _)| witness)
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn elf_driver_evidence_requires_bounded_compiler_inputs() {
+        let mut fixture = ElfWitnessFixture::new();
+        let path = fixture.directory.join(ELF_LINK_DRIVER_INPUTS_FILE);
+        fixture.evidence.compiler_inputs = (0..MAX_LINK_INPUTS)
+            .map(|index| {
+                fixture
+                    .directory
+                    .join(format!("input-{index:05}.o"))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        fs::write(&path, serde_json::to_vec(&fixture.evidence).expect("evidence")).expect("evidence file");
+        assert_eq!(
+            read_elf_link_driver_evidence(&path)
+                .expect("independent compiler-input bound")
+                .compiler_inputs
+                .len(),
+            MAX_LINK_INPUTS
+        );
+        fixture
+            .evidence
+            .compiler_inputs
+            .push(fixture.directory.join("overflow.o").to_string_lossy().into_owned());
+        fs::write(&path, serde_json::to_vec(&fixture.evidence).expect("evidence")).expect("evidence file");
+        read_elf_link_driver_evidence(&path).expect_err("compiler-input count exceeds its bound");
+
+        let first = fixture.directory.join("first.o").to_string_lossy().into_owned();
+        let second = fixture.directory.join("second.o").to_string_lossy().into_owned();
+        for invalid in [
+            vec!["relative.o".to_string()],
+            vec![format!("{first}\0")],
+            vec![first.clone(), first.clone()],
+            vec![second, first.clone()],
+        ] {
+            fixture.evidence.compiler_inputs = invalid;
+            fs::write(&path, serde_json::to_vec(&fixture.evidence).expect("evidence")).expect("evidence file");
+            read_elf_link_driver_evidence(&path).expect_err("invalid compiler-input paths");
+        }
+        fixture.evidence.compiler_inputs = vec![first];
+        fixture.evidence.version = 7;
+        fs::write(&path, serde_json::to_vec(&fixture.evidence).expect("evidence")).expect("evidence file");
+        read_elf_link_driver_evidence(&path).expect_err("old evidence cannot supply compiler provenance");
+        fixture.evidence.version = 8;
+        let mut missing = serde_json::to_value(&fixture.evidence).expect("evidence");
+        missing
+            .as_object_mut()
+            .expect("evidence object")
+            .remove("compiler_inputs");
+        fs::write(&path, serde_json::to_vec(&missing).expect("missing field")).expect("evidence file");
+        assert!(
+            read_elf_link_driver_evidence(&path)
+                .expect_err("compiler inputs are required")
+                .to_string()
+                .contains("compiler_inputs")
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn elf_linker_witness_does_not_search_direct_rlibs() {
+        let mut fixture = ElfWitnessFixture::new();
+        for index in 0..1100 {
+            let path = fixture.directory.join(format!("libfixture_{index:04}.rlib"));
+            fs::write(&path, b"!<arch>\n").expect("archive");
+            fixture.evidence.direct_inputs.push(path.to_string_lossy().into_owned());
+            fixture.inputs.push(path);
+        }
+        for index in 0..16 {
+            fixture.evidence.search_directories.push(
+                fixture
+                    .directory
+                    .join(format!("search-{index:02}"))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        let alias = fixture.directory.join("alias");
+        fs::create_dir(&alias).expect("alias directory");
+        std::os::unix::fs::symlink(&fixture.inputs[1], alias.join("libfixture_0000.rlib")).expect("direct alias");
+        fixture.inputs[1] = alias.join("libfixture_0000.rlib");
+        let witness = fixture.capture().expect("direct rlibs fit the witness bounds");
+        assert_eq!(
+            witness.found.iter().filter(|file| file.path.ends_with(".rlib")).count(),
+            1100,
+            "direct archives must retain their content bindings"
+        );
+        assert!(witness.missing.iter().all(|path| !path.ends_with(".rlib")));
+        let earlier = Path::new(&fixture.evidence.search_directories[0]);
+        fs::create_dir(earlier).expect("earlier directory");
+        fs::write(earlier.join("libfixture_0000.rlib"), b"!<arch>\nshadow").expect("irrelevant shadow");
+        revalidate_file_linker_witness(&witness, None, None).expect("direct path selection is unchanged");
+        fs::write(&fixture.inputs[1], b"!<arch>\nchanged").expect("changed direct input");
+        assert_eq!(
+            revalidate_file_linker_witness(&witness, None, None)
+                .expect_err("direct input contents remain authoritative")
+                .to_string(),
+            "Apple linker found input changed"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn elf_linker_witness_retains_searched_rlibs() {
+        for also_direct in [false, true] {
+            let mut fixture = ElfWitnessFixture::new();
+            let archive = fixture.directory.join("libfixture.rlib");
+            let script = fixture.directory.join("input.ld");
+            let earlier = fixture.directory.join("earlier");
+            fs::write(&archive, b"!<arch>\n").expect("archive");
+            if also_direct {
+                fs::write(&script, b"INPUT(libfixture.rlib)\n").expect("script");
+                fixture
+                    .evidence
+                    .direct_inputs
+                    .push(archive.to_string_lossy().into_owned());
+                fixture.inputs.push(script);
+            }
+            fixture.inputs.push(archive);
+            fixture
+                .evidence
+                .search_directories
+                .push(earlier.to_string_lossy().into_owned());
+            let witness = fixture.capture().expect("library search witness");
+            let candidate = earlier.join("libfixture.rlib");
+            assert!(witness.missing.contains(&candidate.to_string_lossy().into_owned()));
+            fs::create_dir(&earlier).expect("earlier directory");
+            fs::write(candidate, b"!<arch>\nshadow").expect("selected shadow");
+            assert_eq!(
+                revalidate_file_linker_witness(&witness, None, None)
+                    .expect_err("library search changed")
+                    .to_string(),
+                "linker missing input appeared"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn elf_linker_witness_keeps_direct_shared_objects_searchable() {
+        let mut fixture = ElfWitnessFixture::new();
+        let library = fixture.directory.join("libfixture.so.1");
+        let earlier = fixture.directory.join("earlier");
+        let mut elf = [0u8; 20];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[16] = 3;
+        fs::write(&library, elf).expect("ELF shared object");
+        fixture
+            .evidence
+            .direct_inputs
+            .push(library.to_string_lossy().into_owned());
+        fixture.inputs.push(library);
+        fixture
+            .evidence
+            .search_directories
+            .push(earlier.to_string_lossy().into_owned());
+        let witness = fixture.capture().expect("shared object witness");
+        let candidate = earlier.join("libfixture.so.1");
+        assert!(witness.missing.contains(&candidate.to_string_lossy().into_owned()));
+        fs::create_dir(&earlier).expect("earlier directory");
+        fs::write(candidate, elf).expect("shared object shadow");
+        assert_eq!(
+            revalidate_file_linker_witness(&witness, None, None)
+                .expect_err("shared object search changed")
+                .to_string(),
+            "linker missing input appeared"
+        );
+    }
+
+    #[test]
+    fn elf_script_search_retains_literal_library_and_ambiguous_names() {
+        let root = tempfile::tempdir().expect("scripts");
+        let script = root.path().join("input.ld");
+        let direct = BTreeSet::from([
+            "libarchive.a".to_string(),
+            "libfixture.rlib".to_string(),
+            "libunreferenced.rlib".to_string(),
+        ]);
+        for text in [
+            "INPUT (\"libfixture.rlib\") GROUP(-larchive)",
+            "INPUT (/root/libfixture.rlib) GROUP(-l /*comment*/ archive)",
+            "INPUT(-l:libfixture.rlib -larchive)",
+        ] {
+            fs::write(&script, text).expect("script");
+            let mut selected = BTreeSet::new();
+            elf_script_search_names(std::slice::from_ref(&script), &direct, &mut selected).expect("script names");
+            assert_eq!(
+                selected,
+                BTreeSet::from(["libarchive.a".to_string(), "libfixture.rlib".to_string()])
+            );
+        }
+        for bytes in [b"INPUT(libfixture\\.rlib)".as_slice(), b"opaque\0input", b"\xffopaque"] {
+            fs::write(&script, bytes).expect("ambiguous input");
+            let mut selected = BTreeSet::new();
+            elf_script_search_names(std::slice::from_ref(&script), &direct, &mut selected).expect("conservative names");
+            assert_eq!(selected, direct);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn elf_linker_witness_rejects_a_new_shared_library_in_an_absent_search_directory() {
         let root = tempfile::tempdir().expect("link root");
@@ -24564,12 +24995,16 @@ pub(crate) mod tests {
             capture_direct_link_driver(&driver, &[], &current_directory).expect("direct linker runtime evidence");
         let linker = driver.clone();
         let evidence = ElfLinkDriverEvidence {
-            version: 7,
+            version: 8,
+            compiler_inputs: Vec::new(),
             completed: true,
             current_directory: current_directory.to_string_lossy().into_owned(),
             driver: driver.to_string_lossy().into_owned(),
             linker: linker.to_string_lossy().into_owned(),
-            direct_inputs: vec![object.to_string_lossy().into_owned()],
+            direct_inputs: vec![
+                object.to_string_lossy().into_owned(),
+                archive.to_string_lossy().into_owned(),
+            ],
             search_directories: vec![earlier.to_string_lossy().into_owned()],
             default_search_guards: BTreeMap::new(),
             library_names: vec!["libfixture_native.a".to_string(), "libfixture_native.so".to_string()],
@@ -24653,7 +25088,8 @@ pub(crate) mod tests {
             capture_direct_link_driver(&driver, &[], &current_directory).expect("direct linker runtime evidence");
         let linker = driver.clone();
         let evidence = ElfLinkDriverEvidence {
-            version: 7,
+            version: 8,
+            compiler_inputs: Vec::new(),
             completed: true,
             current_directory: current_directory.to_string_lossy().into_owned(),
             driver: driver.to_string_lossy().into_owned(),
