@@ -5280,13 +5280,14 @@ fn unsupported_shapes_bypass_before_acquisition_while_proc_macro_producers_and_c
         let cache_root = selected_profile_cache_root(&workspace.path, cargo_home.path())?;
         let before = directory_snapshot(&cache_root)?;
 
+        // Cargo 1.99 turns incremental compilation off by default when `CI` is set, so request it.
         // Verbose output names each compiler invocation, so a failure shows the one that was not bypassed.
         let incremental = Command::new("cargo")
             .current_dir(&workspace.path)
             .args(["check", "--verbose"])
             .env("CARGO_HOME", cargo_home.path())
+            .env("CARGO_INCREMENTAL", "1")
             .env("CARGO_RAIL_CACHE_TRACE", "1")
-            .env_remove("CARGO_INCREMENTAL")
             .env_remove("RUSTC_FORCE_INCREMENTAL")
             .env_remove("RUSTC_WRAPPER")
             .env_remove("RUSTC_WORKSPACE_WRAPPER")
@@ -5327,7 +5328,7 @@ fn unsupported_shapes_bypass_before_acquisition_while_proc_macro_producers_and_c
             .current_dir(&workspace.path)
             .args(["clippy", "--quiet"])
             .env("CARGO_HOME", cargo_home.path())
-            .env_remove("CARGO_INCREMENTAL")
+            .env("CARGO_INCREMENTAL", "1")
             .env_remove("RUSTC_FORCE_INCREMENTAL")
             .env_remove("RUSTC_WRAPPER")
             .env_remove("RUSTC_WORKSPACE_WRAPPER")
