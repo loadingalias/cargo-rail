@@ -9,18 +9,20 @@ images:
     arch: x64
     ami: ami-096d6502bd8b5345b
 runners:
+  # On-Demand: the native rows run for about an hour, and the IBM and RISC-V rows wait on the
+  # cross-builds. A spot reclaim stopped all three cross-builds at once in CI 38774930981.
   x86_64-linux:
     family: [c7a.2xlarge, c7i.2xlarge, c8a.2xlarge, c8i.2xlarge]
     cpu: 8
     image: ubuntu24-full-x64
-    spot: price-capacity-optimized
+    spot: false
     volume: 150gb:gp3
   aarch64-linux:
     # Retain memory headroom for the native compiler and cache tests.
     family: [m7g.2xlarge, m8g.2xlarge]
     cpu: 8
     image: ubuntu24-full-arm64
-    spot: price-capacity-optimized
+    spot: false
     volume: 150gb:gp3
   x86_64-win:
     family: [c7a.2xlarge, c8a.2xlarge]
