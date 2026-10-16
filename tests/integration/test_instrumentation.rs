@@ -383,7 +383,8 @@ fn unify_diagnostics_measure_bounded_compiler_acquisition_and_warm_outcome() {
                 .as_str()
                 .is_some_and(|identity| identity.starts_with("compiler-acquisition-plan-v1-sha256-"))
         );
-        assert!(acquisition["views"].as_u64().is_some_and(|views| views >= 3));
+        // Default and all features; without a `default` feature, no-default repeats the default view.
+        assert!(acquisition["views"].as_u64().is_some_and(|views| views >= 2));
         assert!(acquisition["cargo_views"].as_u64().is_some_and(|views| views > 0));
         // Views share one sandbox in turn; Cargo owns parallelism inside each view.
         assert_eq!(acquisition["configured_process_slots"], 1);
@@ -720,7 +721,8 @@ fn unify_compiles_each_shared_dependency_unit_once() {
         };
 
         let cold = run("cold-shared.json")?;
-        assert!(cold["views"].as_u64().is_some_and(|views| views >= 9), "{cold:#}");
+        // Three members, each with default and all-features views.
+        assert!(cold["views"].as_u64().is_some_and(|views| views >= 6), "{cold:#}");
         assert_eq!(cold["cargo_views"], cold["views"], "{cold:#}");
         assert_eq!(cold["max_live_cargo_processes"], 1, "{cold:#}");
         assert_eq!(cold["sandboxes_created"], 1, "{cold:#}");

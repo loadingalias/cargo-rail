@@ -117,7 +117,13 @@ fn test_unify_check_json_emits_versioned_feature_target_coverage_views() {
         let first_value: serde_json::Value = serde_json::from_slice(&first.stdout)?;
         assert_eq!(first_value["coverage"]["schema_version"], 1);
         let views = first_value["coverage"]["views"].as_array().expect("coverage views");
-        assert_eq!(views.len(), 4, "default, no-default, all, and selected views");
+        // Without a `default` feature, a no-default view would compile the default view again.
+        assert_eq!(views.len(), 3, "default, all, and selected views");
+        assert!(
+            views
+                .iter()
+                .all(|view| view["features"]["mode"] != "no_default_features")
+        );
         assert!(views.iter().all(|view| {
             view["id"]
                 .as_str()

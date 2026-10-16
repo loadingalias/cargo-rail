@@ -1180,17 +1180,28 @@ fn dependency_domain(kind: DepKind) -> CompilerFactDomain {
     }
 }
 
-pub(crate) fn planned_feature_selections(member: &ParsedManifest) -> Vec<FeatureSelection> {
+/// The baseline selections that compile distinct configurations of `member`.
+///
+/// Without a `default` feature, the default selection enables no feature,
+/// so `--no-default-features` would compile the default configuration again.
+/// Without any feature, every baseline compiles that one configuration.
+fn baseline_feature_selections(member: &ParsedManifest) -> Vec<FeatureSelection> {
     let has_optional_dependency = member
         .dependencies
         .values()
         .flatten()
         .any(|dependency| dependency.optional);
-    let mut selections = if member.declared_features.is_empty() && !has_optional_dependency {
+    if member.declared_features.is_empty() && !has_optional_dependency {
         vec![FeatureSelection::Default]
-    } else {
+    } else if member.declared_features.contains("default") {
         FeatureSelection::BASELINES.to_vec()
-    };
+    } else {
+        vec![FeatureSelection::Default, FeatureSelection::AllFeatures]
+    }
+}
+
+pub(crate) fn planned_feature_selections(member: &ParsedManifest) -> Vec<FeatureSelection> {
+    let mut selections = baseline_feature_selections(member);
     selections.extend(
         member
             .condition_feature_selections
@@ -1252,16 +1263,7 @@ pub(crate) fn planned_coverage_views(
 }
 
 fn coverage_feature_selections(member: &ParsedManifest, cfg_set: Option<&TargetCfgSet>) -> Vec<FeatureSelection> {
-    let has_optional_dependency = member
-        .dependencies
-        .values()
-        .flatten()
-        .any(|dependency| dependency.optional);
-    let mut selections = if member.declared_features.is_empty() && !has_optional_dependency {
-        vec![FeatureSelection::Default]
-    } else {
-        FeatureSelection::BASELINES.to_vec()
-    };
+    let mut selections = baseline_feature_selections(member);
     selections.extend(
         member
             .source_cfg_expressions
@@ -1304,7 +1306,12 @@ mod tests {
             },
             path: PathBuf::from(root).join("Cargo.toml"),
             package_name: name.to_string(),
-            declared_features: BTreeSet::from(["backend".to_string(), "common".to_string(), "example".to_string()]),
+            declared_features: BTreeSet::from([
+                "backend".to_string(),
+                "common".to_string(),
+                "default".to_string(),
+                "example".to_string(),
+            ]),
             required_feature_selections: BTreeSet::from([vec!["example".to_string()]]),
             condition_feature_selections: BTreeSet::from([vec!["backend".to_string(), "common".to_string()]]),
             source_cfg_features: BTreeSet::from(["backend".to_string(), "common".to_string()]),
@@ -1670,7 +1677,27 @@ mod tests {
                 referenced_in_features: false,
                 workspace_inherited: false,
             });
+        assert_eq!(
+            planned_feature_selections(&app),
+            vec![FeatureSelection::Default, FeatureSelection::AllFeatures]
+        );
+    }
+
+    /// Without a `default` feature, `--no-default-features` compiles the default configuration again.
+    #[test]
+    fn packages_without_a_default_feature_skip_the_duplicate_no_default_selection() {
+        let mut app = manifest("app", "app");
+        app.declared_features.remove("default");
+        app.required_feature_selections.clear();
+        app.condition_feature_selections.clear();
+        app.source_cfg_expressions.clear();
+        let distinct = vec![FeatureSelection::Default, FeatureSelection::AllFeatures];
+        assert_eq!(planned_feature_selections(&app), distinct);
+        assert_eq!(coverage_feature_selections(&app, None), distinct);
+
+        app.declared_features.insert("default".to_string());
         assert_eq!(planned_feature_selections(&app), FeatureSelection::BASELINES);
+        assert_eq!(coverage_feature_selections(&app, None), FeatureSelection::BASELINES);
     }
 
     #[test]
