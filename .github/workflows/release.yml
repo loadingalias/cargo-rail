@@ -40,16 +40,16 @@ jobs:
           persist-credentials: false
       - name: Install release tooling
         run: scripts/tooling/package-unix.sh x86_64-unknown-linux-gnu
-      - uses: loadingalias/cargo-rail-action/cache@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
+      - uses: loadingalias/cargo-rail-action/cache@fd41439dfa862939e6928cb98d7e76de580f673c # v12.0.0
         id: cache
         with:
-          version: 0.31.1
+          version: 0.32.0
           remote: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}
           mode: read-write
           max-size: 10GiB
           root-portability: remap
           verify-remote: true
-      # The Action's locked engine predates this release, so the source-built engine releases itself.
+      # This repository releases itself with its source-built engine, as the Action releases itself with its source-built runner.
       - name: Build this release engine
         run: cargo build --locked --bin cargo-rail
       - name: Release
@@ -59,13 +59,13 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           BUMP: ${{ inputs.bump }}
         run: scripts/release.sh --bump "$BUMP"
-      - uses: loadingalias/cargo-rail-action/cache/collect@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
+      - uses: loadingalias/cargo-rail-action/cache/collect@fd41439dfa862939e6928cb98d7e76de580f673c # v12.0.0
         if: always() && steps.cache.outcome == 'success'
         id: cache-record
         with:
           job: release
           output-directory: ${{ runner.temp }}/cache-records
-      - uses: loadingalias/cargo-rail-action/cache/report@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
+      - uses: loadingalias/cargo-rail-action/cache/report@fd41439dfa862939e6928cb98d7e76de580f673c # v12.0.0
         if: always() && steps.cache-record.outcome == 'success'
         with:
           records-directory: ${{ runner.temp }}/cache-records

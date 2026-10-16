@@ -467,9 +467,10 @@ class ToolingLane(unittest.TestCase):
             index for index, line in enumerate(job)
             if line.startswith('- uses: loadingalias/cargo-rail-action/cache@')
         )
-        # The step that captures the plan publishes it as `steps.rail`.
+        # The released planner Action captures the plan and publishes it as `steps.rail`.
         plan = job.index('id: rail')
         self.assertLess(cache, plan)
+        self.assertTrue(job[plan - 1].startswith('- uses: loadingalias/cargo-rail-action@'), job[plan - 1])
         self.assertNotIn('id: rail', job[plan + 1:])
 
     def test_shared_recipe_rejects_invalid_workflow(self):

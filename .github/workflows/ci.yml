@@ -61,40 +61,21 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }} # Authenticates cargo-binstall's GitHub API lookups.
         run: ./scripts/tooling/x86_64-win.ps1 -Operation ci
       # Cache setup changes Cargo configuration, so planning must capture it afterward.
-      - uses: loadingalias/cargo-rail-action/cache@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
+      - uses: loadingalias/cargo-rail-action/cache@fd41439dfa862939e6928cb98d7e76de580f673c # v12.0.0
         if: github.event_name != 'pull_request'
         id: cache
         with:
-          version: 0.31.1
+          version: 0.32.0
           remote: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}
           mode: read-write
           max-size: 10GiB
           root-portability: remap
           verify-remote: true
-      # Until CI pins Cargo-Rail 0.32: no released Cargo-Rail reads this repository's configuration,
-      # so the candidate plans every work item and serves each later `cargo rail` command.
-      # The Action still supplies the independent plan consumer that checks each selection.
-      - uses: loadingalias/cargo-rail-action/setup@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
-        with:
-          version: 0.31.1
-      - name: Build the candidate planner
-        run: |
-          suffix=""
-          if [[ "$RUNNER_OS" == Windows ]]; then suffix=.exe; fi
-          cargo build --locked --all-features --bin cargo-rail
-          # A copy outside target/ stays fixed while later steps rebuild the workspace.
-          mkdir -p "$RUNNER_TEMP/cargo-rail-candidate"
-          cp "target/debug/cargo-rail$suffix" "$RUNNER_TEMP/cargo-rail-candidate/"
-          printf '%s\n' "$RUNNER_TEMP/cargo-rail-candidate" >> "$GITHUB_PATH"
-      - name: Plan every work item with the candidate
+      - uses: loadingalias/cargo-rail-action@fd41439dfa862939e6928cb98d7e76de580f673c # v12.0.0
         id: rail
-        run: |
-          plan="$RUNNER_TEMP/cargo-rail-plan/plan.json"
-          mkdir -p "$RUNNER_TEMP/cargo-rail-plan"
-          cargo-rail rail plan --all --json > "$plan"
-          [[ "$(cargo-rail-action plan is-required "$plan" cargo.fmt)" == true ]]
-          required="$(uv run python -c 'import json, sys; print(json.dumps(json.load(open(sys.argv[1]))["required"], separators=(",", ":")))' "$plan")"
-          printf 'plan-file=%s\nrequired-work=%s\n' "$plan" "$required" >> "$GITHUB_OUTPUT"
+        with:
+          version: 0.32.0
+          all: ${{ github.event_name == 'workflow_dispatch' }}
       - name: Check tooling and workflows
         if: matrix.platform == 'x86_64-linux' && contains(fromJSON(steps.rail.outputs.required-work), 'check-tooling')
         env:
@@ -158,7 +139,7 @@ jobs:
           PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
         run: |
           [[ "$(cargo-rail-action plan is-required "$PLAN_FILE" surface)" == true ]]
-          # The workspace build embeds the compiler-driver authority that Surface needs; the candidate planner does not.
+          # Surface runs from the workspace build, which embeds the compiler-driver authority; the planner installs core components only.
           PATH="$PWD/target/debug:$PATH" just check-surface
       - name: Check worktree
         if: always()
@@ -169,7 +150,7 @@ jobs:
             printf '%s\n' "$status"
             exit 1
           fi
-      - uses: loadingalias/cargo-rail-action/cache/collect@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
+      - uses: loadingalias/cargo-rail-action/cache/collect@fd41439dfa862939e6928cb98d7e76de580f673c # v12.0.0
         if: always() && github.event_name != 'pull_request' && steps.cache.outcome == 'success'
         id: cache-record
         with:
@@ -247,9 +228,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }} # Authenticates cargo-binstall's GitHub API lookups.
         run: scripts/tooling/x86_64-linux.sh cross-build "$PLATFORM"
-      - uses: loadingalias/cargo-rail-action/cache@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
+      - uses: loadingalias/cargo-rail-action/cache@fd41439dfa862939e6928cb98d7e76de580f673c # v12.0.0
         with:
-          version: 0.31.1
+          version: 0.32.0
           remote: ${{ vars.CARGO_RAIL_CACHE_REMOTE }}
           mode: read-write
           max-size: 10GiB
@@ -343,7 +324,7 @@ jobs:
           pattern: cache-record-*
           merge-multiple: true
           path: ${{ runner.temp }}/cache-records
-      - uses: loadingalias/cargo-rail-action/cache/report@2104429578cfeef1a6a5beb379c2202e0310df78 # v11.0.1
+      - uses: loadingalias/cargo-rail-action/cache/report@fd41439dfa862939e6928cb98d7e76de580f673c # v12.0.0
         with:
           records-directory: ${{ runner.temp }}/cache-records
           expected-jobs: '["x86_64-linux", "aarch64-linux", "x86_64-win"]'
