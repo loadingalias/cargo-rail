@@ -2781,6 +2781,53 @@ fn change_file_drives_auto_bump_and_is_consumed_on_release() {
     super::helpers::finish_test(result);
 }
 
+/// Breaking entries lead the release notes, so a reader sees the upgrade steps first.
+/// File order holds within one bump level.
+#[test]
+fn release_notes_list_change_entries_by_bump_level() {
+    let result: Result<()> = (|| {
+        let ws = TestWorkspace::new_named("release-notes-bump-order")?;
+        write_release_config(&ws, "")?;
+
+        ws.add_crate("lib-a", "0.1.0", &[])?;
+        commit_with_lockfile(&ws, "Add lib-a")?;
+        tag_release(&ws, "lib-a", "0.1.0")?;
+        ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}\n")?;
+        ws.commit("fix: change lib-a")?;
+        let changes = ws.path.join(".changes");
+        std::fs::create_dir_all(&changes)?;
+        for (name, level, body) in [
+            ("a-fix", "patch", "Fixed the parser."),
+            ("b-feature", "minor", "Added a flag."),
+            ("c-break", "major", "Removed the old command."),
+            ("d-fix", "patch", "Fixed a message."),
+        ] {
+            std::fs::write(
+                changes.join(format!("{name}.md")),
+                format!("---\n\"lib-a\" = \"{level}\"\n---\n\n{body}\n"),
+            )?;
+        }
+        publish_to_origin(&ws)?;
+
+        let output = release(&ws.path, &["lib-a", "--bump", "auto", "--yes"])?;
+        assert!(output.status.success(), "{}", describe(&output));
+        let changelog = std::fs::read_to_string(ws.path.join("crates/lib-a/CHANGELOG.md"))?;
+        let positions = [
+            "Removed the old command.",
+            "Added a flag.",
+            "Fixed the parser.",
+            "Fixed a message.",
+        ]
+        .map(|entry| changelog.find(entry).unwrap_or_else(|| panic!("{entry}:\n{changelog}")));
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "changelog:\n{changelog}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 #[test]
 fn release_enforces_required_change_file_coverage() {
     let result: Result<()> = (|| {
@@ -3754,6 +3801,11 @@ relative_to = "workspace"
         ] {
             let output = release(&ws.path, args)?;
             assert!(!output.status.success(), "{args:?}: {}", describe(&output));
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("is a symbolic link"),
+                "{args:?}: {}",
+                describe(&output)
+            );
             assert_eq!(std::fs::read_to_string(&victim)?, "outside\n");
             assert!(
                 std::fs::symlink_metadata(ws.path.join("CHANGELOG.md"))?
@@ -3766,6 +3818,69 @@ relative_to = "workspace"
             ref_commit(&origin, "refs/heads/main").as_deref(),
             Some(initial.as_str())
         );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+/// A link inside the repository would make the release write a file that configuration does not name,
+/// including an ignored file that `update-index --cacheinfo` would still commit.
+#[cfg(unix)]
+#[test]
+fn release_rejects_a_changelog_link_to_a_repository_file() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::symlink;
+
+        for (name, link_target) in [("tracked", "docs/CHANGELOG.md"), ("ignored", "target/CHANGELOG.md")] {
+            let ws = TestWorkspace::new_named(&format!("changelog-link-{name}"))?;
+            write_release_config(
+                &ws,
+                r#"
+[release.changelog]
+path = "CHANGELOG.md"
+relative_to = "workspace"
+"#,
+            )?;
+            std::fs::write(ws.path.join(".gitignore"), "target/\n")?;
+            let target = ws.path.join(link_target);
+            std::fs::create_dir_all(target.parent().expect("link target directory"))?;
+            std::fs::write(&target, "# Changelog\n")?;
+            symlink(link_target, ws.path.join("CHANGELOG.md"))?;
+            ws.add_crate("lib-a", "0.1.0", &[])?;
+            commit_with_lockfile(&ws, "Add lib-a")?;
+            ws.tag("lib-a-v0.1.0", "Initial lib-a")?;
+            ws.modify_file("lib-a", "src/lib.rs", "pub fn changed() {}")?;
+            ws.commit("feat: change lib-a")?;
+            write_test_change(&ws.path, &["lib-a"])?;
+            let origin = publish_to_origin(&ws)?;
+            let initial = head(&ws.path)?;
+
+            for args in [
+                &["lib-a", "--bump", "patch", "--dry-run"][..],
+                &["lib-a", "--bump", "patch", "--yes"][..],
+            ] {
+                let output = release(&ws.path, args)?;
+                assert!(!output.status.success(), "{name} {args:?}: {}", describe(&output));
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("is a symbolic link"),
+                    "{name} {args:?}: {}",
+                    describe(&output)
+                );
+                assert_eq!(std::fs::read_to_string(&target)?, "# Changelog\n", "{name}");
+                assert!(
+                    std::fs::symlink_metadata(ws.path.join("CHANGELOG.md"))?
+                        .file_type()
+                        .is_symlink(),
+                    "{name}"
+                );
+                assert_eq!(head(&ws.path)?, initial, "{name}");
+            }
+            assert_eq!(
+                ref_commit(&origin, "refs/heads/main").as_deref(),
+                Some(initial.as_str()),
+                "{name}"
+            );
+        }
         Ok(())
     })();
     super::helpers::finish_test(result);

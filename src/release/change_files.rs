@@ -166,7 +166,7 @@ impl PendingChangeSet {
     /// Load pending change files from the configured directory.
     pub fn load(workspace_root: &Path, change_dir: &str, workspace_members: &[String]) -> RailResult<Self> {
         validate_change_dir_value(change_dir)?;
-        let dir = workspace_root.join(change_dir);
+        let dir = unlinked_change_dir(workspace_root, change_dir)?;
         if !dir.exists() {
             return Ok(Self::default());
         }
@@ -179,6 +179,14 @@ impl PendingChangeSet {
             let entry = entry.map_err(|e| RailError::message(format!("failed to read {}: {}", dir.display(), e)))?;
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "md") {
+                let metadata = fs::symlink_metadata(&path)
+                    .map_err(|e| RailError::message(format!("failed to read {}: {}", path.display(), e)))?;
+                if crate::utils::is_symlink_or_reparse(&metadata) {
+                    return Err(RailError::with_help(
+                        format!("change file '{}' is a symbolic link", path.display()),
+                        "replace the link with the change file itself",
+                    ));
+                }
                 paths.push(path);
             }
         }
@@ -323,7 +331,7 @@ pub fn write_change_file(
         None => slugify_message(body),
     };
     let hash = hash4(&content);
-    let dir = workspace_root.join(change_dir);
+    let dir = unlinked_change_dir(workspace_root, change_dir)?;
     fs::create_dir_all(&dir).map_err(|e| RailError::message(format!("failed to create {}: {}", dir.display(), e)))?;
     let path = dir.join(format!("{}-{}.md", slug, hash));
 
@@ -510,6 +518,23 @@ pub(crate) fn change_dir_validation_error(change_dir: &str) -> Option<&'static s
     None
 }
 
+/// The change directory below `workspace_root`, refused when it or a directory on its path is a link.
+///
+/// A release deletes or rewrites each change file, and `change add` writes one.
+/// A link would redirect those writes to its target.
+fn unlinked_change_dir(workspace_root: &Path, change_dir: &str) -> RailResult<PathBuf> {
+    let dir = workspace_root.join(change_dir);
+    let link = crate::utils::first_linked_entry(workspace_root, Path::new(change_dir))
+        .map_err(|e| RailError::message(format!("failed to inspect {}: {}", dir.display(), e)))?;
+    if let Some(link) = link {
+        return Err(RailError::with_help(
+            format!("change directory '{}' is a symbolic link", link.display()),
+            "name the change directory itself in release.change_dir",
+        ));
+    }
+    Ok(dir)
+}
+
 fn validate_change_dir_value(change_dir: &str) -> RailResult<()> {
     let Some(reason) = change_dir_validation_error(change_dir) else {
         return Ok(());
@@ -620,6 +645,46 @@ Added auto bump planning.
         let member_set: FxHashSet<&str> = members.iter().map(String::as_str).collect();
         let err = parse_change_file(&path, content, &member_set).unwrap_err();
         assert!(err.to_string().contains("unknown crate 'ghost'"));
+    }
+
+    /// A release deletes or rewrites each loaded change file, so a link would redirect that write to its target.
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_linked_change_files_and_directories() {
+        use std::os::unix::fs::symlink;
+
+        let content = "---\n\"rail-core\" = \"patch\"\n---\n\nMessage\n";
+        let file_link = tempfile::tempdir().unwrap();
+        fs::create_dir_all(file_link.path().join(".changes")).unwrap();
+        fs::create_dir_all(file_link.path().join("src")).unwrap();
+        fs::write(file_link.path().join("src/target.md"), content).unwrap();
+        symlink("../src/target.md", file_link.path().join(".changes/linked.md")).unwrap();
+
+        let directory_link = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory_link.path().join("notes")).unwrap();
+        fs::write(directory_link.path().join("notes/change.md"), content).unwrap();
+        symlink("notes", directory_link.path().join(".changes")).unwrap();
+
+        for root in [file_link.path(), directory_link.path()] {
+            let error = PendingChangeSet::load(root, ".changes", &members()).unwrap_err();
+            assert!(error.to_string().contains("is a symbolic link"), "{error}");
+        }
+    }
+
+    /// `change add` must not write a change file through a linked change directory.
+    #[cfg(unix)]
+    #[test]
+    fn write_rejects_a_linked_change_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("notes")).unwrap();
+        symlink("notes", root.path().join(".changes")).unwrap();
+        let intents = BTreeMap::from([("rail-core".to_string(), ChangeBump::Patch)]);
+
+        let error = write_change_file(root.path(), ".changes", &members(), &intents, "Message", None).unwrap_err();
+        assert!(error.to_string().contains("is a symbolic link"), "{error}");
+        assert_eq!(fs::read_dir(root.path().join("notes")).unwrap().count(), 0);
     }
 
     #[test]

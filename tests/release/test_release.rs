@@ -912,6 +912,27 @@ fn a_new_release_never_reuses_a_published_version() {
     finish_test(result);
 }
 
+/// A first release has no baseline tag, so `semver_check = "deny"` asks whether the crate was published before.
+/// The registry that receives the release answers; crates.io does not decide for another registry.
+#[test]
+fn a_first_release_asks_its_own_registry_for_earlier_versions() {
+    let result: Result<()> = (|| {
+        let fixture = Fixture::new(false, "")?;
+        std::fs::write(
+            fixture.root.join(".config/rail.toml"),
+            "[release]\npublish = \"fixture\"\nsemver_check = \"deny\"\n",
+        )?;
+        git(&fixture.root, &["tag", "--delete", "base-v0.1.0"])?;
+        git(&fixture.root, &["push", "--quiet", "origin", ":refs/tags/base-v0.1.0"])?;
+        fixture.change(&[("base", "minor")], "Add a feature.")?;
+
+        let planned = fixture.release_ok(&["--dry-run"], "planned")?;
+        assert_eq!(planned["crates"][0]["name"], "base", "{planned}");
+        Ok(())
+    })();
+    finish_test(result);
+}
+
 #[test]
 fn removed_release_subcommands_name_their_replacement() {
     let result: Result<()> = (|| {

@@ -357,10 +357,14 @@ impl<'a> ReleasePlanner<'a> {
                     .iter()
                     .map(|update| (update.name.clone(), update.version.clone()))
                     .collect::<Vec<_>>();
+                // Breaking entries lead, so the notes show upgrade steps first. The sort is stable,
+                // so file order holds within one bump level.
+                let mut change_entries = plan.change_entries.iter().collect::<Vec<_>>();
+                change_entries.sort_by_key(|entry| std::cmp::Reverse(entry.bump.release_level()));
                 let mut rendered_highlights = highlights;
                 rendered_highlights.extend(
-                    plan.change_entries
-                        .iter()
+                    change_entries
+                        .into_iter()
                         .map(|entry| entry.presentation.render(&entry.body)),
                 );
                 plan.changelog_body = spec.render(&links, &rendered_highlights, &commits, &dependencies);
@@ -624,13 +628,13 @@ impl<'a> ReleasePlanner<'a> {
             .and_then(|ch| ch.relative_to)
             .unwrap_or(self.release_config.changelog.relative_to);
 
-        match relative_to {
-            ChangelogRelativeTo::Crate => Ok(manifest_path
+        let base = match relative_to {
+            ChangelogRelativeTo::Crate => manifest_path
                 .parent()
-                .ok_or_else(|| RailError::message("Invalid manifest path"))?
-                .join(&changelog_relative_path)),
-            ChangelogRelativeTo::Workspace => Ok(self.ctx.workspace_root().join(&changelog_relative_path)),
-        }
+                .ok_or_else(|| RailError::message("Invalid manifest path"))?,
+            ChangelogRelativeTo::Workspace => self.ctx.workspace_root(),
+        };
+        changelog_path(base, Path::new(&changelog_relative_path))
     }
 
     fn apply_version_groups(
@@ -909,6 +913,27 @@ impl<'a> ReleasePlanner<'a> {
         }
         Ok(())
     }
+}
+
+/// Join a configured changelog path to its base directory.
+///
+/// The release reads and rewrites this exact file. A link at the file, or at a directory between
+/// `base` and the file, would redirect both to a path that configuration does not name.
+pub(crate) fn changelog_path(base: &Path, configured: &Path) -> RailResult<PathBuf> {
+    let path = base.join(configured);
+    let link = crate::utils::first_linked_entry(base, configured).map_err(|error| {
+        RailError::message(format!(
+            "failed to inspect changelog path '{}': {error}",
+            path.display()
+        ))
+    })?;
+    if let Some(link) = link {
+        return Err(RailError::with_help(
+            format!("release changelog path '{}' is a symbolic link", link.display()),
+            "name the changelog file itself in release.changelog.path",
+        ));
+    }
+    Ok(path)
 }
 
 /// Determine whether git history is shallow using git's own repository view.

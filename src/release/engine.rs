@@ -523,7 +523,7 @@ impl<'a> Session<'a> {
                     .ok_or_else(|| RailError::message("crate manifest has no directory"))?,
                 crate::config::ChangelogRelativeTo::Workspace => self.ctx.workspace_root().to_path_buf(),
             };
-            Some(self.worktree_relative(&base.join(path))?)
+            Some(self.worktree_relative(&super::planner::changelog_path(&base, &path)?)?)
         };
         Ok(Unit {
             name: name.to_owned(),
@@ -805,7 +805,7 @@ impl<'a> Session<'a> {
             let evidence = super::semver_checks::assess(
                 self.ctx,
                 &planned.name,
-                planned.publish,
+                registry.as_ref().filter(|_| planned.publish),
                 planned.previous_tag.as_deref(),
                 self.config.semver_check,
                 planned.reviewed_level,

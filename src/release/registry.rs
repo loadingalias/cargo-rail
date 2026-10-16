@@ -244,6 +244,11 @@ impl PublicationRegistry {
         &self.name
     }
 
+    /// Whether the registry holds any version of `crate_name`.
+    pub(crate) fn has_published_versions(&self, crate_name: &str) -> Result<bool, String> {
+        self.observer.has_published_versions(crate_name)
+    }
+
     /// The registry's record of `crate_name` at `version`, if it holds one.
     pub(crate) fn version(&self, crate_name: &str, version: &semver::Version) -> RailResult<Option<Published>> {
         self.observer

@@ -30,6 +30,35 @@ pub(crate) fn is_symlink_or_reparse(metadata: &fs::Metadata) -> bool {
     }
 }
 
+/// Return the first existing entry along `relative`, below `base`, that is a symlink or reparse point.
+///
+/// `base` itself is not checked. The walk stops at the first missing entry.
+/// An absolute `relative` checks only its final entry, because the directories above a repository
+/// can be links (for example, `/tmp` on macOS).
+pub(crate) fn first_linked_entry(base: &Path, relative: &Path) -> io::Result<Option<PathBuf>> {
+    let (mut current, names) = if relative.is_absolute() {
+        (
+            relative.parent().unwrap_or(relative).to_path_buf(),
+            relative.file_name().into_iter().collect::<Vec<_>>(),
+        )
+    } else {
+        (
+            base.to_path_buf(),
+            relative.components().map(|component| component.as_os_str()).collect(),
+        )
+    };
+    for name in names {
+        current.push(name);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if is_symlink_or_reparse(&metadata) => return Ok(Some(current)),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
 /// Open a cache lock without permitting pathname replacement on Windows.
 pub(crate) fn open_cache_lock_file(path: &Path, create: bool) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();

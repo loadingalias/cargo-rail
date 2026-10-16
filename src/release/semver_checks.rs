@@ -3,6 +3,7 @@
 use crate::config::SemverCheckPolicy;
 use crate::error::{RailError, RailResult};
 use crate::release::process;
+use crate::release::registry::PublicationRegistry;
 use crate::release::version::BumpLevel;
 use crate::workspace::WorkspaceContext;
 use serde::{Deserialize, Serialize};
@@ -71,10 +72,11 @@ impl ApiEvidence {
     }
 }
 
+/// API evidence for `crate_name`; `registry` is the registry that receives it, or `None` when it does not publish.
 pub(crate) fn assess(
     ctx: &WorkspaceContext,
     crate_name: &str,
-    publish: bool,
+    registry: Option<&PublicationRegistry>,
     baseline: Option<&str>,
     policy: SemverCheckPolicy,
     reviewed_level: Option<BumpLevel>,
@@ -89,7 +91,7 @@ pub(crate) fn assess(
     };
     evidence.detail = if policy == SemverCheckPolicy::Off {
         "API validation is disabled by release policy".into()
-    } else if !publish || !has_library_target(ctx, crate_name) {
+    } else if registry.is_none() || !has_library_target(ctx, crate_name) {
         "package has no published library API".into()
     } else if let Some(baseline) = baseline {
         let baseline =
@@ -123,9 +125,10 @@ pub(crate) fn assess(
         }
     } else {
         let observation = if policy == SemverCheckPolicy::Deny {
-            super::registry::RegistryObserver::new(super::registry::CRATES_IO_INDEX)
-                .map_err(|error| error.to_string())
-                .and_then(|observer| observer.has_published_versions(crate_name))
+            registry.map_or_else(
+                || Err("the crate does not publish to a registry".into()),
+                |registry| registry.has_published_versions(crate_name),
+            )
         } else {
             Err("prior registry publication was not queried under warn policy".into())
         };
