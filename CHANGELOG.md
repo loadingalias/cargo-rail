@@ -3,6 +3,319 @@
 Published versions are recorded below. Pending release intent lives in [`.changes/`](.changes/);
 see [releasing a workspace](docs/releases.md) for the current preparation and publication workflow.
 
+## [0.32.0](https://github.com/loadingalias/cargo-rail/compare/v0.31.1...v0.32.0) - 2026-10-16
+- Use native input protocol 5 for the compiler driver.
+  The driver now reports the libraries that rustc selects from each native search directory.
+  Cargo-Rail rejects independent compiler adapter packs from 0.30 and 0.31, which use protocol 4.
+  Publish these packs again for this release.
+
+- Replace the release subcommands with one stateless command, `cargo rail release`.
+  This release breaks release commands, `[release]` configuration, and release workflows.
+  After you upgrade, run `cargo rail config migrate` and replace the release workflow.
+  
+  - `cargo rail release [CRATE...] [--bump B] [--pr] [--yes] [--dry-run]` shows one preview and asks for confirmation once.
+    Then it writes the release commit and tags it.
+    It pushes the branch and every tag in one atomic push.
+    It uploads to the registry in dependency order and creates GitHub releases.
+    The push succeeds only if `origin` still has the starting branch tip and has none of the tags.
+    `--dry-run` runs every precondition check and changes nothing.
+  - When you run the command again after an interruption, it finishes the release.
+    It reads progress from the remote tags, the registry, and GitHub.
+    It counts a published version as done only when the `.cargo_vcs_info.json` of that version names the release commit.
+  - This release removes `release run`, `check`, `resume`, `status`, `abort`, `record`, and `init`.
+    Each removed subcommand prints its replacement.
+    This release also removes hosted execution, `--local`, `--executor`, `--retain-remote`, `--prepare`, release plan files, `--allow-non-default-branch`, GitLab releases,
+    and the MSRV check.
+  - Releases keep no records.
+    This release removes release record refs, local release journals, `clean --release-journal`, and the `release-record-v11` schema.
+    If `origin` still holds `refs/notes/cargo-rail/*` refs from 0.31 or earlier, the result shows a warning.
+    The warning names these refs and gives the command that deletes them.
+  - A release requires that every check run and commit status on its source commit passes
+    (`release.checks = "all"`, the default on a GitHub `origin`).
+    Pending checks stop the command with exit code 1 before any effect.
+  - For GitHub access, Cargo-Rail uses the REST API with `GH_TOKEN`, `GITHUB_TOKEN`, or `gh auth token`.
+    The GitHub CLI is not required, except to verify asset attestations.
+  - `[release]` adds `crates`, `publish`, `github_release`, `checks`, `assets`, and `asset_attestations`.
+    It retires `remote_effects`, `registry_publication`, `hosted_workflow`, `validation`, `artifacts`, `tag_prefix`, `require_change_files`, `release_notes_dir`, `require_release_notes`, and the `{prefix}` tag placeholder.
+    `config migrate` replaces the retired fields and keeps their behavior.
+    It writes successors only to a file that contains a retired field or the `{prefix}` placeholder.
+    For example, such a file without `registry_publication = "crates-io"` gets `publish = "none"`.
+    Aliases accept `{major}` and `{minor}`.
+  - A configuration without retired fields gets the new release defaults.
+    By default, 0.31 published to no registry and created no GitHub releases.
+    By default, 0.32 publishes to crates.io.
+    On a GitHub `origin`, it also creates GitHub releases and uses `checks = "all"`.
+    To keep publication and GitHub releases off, set `publish = "none"`, `github_release = false`, and `checks = "none"`.
+    Publication still needs a registry credential, and the release checks for it before any effect.
+  - `release.publish` names `crates-io`, `none`, or any Cargo registry with a sparse index.
+    The registry credential check reads Cargo configuration.
+    Packaging and semver checks run without registry or forge tokens.
+  - `release.crates` limits the crates that a release manages.
+    `change check` requires change files only for these crates.
+  - `--pr` opens the release commit as a pull request.
+    When a squash merge drops the release trailer,
+    the next run finds the merged pull request through GitHub and tags the merged commit.
+    If the branch moved before the merge, the run shows a warning.
+  - Before Cargo-Rail publishes a draft release,
+    it downloads each `release.assets` file and compares the file with the SHA-256 that GitHub recorded.
+    Then it runs `gh attestation verify` for this repository and the release commit or its parent.
+    `release.asset_attestations = "off"` skips the attestation check.
+  - The command finishes a release commit that Cargo-Rail 0.31 created.
+  - If a literal `vN` alias would name a different major version, the release stops before any effect.
+
+- Bind each native search directory by the libraries that rustc selects from it, not by its content.
+  A directory such as `/usr/lib/x86_64-linux-gnu` can contain symbolic links, unrelated files, and subdirectories.
+  These entries no longer block or invalidate reuse of the crates that a `-sys` build script reaches.
+  The compiler driver reports each native-library search that rustc performs itself.
+  The action binds every candidate through the spelling, canonical target,
+  and bytes of the selected library.
+  Reuse `-l NAME` and `-l dylib=NAME` actions.
+  A crate such as `pq-sys` no longer bypasses.
+  
+  Name the cause of a capture bypass, such as a linked source entry or a capture bound.
+  Add one example for each of the first recorded bypass reasons to `cargo rail cache report --finish`.
+  Count a failed cold admission under its own reason.
+  Before, Cargo-Rail joined it to the miss reason and did not count it.
+
+- Remove unused public library items.
+  No command used them, and the command-line interface is unchanged.
+  The removed items are:
+  
+  - 38 functions with no production caller, including the `SystemGit` remote helpers
+    (`add_remote`, `push_to_remote`, `fetch_from_remote`, `ls_remote_has_content`),
+    unused `WorkspaceGraph` traversals of dependents, and unused `toml` editor methods;
+  - the `workspace::WorkspaceView` and `CrateInfo` facade;
+  - `UnifyOutputFormat`, replaced by `TextJsonOutputFormat` with the same values;
+  - `toml::WorkspaceDepsBuilder` and `toml::editor::TomlBatchEditor`;
+  - `WorkspaceContext::build_with_source_capture`.
+  
+  Surface backups no longer embed the configuration in `metadata.json`.
+  Nothing read this configuration.
+  Also, when the embedded configuration held a key that a later release retired,
+  Cargo-Rail could not list or restore the backup.
+
+- Select remote cache storage for compilation only through `cache setup`.
+  Cargo gives repository `[env]` values and build-script `rustc-env` output to the compiler wrapper.
+  Before this change, a repository could use these values to set `CARGO_RAIL_CACHE_REMOTE`, `CARGO_RAIL_CACHE_MODE`, or `CARGO_RAIL_CACHE_REMOTE_ENVIRONMENT`.
+  It could then select a different bucket, change a read-only setup to read-write,
+  or add environment names to the remote cache identity.
+  The compiler wrapper and `cache status` now ignore all three variables.
+  They use the remote that setup saved.
+  Cargo does not set the environment of a Cargo-Rail command that you start directly.
+  For this reason, `cache probe` and the compiler analysis of `unify` and `surface` still read these variables.
+
+- Read build-script rerun declarations as Cargo reads them: trim each output line first.
+  Before, Cargo-Rail ignored an indented `cargo:rerun-if-changed=PATH` line.
+  Compiler evidence could then stay reusable after that file changed.
+  
+  Unify no longer treats `cfg(target_feature = "...")` or `cfg(panic = "...")` code as unreachable when bare `rustc --print cfg` omits the value.
+  Rustflags and the profile can enable both values.
+  
+  Separate remote-cache coordinators by Azure credential selection, such as `AZURE_CLIENT_ID` or `AZURE_FEDERATED_TOKEN_FILE`.
+  AWS credentials already separated coordinators in the same way.
+  
+  Planning-evidence identities must use lowercase hexadecimal digits, as the `planning-evidence-v2` schema requires.
+
+- Reject `--check` and other `unify` or `config migrate` options that come before the `apply` subcommand.
+  Before, `cargo rail unify --check apply` ignored `--check` and wrote manifests.
+  
+  Keep machine output to one JSON value.
+  `--json unify undo` no longer prints `backup restored` before the JSON result.
+  When a `--diagnostics-file` write fails after a successful command, Cargo-Rail reports the failure on stderr.
+  A missing working directory or a failed standard-output write now causes exit code 2, not 1.
+  Exit code 1 means a pending mutation.
+  
+  `config migrate apply` no longer deletes a default-only file that `--config` selected explicitly.
+  A default-only file contains only default values.
+  `init` refuses to write below the Cargo workspace root,
+  because configuration discovery never reads a file there.
+  `init --force` no longer overwrites a file that another discovery location shadows.
+  
+  `config explain --all` lists `release.auxiliary_cargo_manifests` and `unify.transitive_pinning.host` when they are unset.
+  `config explain` also accepts these fields by name.
+  The `plan` help examples save and verify the plan under `target/`.
+  An untracked plan file inside the checkout is itself drift.
+  
+  Without `--since`, `plan` and `change check` select a default ref: the first of `origin/HEAD`, `origin/main`, `origin/master`, `main`, or `master` that exists.
+  They fail when none of these refs exists.
+  `plan` compares against the merge base of the default ref and `HEAD`.
+  `change check` compares against the default ref itself, or against that merge base with `--merge-base`.
+  Before, when neither `origin/HEAD` nor `origin/main` existed, both commands compared against `HEAD~1`.
+  That comparison left out earlier commits on the branch.
+
+- Bind whether each package has a default README in reused Clippy results.
+  `cargo metadata` reports `README.md`, `README.txt`, or `README` as the README of a package without a `readme` key.
+  `clippy::cargo_common_metadata` reads that name.
+  Before this change, a new or removed README did not change the Clippy action.
+  With `-D clippy::cargo`, a hit could then replay a pass after the README was removed.
+  The contents of a README are still not bound, so an edit to a README still hits.
+
+- Cargo-Rail captures some inputs after the compiler exits.
+  Store no cold result when one of these inputs changed while the compiler ran.
+  This rule covers linker inputs, failed linker lookups, native-library candidates,
+  procedural-macro reads, and selected repository inputs.
+  Otherwise, a cold result could bind a state that the compiler never read.
+  For example, a file could change and then return to its earlier content during compilation.
+  A candidate could also appear and then disappear during compilation.
+  The action bypasses with `cold_input_changed_during_execution`.
+
+- Keep one compiler session for each compiler environment in a build, up to eight sessions.
+  Cargo runs build-script probes with different library search paths from its ordinary units.
+  A build no longer recaptures the session each time it switches between these environments.
+  Each recapture ran two `rustc` queries.
+
+- Reuse a cached action when another compiler wrapper replaces the shared compiler session
+  while this wrapper reads it.
+  The read now tries again under the session lock.
+  Before, it bypassed with `native_cache_session_unavailable`.
+  Add the error that causes a session, installation, or local cache bypass to the `cargo rail cache report` details.
+
+- Avoid unnecessary ELF linker search probes for directly named archives and object files.
+  Linker scripts and binary metadata retain candidates for actual or uncertain searches,
+  and every selected file keeps its content binding.
+  Separate limits for found files
+  and absent search candidates prevent their combined count from causing unnecessary `elf_linker_witness_unavailable` bypasses on
+  large workspaces.
+
+- Reuse crates whose build scripts emit a bare `rustc-link-search` or `-L all=` directory outside the repository.
+  An example is non-bundled `libsqlite3-sys` with a system library directory.
+  Rustc also searches that directory for Rust crates.
+  That search now binds by absolute host path.
+  Before, it bypassed with `compiler_native_input_evidence_unavailable`.
+
+- On macOS, stage the compiler-observation wrappers as clones instead of hard links.
+  The first launch of a new executable waits for a Gatekeeper scan.
+  When the scan resolved a hard link to the deleted copy of another command, it terminated the launch.
+
+- Name every condition that stops a procedural macro unit in the cache report.
+  Before this change, the example named only the first condition.
+  For example, a macro that starts `cargo metadata` and reads `.env` files outside the repository showed only the process.
+  The example now names each effect, secret-named variable, process, and read.
+  The unit still has one reason, so the reason counts still add up to the bypassed units.
+  A process appears as its program and subcommand, such as `cargo metadata`, without its other arguments.
+
+- Reuse units whose procedural macros search upward past the workspace root for a missing file.
+  For example, `sqlx` 0.9 looks for a `.env` file in each directory up to the file-system root.
+  Before this change, each check outside the repository made the unit bypass with `procedural_macro_read_outside_repository`.
+  The action now binds the absence of that name in every directory above the root.
+  If a file with that name exists above the root, the unit still runs on the ordinary compiler path.
+  Remote storage neither publishes nor restores these results,
+  because directories outside the repository decide them.
+
+- Reuse crates that load a procedural macro that links an asynchronous runtime but never starts it.
+  Classify the event-queue, fork-handler, socket, and descriptor functions that the standard library,
+  tokio, and mio import.
+  These functions include glibc's `__register_atfork` and macOS `kqueue` and `kevent`.
+  A function with an effect records that effect only when the macro calls the function.
+  Treat every socket operation and every change of user, group, or session as an effect.
+  Require that the import table and the Linux system-call table classify each operation in the same
+  way.
+
+- Plan changes outside a nested workspace.
+  A changed Cargo configuration file
+  or toolchain file in a parent directory of the workspace root now requires every built-in Cargo item
+  for the whole workspace.
+  A changed `rustfmt.toml`, `clippy.toml`, or `deny.toml` file in that location requires `cargo.fmt`, `cargo.clippy`, or `dependency-policy`, respectively.
+  Any other changed file outside the workspace widens built-in Cargo work
+  until planning evidence shows that no compiler read it.
+  Before, the planner dropped these changes and skipped the work as if the evidence were complete.
+
+- Reuse a library that Cargo compiles before the rlib of a dependency is complete.
+  Cargo starts a dependent from the rmeta of the dependency.
+  A compilation that reads only crate metadata never reads the rlib that has the same filename hash.
+  That rlib is no longer an input.
+  Its appearance during compilation no longer causes a bypass with `compiler_native_input_evidence_unavailable`.
+  As a result, cold and warm builds bind the same search.
+
+- Plan every built-in Cargo item for the whole workspace when `rust-toolchain.toml`, `rust-toolchain`, or the root `.cargo/config.toml` changes.
+  Plan `cargo.clippy` for the whole workspace when a Clippy configuration file changes.
+  These files have an effect on every package.
+  Before, a change to these files together with a change to the source of one member selected only
+  that member and its dependents.
+  
+  Emit exact test targets for a package only when its own target files are the sole reason
+  for its selection.
+  A package whose dependency also changed now keeps all of its targets.
+  For example, `b` depends on `a`, and both `crates/a/src/lib.rs` and `crates/b/tests/it.rs` change.
+  Package `b` now keeps all of its targets.
+
+- Apply a mutation plan that was saved inside the worktree.
+  Before, `config migrate -f json > migrate.json` followed by `config migrate apply --plan migrate.json` failed with "mutation drift detected".
+  This failure occurred because the shell created `migrate.json` before the preview captured the worktree.
+  The same failure occurred after a second `unify --check -o plan.json` run and with every other `--plan` consumer.
+  The preview now ignores the file that its standard output or `-o` writes.
+  Apply now ignores the file that `--plan` names.
+  A relative `--plan` or `-o` path is relative to the current directory.
+
+- Make Git operations safer:
+  
+  - When Cargo-Rail stages or cleans planned paths, it treats `*`, `?`,
+    and `[` in file names as literal characters.
+  - A split `remote` must not start with `-`.
+    Git receives every configured remote after `--`, so a value such as `--upload-pack=<command>` cannot run a command.
+  - The post-apply check for unplanned changes now sees files that appeared
+    after Cargo-Rail captured the plan.
+
+- Refuse a release when the changelog path, the change directory, or a change file is a symbolic link.
+  Before, the release followed the link and wrote its target, which configuration does not name.
+  For example, `CHANGELOG.md -> target/CHANGELOG.md` committed the ignored `target/CHANGELOG.md`.
+  A link to a file outside the repository was already refused, but for a different reason.
+  `change status` and `change check` also refuse a linked change file or change directory.
+  `change add` refuses to write through a linked change directory.
+
+- List change entries in release notes and changelogs by bump level.
+  `major` entries come first, then `minor` entries, then `patch` entries.
+  Before, entries followed the change-file names.
+  Thus, a breaking change and its upgrade steps could come last.
+  Entries with the same level keep the order of their file names.
+
+- Keep the release push credential away from build scripts and procedural macros.
+  Release runners pass the push token as process-scoped Git configuration (`GIT_CONFIG_*` variables).
+  The companion Action and this repository's release workflow do this.
+  `cargo rail release` now removes these variables from `cargo package` and `cargo semver-checks`.
+  It already removed the registry and forge tokens there.
+  Before, code that these commands compiled and ran could read the push token.
+
+- On Linux and macOS, hash each unchanged input file once for each compiler wrapper.
+  Before, Cargo-Rail hashed a static library in the `OUT_DIR` of a `-sys` crate again when rustc selected it.
+  It hashed that library again before it restored a hit.
+
+- Build Cargo-Rail release archives and their bundled compiler driver with Rust 1.99.0.
+  The bundled driver serves only the exact compiler that built it.
+  For a workspace on another compiler, such as Rust 1.98.1,
+  Cargo-Rail builds the driver from its authenticated source with that compiler.
+  That build needs the `rustc-dev` component of the workspace toolchain.
+
+- With `release.semver_check = "deny"`, a crate that has no baseline tag is checked against the registry that receives it.
+  The release asks that registry whether the crate has an earlier version.
+  Before, it always asked crates.io.
+  Thus, an unrelated crates.io crate with the same name could block a release to another registry.
+
+- When `cargo semver-checks` cannot produce a verdict, the release warning names its error.
+  Before, the warning showed the first line of output, such as `Cloning <commit>`.
+  The error came later, for example a baseline dependency that crates.io yanked.
+
+- Compile one fewer view for a package that declares features but no `default` feature.
+  For that package, `--no-default-features` compiles the same configuration as the default selection.
+  Surface and the compiler evidence of `unify` compiled that configuration twice.
+
+- An rlib or staticlib that rustc writes can hold a native-library member.
+  Compile without reuse when the compilation did not generate that member
+  and no reported native-library search selected it.
+  A future rustc might bundle a library that the compiler driver does not report.
+  With this rule, the archive then cannot be bound without the search that chose the library.
+
+- Store no linked result when rustc passes a library by path from a native search directory
+  and no reported native-library search selected it, unless the compiler arguments name that path.
+  The action bypasses with `native_library_search_unreported` because the search that chose the library is unbound.
+  
+  Startup objects and runtime files added by GCC
+  or Clang do not require a rustc native-library search report.
+  Their contents and driver-selected paths remain bound by the linker witness.
+
+- On Windows, accept a `file:///C:/...` origin for releases.
+  Cargo-Rail read the URL path as `/C:/...`, which is not an absolute Windows path,
+  so it refused the origin as relative.
 ## [0.31.1](https://github.com/loadingalias/cargo-rail/compare/v0.31.0...v0.31.1) - 2026-10-11
 - Report disabled release effects as skipped instead of completed publication,
   while preserving recovery instructions.
