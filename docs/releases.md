@@ -283,6 +283,10 @@ A binary release runs the step two times, with one asset job for each target bet
 ```
 
 Give the `release` job an `outputs` map with `state: ${{ steps.<id>.outputs.state }}` and `tags: ${{ steps.<id>.outputs.tags }}`.
+Also give the `release` and `publish` jobs `attestations: read`.
+The run that finishes the release verifies the provenance of each asset.
+The second run succeeds in every state except `awaiting_checks`.
+To fail the workflow when the release did not finish, add a step that requires its `state` output to be `released`.
 
 ## Machine output
 
