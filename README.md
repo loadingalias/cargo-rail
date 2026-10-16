@@ -87,7 +87,7 @@ Before you replace an older cache installation, read the [cache upgrade and reco
 | Native archive | CLI, remote cache providers, authenticated compiler driver and its source | None |
 | `cargo binstall cargo-rail` | Prebuilt CLI only | None |
 | `cargo install cargo-rail --locked` | CLI without remote cache providers; add `--features s3,azure` | Cargo-Rail's `rust-version` or newer |
-| GitHub Action (planner, `setup`, `cache`) | Authenticated archive components for the version in the Action's lock | None |
+| GitHub Action (planner, `setup`, `cache`, `release`) | Authenticated archive components for the version in the Action's lock | None |
 | Compiler adapter pack | A compiler driver for installations without one | The exact compiler that it serves |
 
 To install one exact version, run `cargo install cargo-rail --locked --version X.Y.Z`.

@@ -14,7 +14,7 @@ and registries stay the executors of their own operations.
 | `unify` | Dependency diagnostics and manifest mutation plans | General Cargo execution |
 | `surface` | Compiler-derived reachability and visibility plans | Source lints outside its compiler contract |
 | cache | Verified compiler facts and results | Cargo freshness or incremental compilation |
-| `change` / `release` | Reviewed release intent and durable publication state | Forge, registry, or Git implementation |
+| `change` / `release` | Reviewed release intent and release decisions derived from Git, registry, and GitHub state | Forge, registry, or Git implementation |
 | `split` / `sync` | Crate ownership, history mapping, and conflict receipts | General repository synchronization |
 
 These workflows share captured infrastructure.
@@ -129,6 +129,7 @@ On Linux and macOS, this module instruments procedural-macro images to record wh
 | `compiler/`                         | Compiler invocation, facts, sessions, and native-result decisions |
 | `cache/`                            | Installation profiles, local CAS authority, result retention, and usage reporting |
 | `remote_cache/`                     | Machine-owned provider authority and remote transport |
-| `mutation/`                         | Drift checks, authorized writes, backups, and receipts |
+| `mutation/`                         | Drift checks, authorized writes, and receipts |
+| `backup/`                           | Workspace-file backups for mutation recovery |
 | `release/`, `split/`, `sync/`       | Durable Git, forge, registry, and cross-repository workflows |
 | `git/`, path types, process helpers | External capability and containment boundaries |

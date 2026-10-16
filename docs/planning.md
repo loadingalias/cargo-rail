@@ -16,9 +16,11 @@ worktree, and untracked files:
 ```bash
 cargo rail plan
 cargo rail plan --explain
-cargo rail plan --json > plan.json
+cargo rail plan --json > target/plan.json
 ```
 
+The default branch is the first of these refs that exists: `origin/HEAD`, `origin/main`, `origin/master`, `main`, or `master`.
+When none of these refs exists, `plan` fails.
 Use `--since <REF>` for an exact base.
 Use `--from <REF> --to <REF>` for an exact Git-object comparison that ignores the live worktree.
 `--all` is the only normal override.
@@ -35,8 +37,7 @@ A skipped planner item cannot replace those checks.
 ## Register repository work
 
 Pure Cargo workspaces need no planning configuration.
-Cargo-Rail already owns the built-in Cargo, dependency-policy, release-semver,
-and Surface decisions.
+Cargo-Rail already owns the built-in Cargo, `dependency-policy`, `release.semver`, and `surface` decisions.
 
 Register only positive inputs for repository-specific work.
 Keep commands in Just, scripts, or CI:
@@ -147,8 +148,8 @@ unknown configuration fields, and malformed variant catalogs.
 The checked-in contract is [`plan-v9.schema.json`](../schemas/plan-v9.schema.json):
 
 ```bash
-cargo rail plan --schema > plan.schema.json
-cargo rail plan --json > plan.json
+cargo rail plan --schema > target/plan.schema.json
+cargo rail plan --json > target/plan.json
 ```
 
 These fields have execution authority:
@@ -198,6 +199,9 @@ An unignored plan file inside the checkout is untracked drift.
 Without evidence, a changed file widens every built-in Cargo work item if a compiler, build script,
 or procedural macro could read the file.
 This applies even to a README.
+
+A changed `rust-toolchain.toml`, `rust-toolchain`, or `.cargo/config.toml` at the workspace root requires every built-in Cargo item for the whole workspace.
+These files have an effect on every package.
 
 In a nested workspace, a changed file outside the workspace directory also counts.
 A changed Cargo configuration or toolchain file in a parent directory of the workspace root requires
@@ -254,8 +258,8 @@ The evidence follows the rebuild model of Cargo:
 - A file that a procedural macro reads counts only when the macro reports the read to the compiler,
   as Cargo requires.
   A macro that reads a file without a report can become stale under Cargo too.
-- An added `clippy.toml` or `.clippy.toml` always selects `cargo.clippy`,
-  because dep-info names only files that exist.
+- Any changed `clippy.toml` or `.clippy.toml` selects `cargo.clippy` for the whole workspace.
+  A Clippy configuration file can govern many packages, and dep-info names only files that exist.
 - Files that a test reads at run time, such as a fixture, are not compiler inputs.
   Declare them as repository work.
 

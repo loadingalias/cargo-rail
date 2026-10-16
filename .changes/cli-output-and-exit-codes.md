@@ -22,6 +22,9 @@ because configuration discovery never reads a file there.
 The `plan` help examples save and verify the plan under `target/`.
 An untracked plan file inside the checkout is itself drift.
 
-Without `--since`, `plan` and `change check` compare against the first of these refs that exists: `origin/HEAD`, `origin/main`, `origin/master`, `main`, or `master`.
+Without `--since`, `plan` and `change check` select a default ref: the first of `origin/HEAD`, `origin/main`, `origin/master`, `main`, or `master` that exists.
 They fail when none of these refs exists.
-Before, they compared against `HEAD~1`, so the comparison left out earlier commits on the branch.
+`plan` compares against the merge base of the default ref and `HEAD`.
+`change check` compares against the default ref itself, or against that merge base with `--merge-base`.
+Before, when neither `origin/HEAD` nor `origin/main` existed, both commands compared against `HEAD~1`.
+That comparison left out earlier commits on the branch.

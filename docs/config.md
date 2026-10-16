@@ -31,6 +31,9 @@ cargo rail config migrate
 `init` recognizes an explicit `[workspace]` manifest or a root `[package]` manifest.
 If no Cargo manifest exists, `init` still writes the requested configuration.
 It also reports that it detected no workspace.
+`init` refuses to write below the Cargo workspace root, because discovery never reads a file there.
+When another discovery location already holds the active file, `init` refuses to write, even with `--force`.
+To replace the active file, pass its exact path with `--output` and `--force`.
 
 `cargo rail config` without a subcommand shows the configured overrides and the active source.
 When no configuration file exists, it reports that the coded defaults apply.
@@ -81,12 +84,20 @@ When decoding fails, the error identifies the revision and the configuration pat
 `cargo rail config migrate` previews the update.
 `config migrate apply` writes it.
 The migration replaces each retired `[release]` key from Cargo-Rail 0.31 with its successor.
-The successor keeps the behavior of the retired key:
+It writes successors only to a file that contains a retired `[release]` key or the `{prefix}` placeholder.
+In that file, the successor keeps the behavior of the retired key:
 
-- A file without registry publication gets `publish = "none"`.
-- A file without GitHub effects gets `github_release = false` and `checks = "none"`.
+- Without `registry_publication = "crates-io"`, the file gets `publish = "none"`.
+- Without `remote_effects = "github"` or `"auto"`, the file gets `github_release = false` and `checks = "none"`.
 - `{prefix}` in a tag format becomes the prefix itself.
 - An artifact inventory becomes `release.assets`.
+
+Without such a file, the release uses the 0.32 defaults.
+By default, Cargo-Rail 0.31 published to no registry and created no GitHub releases.
+By default, Cargo-Rail 0.32 publishes to crates.io.
+On a GitHub `origin`, it also creates GitHub releases and uses `checks = "all"`.
+To keep publication and GitHub releases off, as in 0.31, set `publish = "none"`, `github_release = false`, and `checks = "none"` in `[release]`.
+Publication still needs a registry credential, and Cargo-Rail checks for it before any effect.
 
 The migration also removes settings that only repeat the current defaults.
 See [Start sparse](#start-sparse).
@@ -117,7 +128,8 @@ It removes the header comment that `config print` writes.
 When a file contains only defaults,
 the migration deletes it if no other discovery location holds a configuration file.
 Otherwise, the migration keeps the emptied file.
-The migration also keeps an emptied file that is outside the discovery locations.
+The migration also keeps an emptied file that is outside the discovery locations,
+and an emptied file that `--config` selects explicitly.
 
 Keys that an earlier release removed, such as `[run]` or `release.require_changelog_entries`, have no current meaning.
 The migration removes them first and names the release that removed each one.

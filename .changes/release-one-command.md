@@ -31,8 +31,15 @@ After you upgrade, run `cargo rail config migrate` and replace the release workf
 - `[release]` adds `crates`, `publish`, `github_release`, `checks`, `assets`, and `asset_attestations`.
   It retires `remote_effects`, `registry_publication`, `hosted_workflow`, `validation`, `artifacts`, `tag_prefix`, `require_change_files`, `release_notes_dir`, `require_release_notes`, and the `{prefix}` tag placeholder.
   `config migrate` replaces the retired fields and keeps their behavior.
-  For example, a file without registry publication gets `publish = "none"`.
+  It writes successors only to a file that contains a retired field or the `{prefix}` placeholder.
+  For example, such a file without `registry_publication = "crates-io"` gets `publish = "none"`.
   Aliases accept `{major}` and `{minor}`.
+- A configuration without retired fields gets the new release defaults.
+  By default, 0.31 published to no registry and created no GitHub releases.
+  By default, 0.32 publishes to crates.io.
+  On a GitHub `origin`, it also creates GitHub releases and uses `checks = "all"`.
+  To keep publication and GitHub releases off, set `publish = "none"`, `github_release = false`, and `checks = "none"`.
+  Publication still needs a registry credential, and the release checks for it before any effect.
 - `release.publish` names `crates-io`, `none`, or any Cargo registry with a sparse index.
   The registry credential check reads Cargo configuration.
   Packaging and semver checks run without registry or forge tokens.

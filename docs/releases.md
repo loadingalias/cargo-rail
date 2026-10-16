@@ -23,6 +23,8 @@ A new release starts only when all of these conditions are true:
 
 - the current branch exists on `origin`, and `HEAD` is the tip of that branch on `origin`;
 - the worktree is clean, and no untracked files exist;
+- no changelog path or change directory path contains a symbolic link,
+  and no change file is a symbolic link;
 - the checks gate passes on `HEAD` (see [Checks](#checks));
 - no planned tag exists on `origin` or locally;
 - no planned version is already in the registry;
@@ -32,6 +34,8 @@ A new release starts only when all of these conditions are true:
 - each GitHub release has notes: the changelog section of the crate for the new version.
 
 Any failure stops the command before it changes anything.
+The release refuses a symbolic link before it reads the changelog or change files,
+because a release rewrites these files and a link would redirect the write.
 `--dry-run` runs all of these checks.
 Thus a passing dry run means that the release can start.
 
@@ -338,7 +342,15 @@ They compare the previous tag with the new tag.
 1. Run `cargo rail config migrate apply`.
    The migration replaces each retired `[release]` key with its successor.
    The successor keeps the behavior of the retired key.
-   For example, a file without registry publication gets `publish = "none"`.
+   For example, a file with retired keys but without `registry_publication = "crates-io"` gets `publish = "none"`.
+1. If the migration added no `[release]` successors, review the new release defaults.
+   The migration writes successors only to a file that contains a retired `[release]` key or the `{prefix}` placeholder.
+   Without such a file, the release uses the 0.32 defaults.
+   By default, Cargo-Rail 0.31 published to no registry and created no GitHub releases.
+   By default, Cargo-Rail 0.32 publishes to crates.io.
+   On a GitHub `origin`, it also creates GitHub releases and uses `checks = "all"`.
+   To keep publication and GitHub releases off, as in 0.31, set `publish = "none"`, `github_release = false`, and `checks = "none"` in `[release]`.
+   Publication still needs a registry credential, and Cargo-Rail checks for it before any effect.
 1. Replace the release workflow with the [Action example](#ci).
    The old `transaction`, `intent`, and `source` inputs no longer exist.
 1. To finish a release that 0.31 started, run `cargo rail release`.

@@ -15,6 +15,7 @@ Start with the smallest lane that tests the changed behavior:
 | Compiler                  | `just test`; add `just check-compiler-driver` for driver changes |
 | Cache                     | `just test-cache-host` |
 | Release                   | `just test`; add `just release-check` to preview the next release |
+| Surface                   | `just build`, then `just check-surface` with `target/debug` first on `PATH` |
 | Cross-target compilation  | `just check-cross` |
 | Tooling or GitHub Actions | `just check-tooling` |
 
@@ -110,6 +111,17 @@ Move that separate nightly pin to a newer nightly only after the focused lane pa
 CI runs the same recipes one at a time, when the plan for the change selects them.
 Markdown lint runs only on the workstation.
 The pinned `rumdl` is installed there.
+
+`just check-surface` checks product reachability and visibility with `cargo rail surface --check --explain`.
+`just check` and `just ci-check` do not run it.
+CI runs it on x86_64 Linux when the plan for the change requires `surface`.
+The recipe needs the source build first on `PATH`,
+because the build from `just build` embeds the compiler-driver authority that Surface needs.
+Run `just build`, then run this command:
+
+```bash
+PATH="$PWD/target/debug:$PATH" just check-surface
+```
 
 For runtime tests, run `just test` separately.
 These tests include native cache tests and doctests.

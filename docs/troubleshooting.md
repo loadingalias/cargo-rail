@@ -246,12 +246,9 @@ Before the first build, do these steps:
 1. Run the same command without `--check`.
 1. Run `cargo rail cache setup` again.
 
-Cargo-Rail rejects independent compiler adapter packs from earlier releases
-(native input protocol 4).
-Publish these packs again for 0.30.0.
-
 Cargo-Rail 0.32 uses native input protocol 5.
-It rejects independent compiler adapter packs from 0.30 and 0.31.
+It rejects independent compiler adapter packs from 0.30 and 0.31, which use protocol 4,
+and packs from earlier releases.
 Publish these packs again for 0.32.
 
 If setup reports an unsupported installation receipt version, do these steps:
@@ -303,6 +300,10 @@ These errors need a decision, not a rerun:
   For a repository that cannot attest, set `release.asset_attestations = "off"` instead.
 - **An alias names a commit outside this release line.** Examine the alias.
   A release moves an alias only forward.
+- **A changelog path, the change directory, or a change file is a symbolic link.**
+  The check also covers each directory on the configured changelog and change directory paths.
+  The release refuses the link before it reads the file, because a release rewrites these files.
+  Name the file or directory itself in `release.changelog.path` or `release.change_dir`, or replace the link with the file.
 
 Use the same procedure to finish a release that Cargo-Rail 0.31 started,
 after its release commit is on the branch.

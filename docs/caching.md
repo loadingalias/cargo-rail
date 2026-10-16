@@ -169,7 +169,9 @@ Use a separate output directory for each host.
 The command verifies component digests and refuses to replace existing release outputs.
 It does not publish its outputs.
 The [packaging workflow](../.github/workflows/package.yml) produces these archives.
-The [release transaction](releases.md) verifies the exact producer attempt and bytes before publication.
+Before `cargo rail release` publishes a draft, it compares each asset with the SHA-256 digest that GitHub recorded.
+It also verifies the attestation of each asset, unless `release.asset_attestations = "off"`.
+See [Release binaries](releases.md#release-binaries).
 Extract the complete archive so that the component files stay together.
 The companion cache Action requires these components: core, wrapper, worker, matched driver,
 and authenticated driver source.
@@ -253,6 +255,12 @@ The bypass reason names the cause:
 | `cold_input_changed_during_execution`   | An input that Cargo-Rail captured after the compiler exited changed after the compiler started. Examples are a linker input, a native-library candidate, and a macro read |
 | `native_library_search_unreported`      | The linker received a file by path from a native search directory that no reported native-library search selected |
 | `complete_action_capture_unavailable`   | Any other capture error. `cache status` counts it as a failure |
+
+`native_library_search_unreported` applies only to a file that rustc passes to the linker.
+A file that the compiler arguments name needs no search report.
+A GCC or Clang link driver adds its own startup objects and runtime files.
+These files also need no rustc native-library search report.
+The linker witness binds their contents and the paths that the driver selected.
 
 A [cache report](#aggregate-cache-measurements) names the entry, bound, or candidate that caused each of these reasons.
 
@@ -398,7 +406,8 @@ These units run without reuse:
 
 A unit reports one reason.
 An effect comes first, then a secret-named variable, then a process, and then a read.
-The [cache report](#aggregate-cache-measurements) example names every effect, process, and read that stops the unit.
+The [cache report](#aggregate-cache-measurements) example names every effect, secret-named variable, process,
+and read that stops the unit.
 Thus, one cold build shows every condition that the unit must clear.
 
 Linking a function is not calling it.
@@ -642,7 +651,10 @@ It derives the standard R2 account endpoint.
 It intentionally has no syntax for a jurisdiction or an arbitrary endpoint.
 Use a default-jurisdiction bucket until a real consumer requires a typed jurisdiction contract.
 
-`cache probe` uses the saved authority and the standard AWS credential environment.
+When `CARGO_RAIL_CACHE_REMOTE` is set, `cache probe` uses that remote, with `CARGO_RAIL_CACHE_MODE` and `CARGO_RAIL_CACHE_REMOTE_ENVIRONMENT` when they are set.
+Otherwise, it uses the saved authority.
+A mode or environment variable without `CARGO_RAIL_CACHE_REMOTE` is an error.
+`cache probe` reads credentials from the standard AWS credential environment.
 This environment includes a session token when one is present.
 `cache probe` proves authenticated marker compatibility.
 It can initialize an absent marker only in `read-write` mode.
@@ -889,6 +901,11 @@ It removes a profile only if the profile is detached and has no enrolled roots.
 and the installation receipt.
 It keeps the profiles and their CAS data.
 
+Cargo-Rail refuses a selected local CAS root that is not empty and has no `OWNER` marker.
+`cargo rail cache recover --check` previews the recovery of that root.
+`cache recover` moves the root to an adjacent quarantine directory, writes a recovery receipt beside it,
+and creates a new owned CAS; it deletes no bytes.
+
 Setup repairs the current installed component bytes from their authenticated source files.
 `cache status` reads stale receipt versions but does not activate them.
 Before setup installs the current component set and updates the wrapper entry of Cargo,
@@ -934,8 +951,8 @@ The recording contains bounded aggregate counters and reason counts.
 In `details`, the finished interval also names one example for each of the first eight bypass reasons.
 An example can be the source entry, native-library candidate, macro import,
 or session or admission error that caused the reason.
-For a unit that loads procedural macros, the example names every effect, process,
-and read that stops the unit, not only the condition that the reason names.
+For a unit that loads procedural macros, the example names every effect, secret-named variable,
+process, and read that stops the unit, not only the condition that the reason names.
 Examples can name host paths.
 Examples never enter the measurements, a cache key, or restore authority.
 Text output lists each bypass reason with its example.
