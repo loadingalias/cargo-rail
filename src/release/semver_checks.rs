@@ -225,14 +225,25 @@ fn marker_line(text: &str) -> Option<String> {
         .map(|line| line.trim().to_string())
 }
 
+/// The line that best explains a failure: the first error that is not a header for the lines below it,
+/// then the first error, then the first line. Progress lines such as `Cloning` come before the error.
 fn first_message(stderr: &str, stdout: &str) -> String {
-    for line in stderr.lines().chain(stdout.lines()) {
-        let line = line.trim();
-        if !line.is_empty() {
-            return line.to_string();
-        }
-    }
-    "cargo-semver-checks exited without output".to_string()
+    let lines = || {
+        stderr
+            .lines()
+            .chain(stdout.lines())
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+    };
+    let errors = || lines().filter(|line| line.starts_with("error"));
+    errors()
+        .find(|line| !line.ends_with(':'))
+        .or_else(|| errors().next())
+        .or_else(|| lines().next())
+        .map_or_else(
+            || "cargo-semver-checks exited without output".to_string(),
+            str::to_string,
+        )
 }
 
 #[cfg(test)]
@@ -297,6 +308,20 @@ mod tests {
             verdict,
             SemverCheck::Inconclusive {
                 message: "error: the crate lib-a has no published versions to use as a baseline".to_string(),
+            }
+        );
+    }
+
+    /// Progress lines precede the error, so the detail must name the error, not the first progress line.
+    #[test]
+    fn inconclusive_detail_names_the_error_after_progress_lines() {
+        let stderr = "     Cloning ec6d396738b8ad9204236c088c3e3ffea9440adf\n    Building cargo-rail v0.31.1 (current)\n\
+                      error: running 'cargo update' on crate 'cargo-rail' failed with output:\n\
+                      error: failed to select a version for the requirement `zip = \"^8.6.0\"`\n";
+        assert_eq!(
+            classify_output(false, "", stderr),
+            SemverCheck::Inconclusive {
+                message: "error: failed to select a version for the requirement `zip = \"^8.6.0\"`".to_string(),
             }
         );
     }
