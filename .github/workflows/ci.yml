@@ -152,6 +152,14 @@ jobs:
           cargo-rail rail plan --verify "$PLAN_FILE"
           just test
           cargo-rail rail plan --verify "$PLAN_FILE"
+      - name: Check source surface
+        if: matrix.platform == 'x86_64-linux' && contains(fromJSON(steps.rail.outputs.required-work), 'surface')
+        env:
+          PLAN_FILE: ${{ steps.rail.outputs.plan-file }}
+        run: |
+          [[ "$(cargo-rail-action plan is-required "$PLAN_FILE" surface)" == true ]]
+          # The workspace build embeds the compiler-driver authority that Surface needs; the candidate planner does not.
+          PATH="$PWD/target/debug:$PATH" just check-surface
       - name: Check worktree
         if: always()
         run: |

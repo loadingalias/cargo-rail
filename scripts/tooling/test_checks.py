@@ -42,9 +42,6 @@ else:
         log.write(json.dumps({'args': [name, *sys.argv[1:]],
                               'rustdocflags': os.environ.get('RUSTDOCFLAGS'),
                               'bootstrap': os.environ.get('RUSTC_BOOTSTRAP')}) + '\\n')
-    fail_args = os.environ.get('CHECK_FAIL_ARGS')
-    if fail_args and [name, *sys.argv[1:]] == json.loads(fail_args):
-        sys.exit(int(os.environ['CHECK_FAIL_CODE']))
     if sys.argv[1:2] == [os.environ.get('CHECK_FAIL_COMMAND')]:
         sys.exit(23)
 '''
@@ -144,20 +141,16 @@ else:
             ['cargo', 'rail', 'plan', '--explain', '--all'],
         ])
 
-        preview = ['cargo', 'rail', 'release', '--dry-run', '--bump', 'patch']
-        calls = self.run_recipe('pre-release', 'patch')
+        calls = self.run_recipe('release-check', 'patch')
         self.assertEqual([call['args'] for call in calls], [
-            preview,
-            ['cargo', 'rail', 'surface', '--check', '--explain'],
+            ['cargo', 'rail', 'release', '--dry-run', '--bump', 'patch'],
         ])
 
-        # Pending checks (exit 1) and errors (exit 2) both stop the heavy surface gate.
-        self.environment['CHECK_FAIL_ARGS'] = json.dumps(preview)
-        for code in ['1', '2']:
-            with self.subTest(code=code):
-                self.environment['CHECK_FAIL_CODE'] = code
-                calls = self.run_recipe('pre-release', 'patch', success=False)
-                self.assertEqual([call['args'] for call in calls], [preview])
+        # The release checks gate enforces Surface through CI, so the release preview never runs it.
+        calls = self.run_recipe('check-surface')
+        self.assertEqual([call['args'] for call in calls], [
+            ['cargo', 'rail', 'surface', '--check', '--explain'],
+        ])
 
     def test_shared_check_failure_stops_later_checks(self):
         self.environment['CHECK_FAIL_COMMAND'] = 'clippy'

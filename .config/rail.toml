@@ -22,6 +22,19 @@ targets = [
 include_renamed = true
 major_version_conflict = "bump"
 
+[surface]
+enabled = true
+
+# Every feature condition is `feature = "x"`, `not(feature = "x")`, or `not(any(...))`;
+# none needs exactly one provider. These two views compile every conditional block.
+[[surface.feature-profile]]
+name = "minimal"
+no-default-features = true
+
+[[surface.feature-profile]]
+name = "complete"
+all-features = true
+
 [plan.work.check-compiler-driver]
 scope = "repository"
 paths = [

@@ -26,8 +26,8 @@ cache-status:
 release-check bump="auto":
     cargo rail release --dry-run --bump {{quote(bump)}}
 
-# Run the heavy source-surface gate only after the release preview passes.
-pre-release bump="auto": (release-check bump)
+# Check product reachability and visibility; CI runs this when the plan requires `surface`.
+check-surface:
     cargo rail surface --check --explain
 
 # Shared nonmutating checks, also run by the local check recipe.
