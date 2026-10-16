@@ -228,6 +228,14 @@ impl GitHub {
     }
 
     fn request(&self, method: Method, path: &str) -> RailResult<RequestBuilder> {
+        self.request_accepting(method, path, "application/vnd.github+json")
+    }
+
+    /// A repository API request that accepts exactly `media_type`.
+    ///
+    /// `RequestBuilder::header` appends, so each request sets `Accept` only here.
+    /// GitHub answers an asset request that also accepts JSON with the asset's metadata, not its bytes.
+    fn request_accepting(&self, method: Method, path: &str, media_type: &str) -> RailResult<RequestBuilder> {
         let url = self
             .api
             .join(&format!("repos/{}/{}/{path}", self.owner, self.repo))
@@ -236,7 +244,7 @@ impl GitHub {
             .client
             .request(method, url)
             .bearer_auth(&self.token)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header(reqwest::header::ACCEPT, media_type)
             .header("X-GitHub-Api-Version", API_VERSION))
     }
 
@@ -420,8 +428,11 @@ impl GitHub {
             )));
         }
         let response = self
-            .request(Method::GET, &format!("releases/assets/{}", asset.id))?
-            .header(reqwest::header::ACCEPT, "application/octet-stream")
+            .request_accepting(
+                Method::GET,
+                &format!("releases/assets/{}", asset.id),
+                "application/octet-stream",
+            )?
             .send()
             .map_err(|error| RailError::message(format!("downloading release asset {} failed: {error}", asset.name)))?;
         let mut response = if response.status().is_redirection() {

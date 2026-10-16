@@ -24,6 +24,8 @@ pub struct Request {
     pub method: String,
     pub path: String,
     pub authorization: String,
+    /// Every `Accept` header value, in order; a client can send more than one.
+    pub accept: Vec<String>,
     pub body: Vec<u8>,
 }
 
@@ -109,6 +111,7 @@ fn serve(stream: TcpStream, handler: &Handler, address: SocketAddr) -> Result<()
     let (method, path) = (words[0].to_owned(), words[1].to_owned());
     let mut length = 0;
     let mut authorization = String::new();
+    let mut accept = Vec::new();
     loop {
         let mut header = String::new();
         ensure!(input.read_line(&mut header)? > 0, "truncated headers");
@@ -120,6 +123,8 @@ fn serve(stream: TcpStream, handler: &Handler, address: SocketAddr) -> Result<()
                 length = value.trim().parse::<usize>()?;
             } else if key.eq_ignore_ascii_case("authorization") {
                 authorization = value.trim().to_owned();
+            } else if key.eq_ignore_ascii_case("accept") {
+                accept.push(value.trim().to_owned());
             } else if key.eq_ignore_ascii_case("expect") && value.trim() == "100-continue" {
                 input.get_mut().write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
             }
@@ -132,6 +137,7 @@ fn serve(stream: TcpStream, handler: &Handler, address: SocketAddr) -> Result<()
             method,
             path,
             authorization,
+            accept,
             body,
         },
         address,
@@ -432,7 +438,11 @@ fn github(state: &mut GithubState, request: Request, address: SocketAddr) -> Res
             Response::json(200, &GithubState::release_json(release, address))
         }
         ("GET", ["releases", "assets", id]) => {
-            // GitHub redirects asset downloads to signed storage on another host.
+            // GitHub answers with the asset's JSON metadata unless `application/octet-stream`
+            // is the only accepted type; then it redirects to signed storage on another host.
+            if request.accept != ["application/octet-stream"] {
+                return Response::json(200, &json!({ "id": id, "accept": request.accept }));
+            }
             Response {
                 status: 302,
                 headers: vec![("Location".into(), format!("http://{address}/download/assets/{id}"))],
