@@ -26,6 +26,7 @@ jobs:
       checks: read # Read the source commit's check runs.
       pull-requests: read # Find open and merged release pull requests.
       statuses: read # Read the source commit's commit statuses.
+      attestations: read # Verify asset provenance when a rerun finishes the release.
     outputs:
       state: ${{ steps.release.outputs.state }}
       tag: ${{ steps.release.outputs.tag }}
@@ -99,6 +100,7 @@ jobs:
       checks: read # Read the source commit's check runs.
       pull-requests: read # Find merged release pull requests.
       statuses: read # Read the source commit's commit statuses.
+      attestations: read # Verify the provenance of each asset before publication.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -109,7 +111,14 @@ jobs:
       - name: Build this release engine
         run: cargo build --locked --bin cargo-rail
       - name: Verify the assets and publish
+        id: publish
         env:
           GH_TOKEN: ${{ github.token }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: scripts/release.sh
+      # Every state but `awaiting_checks` exits 0, so a green step alone does not prove publication.
+      - name: Require a published release
+        env:
+          STATE: ${{ steps.publish.outputs.state }}
+        run: |
+          [[ "$STATE" == released ]] || { echo "::error::the release ended in state '$STATE'"; exit 1; }
