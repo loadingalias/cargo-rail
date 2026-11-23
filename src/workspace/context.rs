@@ -571,7 +571,7 @@ impl WorkspaceContext {
             Err(err) => return Err(err),
         };
 
-        let initial_generated_roots = [super::cargo_rail_state_root(workspace_root)];
+        let initial_generated_roots = rail_generated_roots(workspace_root)?;
         let mut source_capture = if capture == ContextCapture::Snapshot {
             git.as_ref()
                 .map(|state| GitWorktreeCapture::capture_excluding(state.git(), &initial_generated_roots))
@@ -726,7 +726,7 @@ impl WorkspaceContext {
                 (Some(capture), Some(_)) => capture.shared_snapshot(),
                 (None, None) => Arc::new(SourceSnapshot::capture_filesystem(
                     &workspace_root,
-                    &generated_source_roots(&workspace_root, &cargo),
+                    &generated_source_roots(&workspace_root, &cargo)?,
                 )?),
                 _ => {
                     return Err(RailError::message(
@@ -977,7 +977,7 @@ impl WorkspaceContext {
         }
         SourceSnapshot::capture_filesystem(
             &self.workspace_root,
-            &generated_source_roots(&self.workspace_root, &self.cargo),
+            &generated_source_roots(&self.workspace_root, &self.cargo)?,
         )
     }
 
@@ -1053,7 +1053,7 @@ impl WorkspaceContext {
     pub(crate) fn object_source_changes(&self, base: &str, head: &str) -> RailResult<ChangeSet> {
         let git = self.git()?;
         let generated_roots = if self.historical_planning.is_some() {
-            generated_source_roots(&self.workspace_root, &self.cargo)
+            generated_source_roots(&self.workspace_root, &self.cargo)?
                 .into_iter()
                 .filter_map(|root| {
                     root.strip_prefix(&self.authority_source_root)
@@ -1272,18 +1272,27 @@ fn validated_generated_source_roots(
     if let Some(build_directory) = &cargo.metadata().build_directory {
         validate_cargo_output_root("build", git_root, workspace_root, build_directory.as_std_path())?;
     }
-    Ok(generated_source_roots(workspace_root, cargo))
+    generated_source_roots(workspace_root, cargo)
 }
 
-fn generated_source_roots(workspace_root: &Path, cargo: &CargoState) -> Vec<PathBuf> {
-    let mut roots = vec![
-        super::cargo_rail_state_root(workspace_root),
-        cargo.metadata().target_directory.as_std_path().to_path_buf(),
-    ];
+fn rail_generated_roots(workspace_root: &Path) -> RailResult<Vec<PathBuf>> {
+    if !super::uses_user_storage() {
+        return Ok(vec![super::cargo_rail_state_root(workspace_root)]);
+    }
+    Ok(vec![
+        super::workspace_storage_dir(workspace_root, super::WorkspaceStorage::Cache, None, false)?,
+        super::workspace_storage_dir(workspace_root, super::WorkspaceStorage::State, None, false)?,
+        workspace_root.join(".cargo-rail/unify-report.md"),
+    ])
+}
+
+fn generated_source_roots(workspace_root: &Path, cargo: &CargoState) -> RailResult<Vec<PathBuf>> {
+    let mut roots = rail_generated_roots(workspace_root)?;
+    roots.push(cargo.metadata().target_directory.as_std_path().to_path_buf());
     if let Some(build_directory) = &cargo.metadata().build_directory {
         roots.push(build_directory.as_std_path().to_path_buf());
     }
-    roots
+    Ok(roots)
 }
 
 fn stabilize_cargo_generated_lockfile(
@@ -1378,8 +1387,13 @@ fn stabilize_planning_generated_lockfile(
     Ok(Some(CapturedLockfile::new(lockfile, bytes)))
 }
 
-fn generated_lock_marker_path(workspace_root: &Path) -> PathBuf {
-    super::cargo_rail_state_root(workspace_root).join("generated-lockfile-v1")
+fn generated_lock_marker_path(workspace_root: &Path, create: bool) -> RailResult<PathBuf> {
+    let root = if super::uses_user_storage() {
+        super::workspace_storage_dir(workspace_root, super::WorkspaceStorage::Cache, None, create)?
+    } else {
+        super::cargo_rail_state_root(workspace_root)
+    };
+    Ok(root.join("generated-lockfile-v1"))
 }
 
 fn generated_lock_marker_value(workspace_root: &Path, digest: ContentDigest) -> RailResult<Vec<u8>> {
@@ -1394,7 +1408,7 @@ fn generated_lock_marker_value(workspace_root: &Path, digest: ContentDigest) -> 
 }
 
 fn generated_lock_marker_matches(workspace_root: &Path, digest: ContentDigest) -> RailResult<bool> {
-    let marker = generated_lock_marker_path(workspace_root);
+    let marker = generated_lock_marker_path(workspace_root, false)?;
     let metadata = match fs::symlink_metadata(&marker) {
         Ok(metadata) if metadata.file_type().is_file() => metadata,
         Ok(_) => return Ok(false),
@@ -1421,7 +1435,7 @@ fn write_generated_lock_marker(workspace_root: &Path, lockfile: &Path, digest: C
             lockfile.display()
         )));
     }
-    let marker = generated_lock_marker_path(workspace_root);
+    let marker = generated_lock_marker_path(workspace_root, true)?;
     if fs::symlink_metadata(&marker).is_ok_and(|metadata| !metadata.file_type().is_file()) {
         return Err(RailError::message(format!(
             "generated lockfile marker '{}' is not a regular file",

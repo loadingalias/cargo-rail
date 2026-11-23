@@ -376,6 +376,9 @@ pub fn try_dispatch_pre_context(
                         format,
                     )?;
                 }
+                cli::CacheCommand::Adopt { from, check, format } => {
+                    cache::run_adopt(workspace_root, from.as_deref(), check, format)?;
+                }
                 cli::CacheCommand::Ready { format } => cache::run_ready(workspace_root, format)?,
                 cli::CacheCommand::Normalize {
                     url,

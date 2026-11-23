@@ -3207,6 +3207,70 @@ fn test_unify_apply_writes_mutation_receipts() {
     super::helpers::finish_test(result);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn user_workspace_storage_unifies_with_managed_target() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new_named("unify-user-storage")?;
+        let manifest = workspace.path.join("Cargo.toml");
+        let contents =
+            std::fs::read_to_string(&manifest)?.replace("[workspace]\n", "[workspace]\nexclude = [\"local-dep\"]\n");
+        std::fs::write(&manifest, contents)?;
+        let local = workspace.path.join("local-dep");
+        std::fs::create_dir_all(local.join("src"))?;
+        std::fs::write(
+            local.join("Cargo.toml"),
+            "[package]\nname = \"local-dep\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )?;
+        std::fs::write(local.join("src/lib.rs"), "pub fn hello() {}\n")?;
+        let dependency = ("local-dep", r#"{ path = "../../local-dep", version = "0.1.0" }"#);
+        workspace.add_crate("crate-a", "0.1.0", &[dependency])?;
+        workspace.add_crate("crate-b", "0.1.0", &[dependency])?;
+        workspace.commit("Add crates for user-storage unify test")?;
+        let storage = tempfile::tempdir()?;
+        let cache = storage.path().join("cache");
+        let state = storage.path().join("state");
+        let managed = storage.path().join("managed");
+        std::fs::create_dir(&managed)?;
+        let target = workspace.path.join("target");
+        symlink(&managed, &target)?;
+        std::fs::write(workspace.path.join(".git/info/exclude"), "/target\n")?;
+        let output = super::helpers::cargo_rail_command(&workspace.path)?
+            .env("CARGO_RAIL_WORKSPACE_STORAGE", "user")
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_STATE_HOME", &state)
+            .env("CARGO_RAIL_CACHE_DIR", storage.path().join("compiler-store"))
+            .env_remove("CARGO_TARGET_DIR")
+            .args(["rail", "unify", "apply", "--report"])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "unify apply failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let cache_root = std::fs::read_dir(cache.join("cargo-rail/workspaces"))?
+            .next()
+            .expect("checkout cache directory")?
+            .path();
+        assert!(cache_root.join("cache.lock").is_file());
+        let state_root = state
+            .join("cargo-rail/workspaces")
+            .join(cache_root.file_name().unwrap());
+        assert!(
+            std::fs::read_dir(state_root.join("receipts"))?
+                .any(|entry| { entry.is_ok_and(|entry| entry.file_name().to_string_lossy().starts_with("unify-")) })
+        );
+        assert!(std::fs::read_dir(state_root.join("backups"))?.next().is_some());
+        assert!(workspace.path.join(".cargo-rail/unify-report.md").is_file());
+        assert!(target.is_symlink());
+        assert!(!managed.join("cargo-rail").exists());
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 #[test]
 fn test_unify_apply_from_plan_file() {
     let result: Result<()> = (|| {

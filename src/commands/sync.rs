@@ -1112,8 +1112,7 @@ fn write_sync_audit_artifact(
     pre_heads: &std::collections::BTreeMap<String, (Option<String>, Option<String>)>,
     post_heads: &std::collections::BTreeMap<String, (Option<String>, Option<String>)>,
 ) -> RailResult<PathBuf> {
-    let dir = crate::workspace::cargo_rail_state_root(workspace_root).join("receipts");
-    std::fs::create_dir_all(&dir)?;
+    let dir = crate::workspace::receipt_dir(workspace_root, true)?;
     let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let path = dir.join(format!("sync-audit-{}.json", nonce));
 

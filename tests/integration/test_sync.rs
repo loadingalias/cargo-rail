@@ -1518,7 +1518,42 @@ fn test_sync_manual_conflict_stops_before_commit_and_resumes_from_receipt() {
             recovery_parent
         );
         git(split_dir.path(), &["reset", "--hard", &target_head])?;
-        let resumed = run_cargo_rail(&ws.path, &["rail", "sync", "--resume", receipt.to_str().unwrap()])?;
+        #[cfg(target_os = "linux")]
+        let storage = tempfile::tempdir()?;
+        #[cfg(target_os = "linux")]
+        let (resumed, resolved_receipt) = {
+            let legacy_receipt = std::fs::read(&receipt)?;
+            let user_command = || -> Result<_> {
+                let mut command = super::helpers::cargo_rail_command(&ws.path)?;
+                command
+                    .env("CARGO_RAIL_WORKSPACE_STORAGE", "user")
+                    .env("XDG_CACHE_HOME", storage.path().join("cache"))
+                    .env("XDG_STATE_HOME", storage.path().join("state"));
+                Ok(command)
+            };
+            let adopted = user_command()?.args(["rail", "cache", "adopt", "--json"]).output()?;
+            assert!(adopted.status.success(), "adoption failed: {adopted:?}");
+            let adoption: serde_json::Value = serde_json::from_slice(&adopted.stdout)?;
+            let adopted_receipt = adoption["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(std::path::Path::new)
+                .find(|path| path.file_name() == receipt.file_name())
+                .expect("adopted conflict receipt")
+                .to_path_buf();
+            let resumed = user_command()?
+                .args(["rail", "sync", "--resume", receipt.to_str().unwrap()])
+                .output()?;
+            assert_eq!(std::fs::read(&receipt)?, legacy_receipt);
+            (resumed, adopted_receipt)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (resumed, resolved_receipt) = (
+            run_cargo_rail(&ws.path, &["rail", "sync", "--resume", receipt.to_str().unwrap()])?,
+            receipt,
+        );
         assert!(
             resumed.status.success(),
             "resume failed:\n{}",
@@ -1526,7 +1561,7 @@ fn test_sync_manual_conflict_stops_before_commit_and_resumes_from_receipt() {
         );
         let log = git(&ws.path, &["log", "-1", "--format=%B"])?;
         assert!(String::from_utf8_lossy(&log.stdout).contains("Rail-Origin: v2 source="));
-        let receipt_json: serde_json::Value = serde_json::from_slice(&std::fs::read(&receipt)?)?;
+        let receipt_json: serde_json::Value = serde_json::from_slice(&std::fs::read(resolved_receipt)?)?;
         assert_eq!(receipt_json["status"], "resolved");
         assert!(
             !std::fs::read_to_string(&conflicted_path)

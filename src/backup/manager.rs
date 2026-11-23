@@ -1,7 +1,7 @@
 //! Backup manager - handles backup creation, restoration, and listing
 
 use super::metadata::{BackupMetadata, BackupRecord};
-use super::{BackupId, create_backup_id, get_backup_root};
+use super::{BackupId, create_backup_id, get_backup_root, selected_backup_root};
 use crate::error::{RailError, RailResult};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -10,7 +10,6 @@ use std::path::{Component, Path, PathBuf};
 #[derive(Debug)]
 pub struct BackupManager {
     workspace_root: PathBuf,
-    backup_root: PathBuf,
 }
 
 impl BackupManager {
@@ -24,11 +23,7 @@ impl BackupManager {
                 .map(|current| current.join(&workspace_root))
                 .unwrap_or(workspace_root)
         };
-        let backup_root = get_backup_root(&workspace_root);
-        Self {
-            workspace_root,
-            backup_root,
-        }
+        Self { workspace_root }
     }
 
     /// Create a backup of specified files
@@ -47,8 +42,11 @@ impl BackupManager {
         }
 
         let workspace_root = canonical_directory(&self.workspace_root, "workspace root")?;
-        let backup_root_path = get_backup_root(&workspace_root);
-        let backup_root = prepare_contained_directory(&workspace_root, &backup_root_path, "backup root")?;
+        let backup_root = if crate::workspace::uses_user_storage() {
+            selected_backup_root(&workspace_root, true)?
+        } else {
+            prepare_contained_directory(&workspace_root, &get_backup_root(&workspace_root), "backup root")?
+        };
         let sources = files
             .iter()
             .map(|file| {
@@ -114,14 +112,16 @@ impl BackupManager {
     pub fn restore_backup(&self, backup_id: &str) -> RailResult<()> {
         validate_backup_id(backup_id)?;
         let workspace_root = canonical_directory(&self.workspace_root, "workspace root")?;
-        let backup_root = canonical_directory(&self.backup_root, "backup root")?;
-        if !backup_root.starts_with(&workspace_root) || backup_root == workspace_root {
-            return Err(RailError::message(format!(
-                "backup root '{}' is outside '{}'",
-                self.backup_root.display(),
-                workspace_root.display()
-            )));
-        }
+        let selected = selected_backup_root(&workspace_root, false)?;
+        let backup_root = if crate::workspace::uses_user_storage()
+            && !selected.join(backup_id).try_exists()?
+            && let Some(legacy) = crate::workspace::legacy_storage_child(&workspace_root, "backups")
+            && legacy.join(backup_id).try_exists()?
+        {
+            canonical_directory(&legacy, "backup root")?
+        } else {
+            self.validated_backup_root(&workspace_root)?
+        };
         let backup_dir = validate_backup_directory(&backup_root, &backup_root.join(backup_id))?;
 
         let metadata = BackupMetadata::load(&backup_dir)?;
@@ -153,18 +153,11 @@ impl BackupManager {
 
     /// List all backups (newest first)
     pub fn list_backups(&self) -> RailResult<Vec<BackupRecord>> {
-        if !self.backup_root.exists() {
+        if !selected_backup_root(&self.workspace_root, false)?.try_exists()? {
             return Ok(Vec::new());
         }
         let workspace_root = canonical_directory(&self.workspace_root, "workspace root")?;
-        let backup_root = canonical_directory(&self.backup_root, "backup root")?;
-        if !backup_root.starts_with(&workspace_root) || backup_root == workspace_root {
-            return Err(RailError::message(format!(
-                "backup root '{}' is outside '{}'",
-                self.backup_root.display(),
-                workspace_root.display()
-            )));
-        }
+        let backup_root = self.validated_backup_root(&workspace_root)?;
 
         let mut backups = Vec::new();
 
@@ -220,7 +213,8 @@ impl BackupManager {
         let to_delete = &backups[keep_count..];
         let deleted_count = to_delete.len();
 
-        let backup_root = canonical_directory(&self.backup_root, "backup root")?;
+        let workspace_root = canonical_directory(&self.workspace_root, "workspace root")?;
+        let backup_root = self.validated_backup_root(&workspace_root)?;
         for backup in to_delete {
             let backup_path = validate_backup_directory(&backup_root, &backup.path)?;
             fs::remove_dir_all(&backup_path)
@@ -232,12 +226,25 @@ impl BackupManager {
 
     /// Check if any backups exist
     pub fn has_backups(&self) -> bool {
-        self.backup_root.exists()
-            && self
-                .backup_root
-                .read_dir()
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false)
+        selected_backup_root(&self.workspace_root, false)
+            .and_then(|root| Ok(root.read_dir()?.next().is_some()))
+            .unwrap_or(false)
+    }
+
+    fn validated_backup_root(&self, workspace_root: &Path) -> RailResult<PathBuf> {
+        let selected = selected_backup_root(workspace_root, false)?;
+        let root = canonical_directory(&selected, "backup root")?;
+        if crate::workspace::uses_user_storage() {
+            if root == selected {
+                return Ok(root);
+            }
+        } else if root.starts_with(workspace_root) && root != workspace_root {
+            return Ok(root);
+        }
+        Err(RailError::message(format!(
+            "backup root '{}' is outside its storage directory",
+            selected.display()
+        )))
     }
 }
 
@@ -418,7 +425,11 @@ mod tests {
         let manager = BackupManager::new(workspace.path());
 
         assert_eq!(manager.workspace_root, workspace.path());
-        assert!(manager.backup_root.ends_with("target/cargo-rail/backups"));
+        assert!(
+            selected_backup_root(&manager.workspace_root, false)
+                .unwrap()
+                .ends_with("target/cargo-rail/backups")
+        );
     }
 
     #[test]

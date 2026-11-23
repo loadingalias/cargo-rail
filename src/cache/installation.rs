@@ -2333,10 +2333,11 @@ fn readiness_profile(
     };
     let workspace = crate::utils::canonicalize_existing(&workspace)?;
     let source_root = crate::utils::canonicalize_existing(source_root)?;
-    let parent = workspace.join("target/cargo-rail/compiler-artifacts-v1");
     let source_parent = source_root.parent();
     let source_name = source_root.file_name().and_then(std::ffi::OsStr::to_str);
-    if source_parent != Some(parent.as_path())
+    let legacy_parent = workspace.join("target/cargo-rail/compiler-artifacts-v1");
+    let user_parent = workspace.join(crate::cache::USER_READINESS_SOURCE_PARENT);
+    if (source_parent != Some(legacy_parent.as_path()) && source_parent != Some(user_parent.as_path()))
         || source_name.is_none_or(|name| !name.starts_with("cargo-rail-cache-readiness-"))
     {
         return Err(RailError::message(

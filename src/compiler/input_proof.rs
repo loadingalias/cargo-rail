@@ -69,11 +69,10 @@ impl<'a> CompilerInputProof<'a> {
         // Files that build scripts generate live in the recycled acquisition sandbox, and the
         // variables they set with `rustc-env` are script output; both are bound by the scripts'
         // rerun inputs below.
-        let generated_root = ObservationPath::capture(
-            &crate::workspace::cargo_rail_state_root(workspace_root).join("compiler-artifacts-v1"),
-            source_root,
-            source_root,
-        );
+        let Ok(artifacts) = crate::cache::compiler_artifacts_dir(workspace_root) else {
+            return Some("compiler_artifact_directory_unavailable".to_string());
+        };
+        let generated_root = ObservationPath::capture(&artifacts, source_root, source_root);
         let script_environment = self
             .build_scripts
             .iter()

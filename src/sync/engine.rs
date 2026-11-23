@@ -150,7 +150,7 @@ type CommitWithChanges = (CommitInfo, Vec<(PathBuf, char)>);
 
 const SYNC_CONFLICT_RECEIPT_VERSION: u32 = 4;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SyncConflictReceipt {
     schema_version: u32,
@@ -515,8 +515,14 @@ impl<'a> SyncEngine<'a> {
     }
 
     fn reject_active_conflict_receipts(&self) -> RailResult<()> {
-        let directory = crate::workspace::cargo_rail_state_root(self.ctx.workspace_root()).join("receipts");
-        let entries = match std::fs::read_dir(&directory) {
+        for directory in crate::workspace::receipt_read_dirs(self.ctx.workspace_root())? {
+            self.reject_active_receipts_in(&directory)?;
+        }
+        Ok(())
+    }
+
+    fn reject_active_receipts_in(&self, directory: &Path) -> RailResult<()> {
+        let entries = match std::fs::read_dir(directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
@@ -1519,28 +1525,15 @@ impl<'a> SyncEngine<'a> {
     }
 
     fn write_conflict_receipt(&self, receipt: SyncConflictReceipt) -> RailResult<PathBuf> {
-        let dir = self.conflict_receipt_dir();
-        std::fs::create_dir_all(&dir)?;
+        let dir = crate::workspace::receipt_dir(self.ctx.workspace_root(), true)?;
         let nonce = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
         let path = dir.join(format!("sync-conflict-{}-{}.json", self.config.crate_name, nonce));
         write_json_atomic(&path, &receipt)?;
         Ok(path)
     }
 
-    fn conflict_receipt_dir(&self) -> PathBuf {
-        crate::workspace::cargo_rail_state_root(self.ctx.workspace_root()).join("receipts")
-    }
-
     fn validate_conflict_receipt_path(&self, receipt_path: &Path) -> RailResult<PathBuf> {
-        let path = utils::canonicalize_existing(receipt_path)?;
-        let dir = utils::canonicalize_existing(&self.conflict_receipt_dir())?;
-        if path.parent().is_none_or(|parent| parent != dir) {
-            return Err(crate::error::RailError::message(format!(
-                "sync receipt '{}' is outside the workspace receipt directory",
-                receipt_path.display()
-            )));
-        }
-        Ok(path)
+        validate_conflict_receipt_path(self.ctx.workspace_root(), receipt_path)
     }
 
     /// Check whether a monorepo path belongs to this sync scope.
@@ -3351,16 +3344,53 @@ fn write_json_atomic(path: &Path, value: &impl Serialize) -> RailResult<()> {
     utils::write_file_atomic(path, &bytes)
 }
 
+fn validate_conflict_receipt_path(workspace_root: &Path, receipt_path: &Path) -> RailResult<PathBuf> {
+    let path = utils::canonicalize_existing(receipt_path)?;
+    let directories = crate::workspace::receipt_read_dirs(workspace_root)?;
+    let primary = &directories[0];
+    if path.parent() == Some(primary) {
+        return Ok(path);
+    }
+    if directories.iter().skip(1).any(|legacy| path.parent() == Some(legacy)) {
+        let adopted = primary.join(path.file_name().expect("receipt in a directory has a file name"));
+        match std::fs::symlink_metadata(&adopted) {
+            Ok(metadata) if metadata.is_file() && !utils::is_symlink_or_reparse(&metadata) => {
+                let current = SyncConflictReceipt::decode(&std::fs::read(&adopted)?, &adopted)?;
+                let mut legacy = SyncConflictReceipt::decode(&std::fs::read(&path)?, &path)?;
+                // These are the only fields that change during resume.
+                legacy.status.clone_from(&current.status);
+                legacy.resulting_commit.clone_from(&current.resulting_commit);
+                legacy
+                    .mapping_authority_post_digest
+                    .clone_from(&current.mapping_authority_post_digest);
+                if legacy == current {
+                    return Ok(adopted);
+                }
+                return Err(crate::error::RailError::message(format!(
+                    "legacy sync receipt '{}' and user-storage receipt '{}' describe different conflicts",
+                    path.display(),
+                    adopted.display()
+                )));
+            }
+            Ok(_) => {
+                return Err(crate::error::RailError::message(format!(
+                    "adopted sync receipt '{}' must be a real file",
+                    adopted.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(crate::error::RailError::message(format!(
+        "sync receipt '{}' is outside the workspace receipt directory",
+        receipt_path.display()
+    )))
+}
+
 /// Read the crate identity from a workspace-owned conflict receipt.
 pub fn conflict_receipt_crate(workspace_root: &Path, receipt_path: &Path) -> RailResult<String> {
-    let path = utils::canonicalize_existing(receipt_path)?;
-    let dir = utils::canonicalize_existing(&crate::workspace::cargo_rail_state_root(workspace_root).join("receipts"))?;
-    if path.parent().is_none_or(|parent| parent != dir) {
-        return Err(crate::error::RailError::message(format!(
-            "sync receipt '{}' is outside the workspace receipt directory",
-            receipt_path.display()
-        )));
-    }
+    let path = validate_conflict_receipt_path(workspace_root, receipt_path)?;
     let receipt: SyncConflictReceipt = serde_json::from_slice(&std::fs::read(path)?)
         .map_err(|error| crate::error::RailError::message(format!("invalid sync conflict receipt: {}", error)))?;
     Ok(receipt.crate_name)

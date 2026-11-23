@@ -20,8 +20,7 @@ pub struct CleanContext {
     workspace_root: PathBuf,
     config: Option<Arc<RailConfig>>,
     _git: Option<SystemGit>,
-    state_root: PathBuf,
-    resolved_state_root: PathBuf,
+    legacy_state_root: Option<PathBuf>,
 }
 
 impl CleanContext {
@@ -56,25 +55,29 @@ impl CleanContext {
             config.validate(&workspace_root, None)?;
         }
 
-        let state_root = crate::workspace::cargo_rail_state_root(&workspace_root);
-        let resolved_state_root = crate::utils::canonicalize_allow_missing(&state_root)?;
-        if !resolved_state_root.starts_with(&workspace_root) {
-            return Err(RailError::with_help(
-                format!(
-                    "clean artifact root '{}' resolves outside workspace '{}'",
-                    state_root.display(),
-                    workspace_root.display()
-                ),
-                "replace linked artifact directories with real directories inside the workspace",
-            ));
-        }
+        let legacy_state_root = if crate::workspace::uses_user_storage() {
+            None
+        } else {
+            let state_root = crate::workspace::cargo_rail_state_root(&workspace_root);
+            let resolved = crate::utils::canonicalize_allow_missing(&state_root)?;
+            if !resolved.starts_with(&workspace_root) {
+                return Err(RailError::with_help(
+                    format!(
+                        "clean artifact root '{}' resolves outside workspace '{}'",
+                        state_root.display(),
+                        workspace_root.display()
+                    ),
+                    "replace linked artifact directories with real directories inside the workspace",
+                ));
+            }
+            Some(resolved)
+        };
 
         Ok(Self {
             workspace_root,
             config,
             _git: git,
-            state_root,
-            resolved_state_root,
+            legacy_state_root,
         })
     }
 
@@ -86,20 +89,15 @@ impl CleanContext {
         self.config.as_deref()
     }
 
-    fn state_root(&self) -> &Path {
-        &self.state_root
-    }
-
     fn revalidate_artifact_root(&self) -> RailResult<()> {
-        let resolved = crate::utils::canonicalize_allow_missing(&self.state_root)?;
-        if resolved != self.resolved_state_root || !resolved.starts_with(&self.workspace_root) {
-            return Err(RailError::with_help(
-                format!(
-                    "clean artifact root '{}' changed after capture",
-                    self.state_root.display()
-                ),
-                "restore the workspace-owned artifact directory and retry",
-            ));
+        if let Some(expected) = &self.legacy_state_root {
+            let path = crate::workspace::cargo_rail_state_root(&self.workspace_root);
+            if crate::utils::canonicalize_allow_missing(&path)? != *expected {
+                return Err(RailError::with_help(
+                    format!("clean artifact root '{}' changed after capture", path.display()),
+                    "restore the workspace-owned artifact directory and retry",
+                ));
+            }
         }
         Ok(())
     }
@@ -177,7 +175,7 @@ pub fn run_clean(ctx: &CleanContext, options: CleanOptions) -> RailResult<()> {
     }
 
     if clean_reports {
-        collect_report_artifacts(ctx, &mut artifacts);
+        collect_report_artifacts(&crate::workspace::report_dir(ctx.workspace_root())?, &mut artifacts);
     }
 
     if prune_backups || delete_all_backups {
@@ -287,8 +285,12 @@ fn summarize_artifacts(
         .and_then(|status| status.workspace.as_ref())
         .map_or(0, |workspace| workspace.bytes);
     let reports = sum_paths(artifacts.report_files.iter().map(Path::new))?;
-    let backup_root = crate::backup::get_backup_root(ctx.workspace_root());
-    let backups = sum_paths(artifacts.backups.iter().map(|id| backup_root.join(id)))?;
+    let backups = if artifacts.backups.is_empty() {
+        0
+    } else {
+        let backup_root = crate::backup::selected_backup_root(ctx.workspace_root(), false)?;
+        sum_paths(artifacts.backups.iter().map(|id| backup_root.join(id)))?
+    };
     Ok(CleanByteSummary {
         cache,
         reports,
@@ -400,14 +402,13 @@ fn collect_cache_artifacts(status: &crate::cache::CacheStatus, artifacts: &mut C
     }
 }
 
-fn collect_report_artifacts(ctx: &CleanContext, artifacts: &mut CleanArtifacts) {
-    let report_dir = ctx.state_root();
+fn collect_report_artifacts(report_dir: &Path, artifacts: &mut CleanArtifacts) {
     if report_dir.exists()
         && let Ok(entries) = fs::read_dir(report_dir)
     {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|ext| ext == "md") {
+            if is_generated_report(&path) {
                 artifacts.report_files.push(path.display().to_string());
             }
         }
@@ -416,10 +417,6 @@ fn collect_report_artifacts(ctx: &CleanContext, artifacts: &mut CleanArtifacts) 
 
 fn collect_backup_artifacts(ctx: &CleanContext, delete_all: bool, artifacts: &mut CleanArtifacts) -> RailResult<()> {
     let backup_manager = BackupManager::new(ctx.workspace_root());
-    if !backup_manager.has_backups() {
-        return Ok(());
-    }
-
     let backup_list = backup_manager.list_backups()?;
 
     if delete_all {
@@ -448,13 +445,22 @@ fn clean_cache_files(ctx: &CleanContext) -> RailResult<Vec<String>> {
     Ok(removal.paths)
 }
 
+fn is_generated_report(path: &Path) -> bool {
+    path.is_file()
+        && if crate::workspace::uses_user_storage() {
+            path.file_name().is_some_and(|name| name == "unify-report.md")
+        } else {
+            path.extension().is_some_and(|ext| ext == "md")
+        }
+}
+
 fn clean_generated_reports(ctx: &CleanContext) -> RailResult<Vec<String>> {
-    let report_dir = ctx.state_root();
+    let report_dir = crate::workspace::report_dir(ctx.workspace_root())?;
     let mut cleaned = Vec::new();
 
     if report_dir.exists() {
         progress!("removing reports...");
-        for entry in fs::read_dir(report_dir).map_err(|e| {
+        for entry in fs::read_dir(&report_dir).map_err(|e| {
             RailError::with_help(
                 format!("failed to read {}: {}", report_dir.display(), e),
                 "check directory permissions",
@@ -467,7 +473,7 @@ fn clean_generated_reports(ctx: &CleanContext) -> RailResult<Vec<String>> {
                 )
             })?;
             let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|ext| ext == "md") {
+            if is_generated_report(&path) {
                 fs::remove_file(&path).map_err(|e| {
                     RailError::with_help(
                         format!("failed to remove {}: {}", path.display(), e),

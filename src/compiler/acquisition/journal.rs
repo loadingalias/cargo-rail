@@ -18,7 +18,7 @@ use crate::source::ContentDigest;
 const ACQUISITION_CONTRACT_VERSION: u32 = 3;
 const ACQUISITION_IDENTITY_PREFIX: &str = "surface-acquisition-v3-sha256-";
 const EVIDENCE_IDENTITY_PREFIX: &str = "surface-acquisition-evidence-v1-sha256-";
-const JOURNAL_DIRECTORY: &str = "surface-acquisitions-v3";
+pub(crate) const JOURNAL_DIRECTORY: &str = "surface-acquisitions-v3";
 const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_JOURNAL_GROUPS: usize = 256;
 const COMPLETION_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
@@ -192,7 +192,12 @@ impl CompilerAcquisitionJournal {
                 "compiler acquisition journal batch must be non-zero",
             ));
         }
-        let state_root = crate::workspace::cargo_rail_state_root(workspace_root);
+        let state_root = crate::workspace::workspace_storage_dir(
+            workspace_root,
+            crate::workspace::WorkspaceStorage::Cache,
+            None,
+            false,
+        )?;
         let canonical_state_root = crate::utils::canonicalize_existing(&state_root)?;
         let directory = state_root.join(JOURNAL_DIRECTORY);
         match fs::symlink_metadata(&directory) {
@@ -724,9 +729,16 @@ fn resolve_resume_path(workspace_root: &Path, path: &Path) -> RailResult<PathBuf
         )));
     }
     let candidate = crate::utils::canonicalize_existing(&candidate)?;
-    let state_root = crate::workspace::cargo_rail_state_root(workspace_root);
-    let authorized = crate::utils::canonicalize_existing(&state_root.join(JOURNAL_DIRECTORY))
-        .is_ok_and(|directory| candidate.starts_with(directory));
+    let current = crate::workspace::workspace_storage_dir(
+        workspace_root,
+        crate::workspace::WorkspaceStorage::Cache,
+        Some(JOURNAL_DIRECTORY),
+        false,
+    )?;
+    let authorized = candidate.starts_with(current)
+        || (crate::workspace::uses_user_storage()
+            && crate::workspace::legacy_storage_child(workspace_root, JOURNAL_DIRECTORY)
+                .is_some_and(|directory| candidate.starts_with(directory)));
     if !authorized {
         return Err(RailError::with_help(
             format!(
