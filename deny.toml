@@ -29,6 +29,11 @@ allow = [
 
 confidence-threshold = 0.93
 
+[[licenses.exceptions]]
+# dirs-sys uses option-ext to locate the user's platform directories.
+crate = "option-ext@0.2.0"
+allow = ["MPL-2.0"]
+
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"

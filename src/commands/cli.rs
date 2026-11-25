@@ -666,6 +666,19 @@ pub struct CacheSetupArgs {
 pub enum CacheCommand {
     /// Install or repair transparent verified compiler reuse.
     Setup(Box<CacheSetupArgs>),
+    /// Copy existing workspace state into the selected user layout.
+    Adopt {
+        /// Existing state directory, relative to the workspace if not absolute.
+        /// Defaults to target/cargo-rail.
+        #[arg(long, value_name = "PATH")]
+        from: Option<PathBuf>,
+        /// Preview the files to copy. Exits 1 when files are pending.
+        #[arg(long, short = 'c')]
+        check: bool,
+        /// Report format.
+        #[arg(long, short = 'f', default_value_t, value_enum)]
+        format: TextJsonOutputFormat,
+    },
     /// Prove uncached execution, one cold miss, and one verified warm hit.
     Ready {
         /// Report format.
@@ -1053,7 +1066,8 @@ impl Commands {
             } => text_json_protocol(format.is_json()),
             Commands::Cache { command } => match command {
                 CacheCommand::Setup(setup) => text_json_protocol(setup.format.is_json()),
-                CacheCommand::Ready { format }
+                CacheCommand::Adopt { format, .. }
+                | CacheCommand::Ready { format }
                 | CacheCommand::Normalize { format, .. }
                 | CacheCommand::Probe { format }
                 | CacheCommand::Status { format, .. }
@@ -1199,7 +1213,8 @@ impl Commands {
             } => *format = TextJsonOutputFormat::Json,
             Commands::Cache { command } => match command {
                 CacheCommand::Setup(setup) => setup.format = TextJsonOutputFormat::Json,
-                CacheCommand::Ready { format }
+                CacheCommand::Adopt { format, .. }
+                | CacheCommand::Ready { format }
                 | CacheCommand::Normalize { format, .. }
                 | CacheCommand::Probe { format }
                 | CacheCommand::Status { format, .. }

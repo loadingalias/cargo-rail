@@ -1638,7 +1638,16 @@ impl SourceClone {
         )?;
         git_with(&root, &["checkout", "--quiet", "--detach", commit], &[], None)?;
         // Reuse dependency builds across releases without touching the user's target directory.
-        let target = crate::workspace::cargo_rail_state_root(ctx.workspace_root()).join("release-build");
+        let target = if crate::workspace::uses_user_storage() {
+            crate::workspace::workspace_storage_dir(
+                ctx.workspace_root(),
+                crate::workspace::WorkspaceStorage::Cache,
+                Some("release-build"),
+                true,
+            )?
+        } else {
+            crate::workspace::cargo_rail_state_root(ctx.workspace_root()).join("release-build")
+        };
         Ok(Self {
             _directory: directory,
             root,

@@ -2953,7 +2953,7 @@ fn lower_hex(bytes: &[u8]) -> String {
     encoded
 }
 
-fn physical_directory_identity(path: &Path) -> RailResult<String> {
+pub(crate) fn physical_directory_identity(path: &Path) -> RailResult<String> {
     let canonical = utils::canonicalize_existing(path)?;
     validate_real_directory(&canonical, "prepared Git effect authority directory")?;
     let mut identity = CanonicalBytes::new(b"cargo-rail-physical-directory-v1");

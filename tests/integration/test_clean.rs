@@ -405,6 +405,214 @@ fn test_clean_refuses_to_follow_a_cache_state_symlink() {
     super::helpers::finish_test(result);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn user_workspace_storage_cleans_cache_and_preserves_receipts() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::{DirBuilderExt as _, symlink};
+
+        let workspace = TempDir::new()?;
+        let managed = TempDir::new()?;
+        let storage = TempDir::new()?;
+        let cache = storage.path().join("cache");
+        let state = storage.path().join("state");
+        let cargo_home = storage.path().join("cargo");
+        fs::create_dir(&cargo_home)?;
+        let target = workspace.path().join("target");
+        symlink(managed.path(), &target)?;
+        fs::write(managed.path().join("keep"), "mbx artifact")?;
+        let run = |args: &[&str]| -> Result<std::process::Output> {
+            Ok(super::helpers::cargo_rail_command(workspace.path())?
+                .env("CARGO_HOME", &cargo_home)
+                .env("CARGO_RAIL_WORKSPACE_STORAGE", "user")
+                .env("XDG_CACHE_HOME", &cache)
+                .env("XDG_STATE_HOME", &state)
+                .args(args)
+                .output()?)
+        };
+
+        let first = run(&["rail", "cache", "status", "--scope", "workspace", "-f", "json"])?;
+        assert!(first.status.success(), "{first:?}");
+        let status: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+        let store = std::path::PathBuf::from(
+            status["status"]["workspace"]["root"]
+                .as_str()
+                .expect("workspace cache root"),
+        );
+        let namespace = store.file_name().expect("checkout identifier");
+        let receipts = state.join("cargo-rail/workspaces").join(namespace).join("receipts");
+        let artifact = store.join("compiler-artifacts-v1/result");
+        let mut directories = fs::DirBuilder::new();
+        directories.recursive(true).mode(0o700);
+        directories.create(artifact.parent().unwrap())?;
+        fs::write(&artifact, "disposable")?;
+        directories.create(&receipts)?;
+        fs::write(receipts.join("receipt.json"), "recoverable")?;
+
+        let preview = run(&["rail", "clean", "--cache", "--check"])?;
+        assert_eq!(preview.status.code(), Some(1), "{preview:?}");
+        assert!(artifact.is_file());
+        let cleaned = run(&["rail", "clean", "--cache"])?;
+        assert!(cleaned.status.success(), "{cleaned:?}");
+        assert!(!artifact.exists());
+        assert!(receipts.join("receipt.json").is_file());
+        assert!(target.is_symlink());
+        assert_eq!(fs::read_to_string(managed.path().join("keep"))?, "mbx artifact");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn user_adopt_copies_legacy_state_without_overwriting_it() {
+    let result: Result<()> = (|| {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let workspace = TempDir::new()?;
+        let managed = TempDir::new()?;
+        let storage = TempDir::new()?;
+        let cache = storage.path().join("cache");
+        let state = storage.path().join("state");
+        let legacy = managed.path().join("cargo-rail");
+        symlink(managed.path(), workspace.path().join("target"))?;
+        for directory in [
+            "receipts",
+            "backups/snapshot",
+            "compiler-artifacts-v1",
+            "surface-acquisitions-v3",
+        ] {
+            fs::create_dir_all(legacy.join(directory))?;
+        }
+        let backup = legacy.join("backups/snapshot/script");
+        fs::write(&backup, "#!/bin/sh\n")?;
+        fs::set_permissions(&backup, fs::Permissions::from_mode(0o755))?;
+        let mut metadata = BackupMetadata::new("test adoption");
+        metadata.add_file("script");
+        metadata.save(&legacy.join("backups/snapshot"))?;
+        fs::create_dir(legacy.join("backups/unfinished"))?;
+        fs::write(legacy.join("backups/unfinished/partial-file"), "in-progress backup")?;
+        fs::write(legacy.join("receipts/receipt.json"), "receipt")?;
+        fs::write(legacy.join("receipts/.writing.tmp"), "partial")?;
+        fs::write(
+            legacy.join("compiler-artifacts-v1/cache-readiness-v1.json"),
+            "readiness",
+        )?;
+        fs::write(legacy.join("compiler-artifacts-v1/disposable"), "build output")?;
+        fs::write(legacy.join("surface-acquisitions-v3/journal.json"), "journal")?;
+        fs::write(legacy.join("generated-lockfile-v1"), "lockfile provenance")?;
+        fs::write(legacy.join("unify-report.md"), "report")?;
+        let run = |args: &[&str], layout: &str| -> Result<std::process::Output> {
+            Ok(super::helpers::cargo_rail_command(workspace.path())?
+                .env("CARGO_RAIL_WORKSPACE_STORAGE", layout)
+                .env("XDG_CACHE_HOME", &cache)
+                .env("XDG_STATE_HOME", &state)
+                .args(["rail", "cache", "adopt", "--json"])
+                .args(args)
+                .output()?)
+        };
+
+        let missing_opt_in = run(&[], "")?;
+        assert_eq!(missing_opt_in.status.code(), Some(2), "{missing_opt_in:?}");
+        let preview = run(&["--check"], "user")?;
+        assert_eq!(preview.status.code(), Some(1), "{preview:?}");
+        assert!(!cache.exists() && !state.exists());
+        assert!(!workspace.path().join(".cargo-rail").exists());
+        let planned: serde_json::Value = serde_json::from_slice(&preview.stdout)?;
+        let files = planned["files"].as_array().unwrap();
+        assert_eq!(files.len(), 7, "{planned}");
+
+        let adopted = run(&[], "user")?;
+        assert!(adopted.status.success(), "{adopted:?}");
+        let actual: serde_json::Value = serde_json::from_slice(&adopted.stdout)?;
+        assert_eq!(actual["files"], planned["files"]);
+        for path in files {
+            assert!(std::path::Path::new(path.as_str().unwrap()).is_file(), "{path}");
+        }
+        let copied_backup = files
+            .iter()
+            .filter_map(|path| path.as_str())
+            .find(|path| path.ends_with("/script"))
+            .unwrap();
+        assert_eq!(fs::metadata(copied_backup)?.permissions().mode() & 0o777, 0o755);
+        assert!(backup.is_file());
+        assert!(legacy.join("compiler-artifacts-v1/disposable").is_file());
+        let repeated = run(&["--from", legacy.to_str().unwrap()], "user")?;
+        assert!(repeated.status.success(), "{repeated:?}");
+        let repeated: serde_json::Value = serde_json::from_slice(&repeated.stdout)?;
+        assert_eq!(repeated["files"], serde_json::json!([]));
+
+        let receipt = files
+            .iter()
+            .filter_map(|path| path.as_str())
+            .find(|path| path.ends_with("/receipt.json"))
+            .unwrap();
+        fs::write(receipt, "newer user-storage receipt")?;
+        fs::write(legacy.join("receipts/another.json"), "another receipt")?;
+        let rejected = run(&[], "user")?;
+        assert_eq!(rejected.status.code(), Some(2), "{rejected:?}");
+        assert_eq!(fs::read_to_string(receipt)?, "newer user-storage receipt");
+        assert!(!std::path::Path::new(receipt).with_file_name("another.json").exists());
+        fs::remove_file(legacy.join("receipts/receipt.json"))?;
+        symlink(receipt, legacy.join("receipts/receipt.json"))?;
+        let linked = run(&[], "user")?;
+        assert_eq!(linked.status.code(), Some(2), "{linked:?}");
+        assert!(
+            String::from_utf8_lossy(&linked.stdout).contains("must be a real file")
+                || String::from_utf8_lossy(&linked.stderr).contains("must be a real file"),
+            "{linked:?}"
+        );
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn user_storage_uses_native_cache_and_state_directories() {
+    let result: Result<()> = (|| {
+        let workspace = TempDir::new()?;
+        let receipts = workspace.path().join("target/cargo-rail/receipts");
+        fs::create_dir_all(&receipts)?;
+        fs::write(receipts.join("receipt.json"), "{}")?;
+        let run = |args: &[&str]| -> Result<std::process::Output> {
+            Ok(super::helpers::isolated_cargo_rail_command(workspace.path())?
+                .env("CARGO_RAIL_WORKSPACE_STORAGE", "user")
+                .env("XDG_CACHE_HOME", workspace.path().join("unused-cache"))
+                .env("XDG_STATE_HOME", workspace.path().join("unused-state"))
+                .args(args)
+                .output()?)
+        };
+        let status = run(&["rail", "cache", "status", "--scope", "workspace", "--json"])?;
+        assert!(status.status.success(), "{status:?}");
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+        let cache = std::path::Path::new(status["status"]["workspace"]["root"].as_str().unwrap());
+        let mut cache_base = dirs::cache_dir().expect("native cache directory").join("cargo-rail");
+        if cfg!(windows) {
+            cache_base.push("cache");
+        }
+        let cache_base = cargo_rail::utils::canonicalize_allow_missing(&cache_base)?.join("workspaces");
+        assert_eq!(cache.parent(), Some(cache_base.as_path()));
+
+        let preview = run(&["rail", "cache", "adopt", "--check", "--json"])?;
+        assert_eq!(preview.status.code(), Some(1), "{preview:?}");
+        let preview: serde_json::Value = serde_json::from_slice(&preview.stdout)?;
+        let state_base = dirs::data_local_dir().expect("native local data directory");
+        let state_base =
+            cargo_rail::utils::canonicalize_allow_missing(&state_base.join("cargo-rail/state"))?.join("workspaces");
+        let receipt = state_base
+            .join(cache.file_name().unwrap())
+            .join("receipts/receipt.json");
+        assert_eq!(
+            std::path::Path::new(preview["files"][0].as_str().unwrap()),
+            receipt.as_path()
+        );
+        assert!(!receipt.exists(), "preview wrote a receipt to user storage");
+        Ok(())
+    })();
+    super::helpers::finish_test(result);
+}
+
 #[test]
 fn test_clean_reports_only() {
     let result: Result<()> = (|| {

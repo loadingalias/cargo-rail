@@ -446,7 +446,7 @@ pub fn validate_pre_apply_with_allowed_paths(
     ))
 }
 
-/// Write an immutable receipt file to `target/cargo-rail/receipts/`.
+/// Write an immutable receipt file to the workspace receipt directory.
 pub fn write_receipt(
     workspace_root: &Path,
     operation: &str,
@@ -488,8 +488,7 @@ pub fn write_receipt_with_objects(
         resulting_objects,
     };
 
-    let dir = crate::workspace::cargo_rail_state_root(workspace_root).join("receipts");
-    fs::create_dir_all(&dir)?;
+    let dir = crate::workspace::receipt_dir(workspace_root, true)?;
 
     let nonce = Utc::now().timestamp_nanos_opt().unwrap_or_default();
     let path = dir.join(format!(

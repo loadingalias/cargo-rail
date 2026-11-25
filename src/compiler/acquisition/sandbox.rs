@@ -73,14 +73,7 @@ impl SandboxPool {
         let workspace_root = crate::utils::canonicalize_existing(workspace_root)?;
         let namespace = generation_namespace()?;
         let workspace_lock = crate::cache::lock_workspace(&workspace_root)?;
-        let state_root = crate::workspace::cargo_rail_state_root(&workspace_root);
-        let canonical_state_root = crate::utils::canonicalize_existing(&state_root)?;
-        if canonical_state_root != state_root || !canonical_state_root.starts_with(&workspace_root) {
-            return Err(RailError::message(
-                "compiler acquisition sandbox root escaped the workspace",
-            ));
-        }
-        let root = state_root.join("compiler-artifacts-v1");
+        let root = crate::cache::compiler_artifacts_dir(&workspace_root)?;
         remove_optional_owned_directory(&root)?;
         create_private_directory(&root)?;
         fs::write(root.join("CACHEDIR.TAG"), CARGO_CACHE_DIRECTORY_TAG)?;

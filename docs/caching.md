@@ -16,6 +16,64 @@ When cache evidence is missing, stale, ambiguous, unsupported, or corrupt,
 Cargo-Rail runs the compiler and reports a stable miss or bypass reason.
 If the compiler or a required acquisition fails, the operation still fails.
 
+## Workspaces with a managed Cargo target
+
+Set `CARGO_RAIL_WORKSPACE_STORAGE=user` to use cargo-rail with a managed
+`target/` symlink such as the one mbx creates. Set it in the environment
+for each cargo-rail command, including cleanup and resume.
+
+```sh
+export CARGO_RAIL_WORKSPACE_STORAGE=user
+cargo rail unify --check
+cargo rail cache status --scope workspace
+```
+
+Cargo-Rail adds `workspaces/<checkout-id>/` to each directory below. The
+cache contains compiler artifacts and their lock. The state directory holds
+mutation receipts and backups.
+
+| Platform | Workspace cache | Workspace state |
+| --- | --- | --- |
+| Linux | `${XDG_CACHE_HOME:-$HOME/.cache}/cargo-rail` | `${XDG_STATE_HOME:-$HOME/.local/state}/cargo-rail` |
+| macOS | `~/Library/Caches/cargo-rail` | `~/Library/Application Support/cargo-rail/state` |
+| Windows | `%LOCALAPPDATA%\cargo-rail\cache` | `%LOCALAPPDATA%\cargo-rail\state` |
+
+Each worktree gets its own directories. On Windows, use local NTFS for
+workspace cache locking and adoption. If you request a unify report without
+specifying a path, it goes to `.cargo-rail/unify-report.md` inside the checkout.
+
+With this mode unset, cargo-rail uses `target/cargo-rail/`. User storage mode
+writes new files to the new locations and can resume receipts from an
+existing real `target/cargo-rail/receipts/` directory. To restore a legacy
+backup while user storage mode is active, pass its ID to `unify undo --backup-id`.
+If mbx has evicted its managed target and left a dangling link, run an mbx
+build to recreate the backing directory before running commands that load
+Cargo metadata.
+
+To bring an existing state directory into user storage, preview the copy
+and then apply it:
+
+```sh
+cargo rail cache adopt --check --verbose
+cargo rail cache adopt --verbose
+```
+
+The source defaults to `target/cargo-rail/`, including when it is reached
+through an mbx-managed `target` symlink. Use `--from PATH` for another copy of
+this checkout's state. Finish any running legacy cargo-rail commands before
+adopting. Adoption copies receipts, complete backups, Surface acquisition
+journals, lockfile provenance, the cache-readiness receipt, and the default
+unify report. It preserves the source and accepts files that already match.
+If it finds a conflicting destination, it reports the path. Compiler output
+trees and cache lock files stay at the source.
+
+A preview exits with status 1 when files are pending. Use the adopted receipt
+path from `--verbose` if the original is no longer available.
+
+`CARGO_RAIL_CACHE_DIR` independently selects the shared compiler result
+store. `cargo rail clean --cache` clears the selected workspace compiler
+artifacts. Receipts and backups remain available.
+
 ## Set up local reuse
 
 Setup enrolls the current workspace for ordinary Cargo, nextest, Just, IDE, and CI commands.

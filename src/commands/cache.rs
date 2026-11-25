@@ -597,6 +597,53 @@ pub(crate) fn run_status(workspace_root: &Path, scope: CacheScope, format: TextJ
     Ok(())
 }
 
+pub(crate) fn run_adopt(
+    workspace_root: &Path,
+    from: Option<&Path>,
+    check: bool,
+    format: TextJsonOutputFormat,
+) -> RailResult<()> {
+    let adoption = crate::cache::adopt::adopt(workspace_root, from, check)?;
+    let pending = check && !adoption.files.is_empty();
+    if format.is_json() {
+        let files = adoption
+            .files
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        let output = crate::output::machine_json_envelope(
+            "cache",
+            if check { "check" } else { "apply" },
+            if pending { "pending_changes" } else { "success" },
+            i32::from(pending),
+            serde_json::json!({
+                "operation": "adopt",
+                "source": adoption.source.display().to_string(),
+                "files": files,
+            }),
+        );
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if adoption.files.is_empty() {
+        println!("Nothing to adopt from {}.", adoption.source.display());
+    } else {
+        println!(
+            "{} {} file(s) from {}.",
+            if check { "Would adopt" } else { "Adopted" },
+            adoption.files.len(),
+            adoption.source.display()
+        );
+        if crate::output::is_verbose() {
+            for path in &adoption.files {
+                println!("  {}", path.display());
+            }
+        }
+    }
+    if pending {
+        return Err(RailError::CheckHasPendingChanges);
+    }
+    Ok(())
+}
+
 pub(crate) fn run_report(start: Option<&Path>, finish: Option<&Path>, format: TextJsonOutputFormat) -> RailResult<()> {
     let (mode, finished) = match (start, finish) {
         (Some(path), None) => {

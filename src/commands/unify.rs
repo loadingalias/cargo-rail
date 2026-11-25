@@ -3035,9 +3035,21 @@ fn unify_report_output_path(
     if no_report {
         return Ok(None);
     }
-    let requested = requested
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| crate::workspace::cargo_rail_state_root(ctx.workspace_root()).join("unify-report.md"));
+    let requested = match requested {
+        Some(path) => path.to_path_buf(),
+        None => {
+            let path = crate::workspace::report_dir(ctx.workspace_root())?.join("unify-report.md");
+            if crate::workspace::uses_user_storage()
+                && std::fs::symlink_metadata(&path).is_ok_and(|metadata| crate::utils::is_symlink_or_reparse(&metadata))
+            {
+                return Err(RailError::message(format!(
+                    "unify report '{}' must not be a symlink",
+                    path.display()
+                )));
+            }
+            path
+        }
+    };
     let absolute = if requested.is_absolute() {
         requested
     } else {
@@ -3222,7 +3234,13 @@ fn build_unify_mutation_parts(
     }
 
     if backup_enabled && plan.has_planned_changes(msrv_write_needed) {
-        actions.push(MutationAction::new("CREATE_BACKUP", "target/cargo-rail/backups", None));
+        let root = crate::backup::selected_backup_root(ctx.workspace_root(), false)?;
+        let target = root.strip_prefix(ctx.workspace_root()).unwrap_or(&root);
+        actions.push(MutationAction::new(
+            "CREATE_BACKUP",
+            crate::utils::path_to_git_format(target),
+            None,
+        ));
     }
 
     if !no_report && plan.has_planned_changes(msrv_write_needed) {

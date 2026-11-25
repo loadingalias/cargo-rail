@@ -1,5 +1,6 @@
 //! Exact ownership, measurement, and reclamation for cargo-rail cache state.
 
+pub(crate) mod adopt;
 pub(crate) mod cas;
 pub(crate) mod digest_memo;
 pub(crate) mod installation;
@@ -8,6 +9,7 @@ pub(crate) mod report;
 pub(crate) mod result;
 
 use crate::error::{RailError, RailResult};
+use crate::workspace::{WorkspaceStorage, uses_user_storage, workspace_storage_dir};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -16,6 +18,7 @@ const STATUS_SCAN_MAX_ENTRIES: usize = 1_000_000;
 const WORKSPACE_LOCK_BYTES: u64 = 0;
 const READINESS_RECEIPT_FILE: &str = "cache-readiness-v1.json";
 const MAX_READINESS_RECEIPT_BYTES: u64 = 16 * 1024;
+pub(crate) const USER_READINESS_SOURCE_PARENT: &str = ".cargo-rail-cache-readiness";
 
 struct WorkspaceCachePaths {
     state_root: PathBuf,
@@ -30,6 +33,33 @@ pub(crate) struct WorkspaceCacheLock {
 
 /// Serialize workspace cache mutation without serializing the selected profile's local CAS.
 pub(crate) fn lock_workspace(workspace_root: &Path) -> RailResult<WorkspaceCacheLock> {
+    let directory = if uses_user_storage() {
+        workspace_storage_dir(workspace_root, WorkspaceStorage::Cache, None, true)?
+    } else {
+        legacy_lock_directory(workspace_root)?
+    };
+    let path = directory.join("cache.lock");
+    let file = crate::utils::open_cache_lock_file(&path, true)?;
+    if !crate::utils::private_file_matches_path(&file, &path, WORKSPACE_LOCK_BYTES)? {
+        return Err(RailError::with_help(
+            format!(
+                "workspace cache lock '{}' is not a private regular file",
+                path.display()
+            ),
+            "remove the hostile lock path; cargo-rail will not follow or share cache lock files",
+        ));
+    }
+    file.lock()?;
+    if !crate::utils::private_file_matches_path(&file, &path, WORKSPACE_LOCK_BYTES)? {
+        return Err(RailError::message(format!(
+            "workspace cache lock '{}' changed while it was acquired",
+            path.display()
+        )));
+    }
+    Ok(WorkspaceCacheLock { _file: file })
+}
+
+fn legacy_lock_directory(workspace_root: &Path) -> RailResult<PathBuf> {
     let workspace_root = crate::utils::canonicalize_existing(workspace_root)?;
     let mut directory = workspace_root.clone();
     for component in ["target", "cargo-rail"] {
@@ -53,25 +83,7 @@ pub(crate) fn lock_workspace(workspace_root: &Path) -> RailResult<WorkspaceCache
         ));
     }
 
-    let path = directory.join("cache.lock");
-    let file = crate::utils::open_cache_lock_file(&path, true)?;
-    if !crate::utils::private_file_matches_path(&file, &path, WORKSPACE_LOCK_BYTES)? {
-        return Err(RailError::with_help(
-            format!(
-                "workspace cache lock '{}' is not a private regular file",
-                path.display()
-            ),
-            "remove the hostile lock path; cargo-rail will not follow or share cache lock files",
-        ));
-    }
-    file.lock()?;
-    if !crate::utils::private_file_matches_path(&file, &path, WORKSPACE_LOCK_BYTES)? {
-        return Err(RailError::message(format!(
-            "workspace cache lock '{}' changed while it was acquired",
-            path.display()
-        )));
-    }
-    Ok(WorkspaceCacheLock { _file: file })
+    Ok(directory)
 }
 /// One cache-owned workspace artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -238,6 +250,17 @@ pub(crate) fn record_readiness(
 }
 
 pub(crate) fn readiness_probe_parent(workspace_root: &Path) -> RailResult<PathBuf> {
+    if uses_user_storage() {
+        // The installed wrapper only delegates its profile to a probe whose
+        // source is physically within the enrolled checkout.
+        return crate::workspace::resolve_storage_directory(
+            crate::utils::canonicalize_existing(workspace_root)?,
+            Path::new(USER_READINESS_SOURCE_PARENT),
+            None,
+            true,
+            true,
+        );
+    }
     let _lock = lock_workspace(workspace_root)?;
     let paths = workspace_cache_paths(workspace_root)?;
     match fs::create_dir(&paths.compiler_artifacts) {
@@ -246,7 +269,7 @@ pub(crate) fn readiness_probe_parent(workspace_root: &Path) -> RailResult<PathBu
         Err(error) => return Err(error.into()),
     }
     let parent = crate::utils::canonicalize_existing(&paths.compiler_artifacts)?;
-    if parent != paths.compiler_artifacts || !parent.starts_with(crate::utils::canonicalize_existing(workspace_root)?) {
+    if parent != paths.compiler_artifacts || !parent.starts_with(&paths.state_root) {
         return Err(RailError::message(
             "cache readiness probe directory escaped the workspace",
         ));
@@ -369,6 +392,19 @@ pub(crate) fn workspace_status(workspace_root: &Path) -> RailResult<WorkspaceCac
 }
 
 fn workspace_cache_paths(workspace_root: &Path) -> RailResult<WorkspaceCachePaths> {
+    let state_root = if uses_user_storage() {
+        workspace_storage_dir(workspace_root, WorkspaceStorage::Cache, None, false)?
+    } else {
+        legacy_cache_state_root(workspace_root)?
+    };
+    Ok(WorkspaceCachePaths {
+        compiler_artifacts: state_root.join("compiler-artifacts-v1"),
+        lock: state_root.join("cache.lock"),
+        state_root,
+    })
+}
+
+fn legacy_cache_state_root(workspace_root: &Path) -> RailResult<PathBuf> {
     let workspace_root = crate::utils::canonicalize_existing(workspace_root)?;
     let metadata = fs::symlink_metadata(&workspace_root)?;
     if !metadata.is_dir() || crate::utils::is_symlink_or_reparse(&metadata) {
@@ -404,11 +440,11 @@ fn workspace_cache_paths(workspace_root: &Path) -> RailResult<WorkspaceCachePath
         }
     }
 
-    Ok(WorkspaceCachePaths {
-        compiler_artifacts: state_root.join("compiler-artifacts-v1"),
-        lock: state_root.join("cache.lock"),
-        state_root,
-    })
+    Ok(state_root)
+}
+
+pub(crate) fn compiler_artifacts_dir(workspace_root: &Path) -> RailResult<PathBuf> {
+    Ok(workspace_cache_paths(workspace_root)?.compiler_artifacts)
 }
 
 fn workspace_status_for_paths(paths: &WorkspaceCachePaths) -> RailResult<WorkspaceCacheStatus> {

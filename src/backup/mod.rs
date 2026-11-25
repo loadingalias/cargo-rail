@@ -1,6 +1,6 @@
 //! Contained workspace-file backups for mutation recovery.
 //!
-//! Each timestamped directory under `target/cargo-rail/backups` preserves the
+//! Each timestamped directory under the workspace backup root preserves the
 //! original relative file layout and records it in `metadata.json`.
 
 use std::path::{Path, PathBuf};
@@ -24,6 +24,19 @@ pub fn create_backup_id() -> BackupId {
 #[doc(hidden)]
 pub fn get_backup_root(workspace_root: &Path) -> PathBuf {
     crate::workspace::cargo_rail_state_root(workspace_root).join("backups")
+}
+
+pub(crate) fn selected_backup_root(workspace_root: &Path, create: bool) -> crate::error::RailResult<PathBuf> {
+    if crate::workspace::uses_user_storage() {
+        crate::workspace::workspace_storage_dir(
+            workspace_root,
+            crate::workspace::WorkspaceStorage::State,
+            Some("backups"),
+            create,
+        )
+    } else {
+        Ok(get_backup_root(workspace_root))
+    }
 }
 
 /// Get the path to a specific backup directory.
